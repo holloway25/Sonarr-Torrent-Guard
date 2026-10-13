@@ -3,7 +3,9 @@ import unittest
 from unittest.mock import patch
 
 from guard import (Api, GuardError, SameOriginRedirect, PrivateRotatingFileHandler,
-                   assess_files, load_config, load_batch_state, save_batch_state, records, run)
+                   assess_files, load_config, load_batch_state, save_batch_state, records, run,
+                   recheck_candidate)
+from safety import SafetyError
 from reports import human_report, json_events
 from workflow import preview_failure, read_readiness
 
@@ -99,6 +101,29 @@ class WorkflowTests(unittest.TestCase):
     def test_stopped_good_torrent_is_kept(self):
         self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
         self.assertEqual(self.check()["decision"], "keep")
+
+    def test_target_recheck_reads_fresh_manifest_and_identity(self):
+        original = self.check()
+        self.s.routes["/api/v3/config/downloadclient"] = {
+            "autoRedownloadFailed": True, "autoRedownloadFailedFromInteractiveSearch": True}
+        before = len([c for c in self.qb.calls if c[0].endswith("/files")])
+        refreshed = recheck_candidate(original, self.config, self.qb, {"HD": self.s})
+        self.assertEqual(refreshed["assessment"]["ownership_fingerprint"], original["ownership_fingerprint"])
+        self.assertEqual(len([c for c in self.qb.calls if c[0].endswith("/files")]), before + 1)
+        self.assertEqual(refreshed["readiness"]["status"], "verified")
+
+    def test_target_recheck_blocks_new_useful_selection(self):
+        self.qb.routes["/api/v2/torrents/files"] = manifest(("info.txt", 1), ("episode.mkv", 0))
+        original = self.check()
+        self.qb.routes["/api/v2/torrents/files"][1]["priority"] = 1
+        with self.assertRaises(SafetyError):
+            recheck_candidate(original, self.config, self.qb, {"HD": self.s})
+
+    def test_target_recheck_preserves_cross_instance_ownership_protection(self):
+        original = self.check()
+        self.config["sonarr"]["UHD"] = copy.deepcopy(self.config["sonarr"]["HD"])
+        with self.assertRaises(SafetyError):
+            recheck_candidate(original, self.config, self.qb, {"HD": self.s, "UHD": self.s})
 
     def test_source_protections(self):
         for source in ("Private Source", "New Unclassified Source"):

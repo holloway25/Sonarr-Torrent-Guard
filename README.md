@@ -30,6 +30,14 @@ JSON-line events suitable for future UI/scheduler integration. Optional
 `--show-titles` displays escaped torrent titles only in text stdout, never in
 JSON events or log files. Runtime reports must stay outside the repository.
 
+Use `--check-safeguards` to perform a second, targeted read-only assessment for
+each failure candidate and record it in a private `action-journal.sqlite3` beside
+the external configuration. Both Sonarr queues are reread to preserve duplicate
+ownership checks. Endpoint/category/source/content identities and complete file
+selections must still match, retry settings must be enabled, and the new snapshot
+must be at most ten seconds old. The journal records preview checks only; this
+option cannot send removal, blocklist or replacement requests.
+
 Optional `--log-file /path/outside/checkout/guard.log` enables one-MiB rotation
 with three backups. Keep runtime files outside Git. No service or schedule is
 installed. A future schedule should run every five minutes. A process lock beside
@@ -89,7 +97,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard
+python3 -m unittest -v test_guard test_safety
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -99,6 +107,21 @@ The privacy checker is a guardrail, not proof that all identifying data is absen
 Manually inspect staged content and author name/email before any commit. Use a
 privacy-safe Git author identity. Never track local handoff notes, configuration,
 logs, state, payloads, personal identities or deployment details.
+
+`safety.py` also implements a simulation-only journal/recovery harness. Tests
+commit dispatch intent before a fake sender runs, interrupt/restart processing,
+and reconcile independently supplied observations without resending. Completion
+requires separate positive evidence of removal, data deletion, failure,
+blocklisting and replacement. Unknown/partial results stay unresolved or require
+manual review. There is no production sender or production evidence collector.
+
+The journal requires an owner-private directory and mode-600 database/sidecars.
+SQLite transactions use FULL synchronization. Evidence is limited to instance,
+hash and ownership/manifest fingerprints; no titles, paths, endpoints or secrets.
+Preview and simulation records are separate and cannot enable live mode. It
+retains at most 1000 rows and refuses new ones at capacity; it never silently
+deletes unresolved evidence. Changed stored evidence requires review. Do not
+delete the journal to force a retry. Backups and exports must also stay outside Git.
 
 ## Remaining milestones
 

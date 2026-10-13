@@ -4,6 +4,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import hashlib
 import http.cookiejar
 import json
 import logging
@@ -19,6 +20,7 @@ import urllib.request
 
 from reports import human_report, json_events
 from workflow import preview_failure, read_readiness
+from safety import Journal, SafetyError, record_preview
 
 
 class GuardError(Exception):
@@ -317,7 +319,7 @@ def source_for(api, hash_value, rows, max_pages):
     return next(iter(sources))
 
 
-def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False):
+def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False, target=None):
     """Return one report per matched torrent. Every action is a proposal only."""
     now = time.time() if now is None else now
     maximum = config.get("max_torrents_per_run", 100)
@@ -358,6 +360,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             except GuardError:
                 continue
         for h, rows in grouped.items():
+            if target is not None and (label, h) != target:
+                continue
             report = {"instance": label, "hash": h, "dry_run": True}
             try:
                 if owners[h] != {label}:
@@ -426,6 +430,17 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                           download_client_id=instance["download_client_binding"]["id"],
                           file_count=len(files), selected_file_count=sum(f["priority"] > 0 for f in files),
                           torrent_state=state)
+            ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
+                         "client_id": report["download_client_id"],
+                         "endpoint": endpoint_key(config["qbittorrent"]["url"]),
+                         "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
+            manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
+                        for f in sorted(files, key=lambda f: f["index"])]
+            report["ownership_fingerprint"] = hashlib.sha256(
+                json.dumps(ownership, sort_keys=True).encode()).hexdigest()
+            report["manifest_fingerprint"] = hashlib.sha256(
+                json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+            report["checked_at"] = time.time() if now is None else now
             if include_titles and isinstance(t.get("name"), str):
                 report["title"] = t["name"]
             if reasons:
@@ -441,6 +456,16 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             batch_state["after"] = [label, h]
         reports.append(report)
     return reports
+
+
+def recheck_candidate(original, config, qb, apis):
+    """Refetch both queues and the target's complete ownership/manifest evidence."""
+    target = (original["instance"], torrent_hash(original["hash"]))
+    reports = run(config, qb, apis, target=target)
+    if len(reports) != 1 or reports[0].get("decision") != "would_fail":
+        raise SafetyError("candidate_no_longer_eligible")
+    readiness = read_readiness({target[0]: apis[target[0]]})[target[0]]
+    return {"assessment": reports[0], "readiness": readiness}
 
 
 def load_config(path):
@@ -495,6 +520,8 @@ def main():
     parser.add_argument("--log-file", type=Path)
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--show-titles", action="store_true", help="Show escaped release titles in text stdout only")
+    parser.add_argument("--check-safeguards", action="store_true",
+                        help="Read-only fresh rechecks recorded in an external preview journal")
     args = parser.parse_args()
     if args.show_titles and args.format != "text":
         parser.error("--show-titles requires --format text")
@@ -523,6 +550,19 @@ def main():
                 with hard_deadline(deadline):
                     readiness = read_readiness(apis)
                     reports = run(config, qb, apis, batch_state=batch_state, include_titles=args.show_titles)
+                    if args.check_safeguards:
+                        journal = Journal(args.config.parent / "action-journal.sqlite3")
+                        try:
+                            for report in reports:
+                                if report["decision"] != "would_fail":
+                                    continue
+                                try:
+                                    row = record_preview(journal, report, lambda: recheck_candidate(report, config, qb, apis))
+                                    report["safeguards"] = {"status": row["stage"], "live_enabled": False}
+                                except (SafetyError, GuardError) as e:
+                                    report["safeguards"] = {"status": "blocked", "reason": str(e), "live_enabled": False}
+                        finally:
+                            journal.close()
             finally:
                 # Preserve completed assessments even if a later request aborts.
                 save_batch_state(batch_path, batch_state)
@@ -540,7 +580,7 @@ def main():
                 if args.log_file:
                     logger.info(line)
         return 0
-    except GuardError as e:
+    except (GuardError, SafetyError) as e:
         print(json.dumps({"dry_run": True, "error": str(e)}), file=sys.stderr)
         return 1
     except Exception:

@@ -10,6 +10,8 @@ config.json
 *.lock
 state*.json
 batch-state.json
+*.sqlite3
+*.sqlite3-*
 HANDOFF*
 handoff*
 staging/

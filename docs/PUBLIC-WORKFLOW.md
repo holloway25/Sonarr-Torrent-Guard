@@ -5,6 +5,11 @@ unit-tested request previews do not establish production mutation behaviour.
 Private-source downloads, the private archive helper, Docker deployment and the
 web UI remain separate future work. Existing seeding/removal policies stay intact.
 
+Fresh read-only assessment and a private SQLite journal are now implemented.
+Dispatch/recovery behaviour is tested using a simulation-only harness; no
+production sender or result-verification adapter exists yet. Enable
+`--check-safeguards` to exercise rechecks and preview journaling against the APIs.
+
 ## Proposed normal path
 
 1. Read and validate both queues, explicit downloader binding, Sonarr grab
@@ -71,6 +76,28 @@ dictionary. It never sends the described request. Every preview remains blocked
 by `live_executor_not_implemented` and `fresh_recheck_required`, plus any retry
 setting problems. A protected/kept/unidentified candidate gets no request preview.
 Multiple queue rows yield one preview, and no additional search is planned.
+
+`safety.py` compares ownership and manifest fingerprints from fresh assessment,
+checks public eligibility, both retry switches and a ten-second maximum snapshot
+age. Manifest fingerprints include names, sizes, indices and priorities, but not
+changing download progress; filenames themselves are not journaled. A fresh read
+still cannot eliminate the small race with external changes before a future
+mutation. Production execution must recheck directly before dispatch.
+
+The external journal uses transactional, fully synchronized SQLite with a unique
+mode/instance/hash key. Preview rows never enter dispatch states. Simulation rows
+commit `dispatch_recorded` before invoking the fake sender. Recovery from that
+stage, a lost response or restart reconciles observations only and never invokes
+the sender again. Data removal without confirmed failure/blocklisting requires
+manual review; confirmed failure without replacement or data-deletion evidence
+stays pending. Complete requires all five positive observations. A missing
+response, 2xx status or disappeared queue item is never sufficient by itself.
+
+Journal records omit raw endpoints, file paths, titles and credentials. The
+private directory/database requirements, bounded row count and preservation of
+unresolved records are intentional. Corrupt journals fail closed instead of
+being reset. Production collection of independently verified observations and
+an approved live transport remain required before a controlled live test.
 
 `reports.py` renders these results for humans and emits versioned JSON data. This
 is the boundary a future read-only web UI can consume. Runtime titles are optional

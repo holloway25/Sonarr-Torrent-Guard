@@ -47,6 +47,12 @@ def human_report(reports, readiness, timestamp):
                      + report.get("hash", "batch")[:12] + " | " + explanation)
         if "title" in report:
             lines.append("  Title: " + display(report["title"]))
+        if "safeguards" in report:
+            safety = report["safeguards"]
+            message = safety["status"].replace("_", " ")
+            if "reason" in safety:
+                message += ": " + safety["reason"].replace("_", " ")
+            lines.append("  Fresh recheck/journal: " + message + " (live execution disabled)")
         if report["decision"] == "would_fail":
             lines.append("  Proposed after approval/checks: Sonarr removes torrent/data, blocklists and handles retry.")
             blockers = report.get("workflow", {}).get("blockers", [])
