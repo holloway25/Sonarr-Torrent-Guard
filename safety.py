@@ -10,6 +10,21 @@ from pathlib import Path
 import sqlite3
 import time
 
+OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
+
+
+def clean_observation(observation):
+    if not isinstance(observation, dict):
+        raise SafetyError("invalid_observation")
+    safe = {}
+    for field in OBSERVATION_FIELDS:
+        val = observation.get(field)
+        if val is not None and not isinstance(val, bool):
+            raise SafetyError("invalid_observation")
+        if field in observation:
+            safe[field] = val
+    return safe
+
 
 class SafetyError(Exception):
     pass
@@ -78,14 +93,34 @@ class Journal:
                         "key TEXT PRIMARY KEY, mode TEXT NOT NULL, stage TEXT NOT NULL, "
                         "evidence TEXT NOT NULL, observation TEXT NOT NULL, updated REAL NOT NULL)")
         self.db.commit()
+        # Additive migration preserves existing recovery evidence and row keys.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            columns = {r[1] for r in self.db.execute("PRAGMA table_info(actions)")}
+            additions = {
+                "confirmed": "TEXT NOT NULL DEFAULT '{}'",
+                "current_observation": "TEXT NOT NULL DEFAULT '{}'",
+                "observation_available": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    self.db.execute("ALTER TABLE actions ADD COLUMN " + name + " " + declaration)
+            if "confirmed" not in columns:
+                for key, raw in self.db.execute("SELECT key,observation FROM actions").fetchall():
+                    old = clean_observation(json.loads(raw))
+                    confirmed = {k: True for k, v in old.items() if v is True}
+                    self.db.execute("UPDATE actions SET confirmed=? WHERE key=?", (json.dumps(confirmed), key))
 
     def close(self):
         self.db.close()
 
     def get(self, key):
-        row = self.db.execute("SELECT mode,stage,evidence,observation FROM actions WHERE key=?", (key,)).fetchone()
+        row = self.db.execute("SELECT mode,stage,evidence,observation,confirmed,current_observation,"
+                              "observation_available FROM actions WHERE key=?", (key,)).fetchone()
         return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
-                                        "evidence": json.loads(row[2]), "observation": json.loads(row[3])}
+                                        "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
+                                        "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
+                                        "observation_available": bool(row[6])}
 
     def prepare(self, report, mode="preview"):
         if mode not in ("preview", "simulation"):
@@ -101,7 +136,7 @@ class Journal:
                 return old
             if self.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0] >= self.limit:
                 raise SafetyError("journal_capacity_reached")
-            self.db.execute("INSERT INTO actions VALUES(?,?,?,?,?,?)",
+            self.db.execute("INSERT INTO actions(key,mode,stage,evidence,observation,updated) VALUES(?,?,?,?,?,?)",
                             (key, mode, "prepared", json.dumps(value), "{}", time.time()))
         return self.get(key)
 
@@ -121,18 +156,22 @@ class Journal:
                 raise SafetyError("journal_stage_changed")
             if stage == "dispatch_recorded" and row["mode"] != "simulation":
                 raise SafetyError("live_execution_disabled")
-            safe = {}
-            if observation:
-                for field in ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed"):
-                    val = observation.get(field)
-                    if val is not None and not isinstance(val, bool):
-                        raise SafetyError("invalid_observation")
-                    safe[field] = val
-            if stage == "complete" and not all(safe.get(field) is True for field in (
-                    "torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")):
+            current = {} if observation is None else clean_observation(observation)
+            last_known = dict(row["observation"])
+            confirmed = dict(row["confirmed"])
+            for field, val in current.items():
+                if val is not None:
+                    last_known[field] = val
+                if val is True:
+                    confirmed[field] = True
+            if stage == "complete" and not all(current.get(field) is True for field in OBSERVATION_FIELDS):
                 raise SafetyError("completion_not_verified")
-            self.db.execute("UPDATE actions SET stage=?,observation=?,updated=? WHERE key=? AND stage=?",
-                            (stage, json.dumps(safe), time.time(), key, expected))
+            if any(val is False and row["confirmed"].get(field) is True for field, val in current.items()):
+                stage = "manual_review"
+            self.db.execute("UPDATE actions SET stage=?,observation=?,confirmed=?,current_observation=?,"
+                            "observation_available=?,updated=? WHERE key=? AND stage=?",
+                            (stage, json.dumps(last_known), json.dumps(confirmed), json.dumps(current),
+                             observation is not None, time.time(), key, expected))
         return self.get(key)
 
 
@@ -153,19 +192,17 @@ def reconcile(journal, key, observe):
     if row["stage"] not in ("dispatch_recorded", "uncertain", "replacement_pending"):
         return row
     try:
-        observation = observe()
-        fields = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
-        if not isinstance(observation, dict) or any(
-                observation.get(k) is not None and not isinstance(observation[k], bool) for k in fields):
-            raise SafetyError("invalid_observation")
+        observation = clean_observation(observe())
     except Exception:
         return journal.transition(key, row["stage"], "uncertain")
-    if all(observation.get(k) is True for k in fields):
+    known = dict(row["observation"])
+    known.update({k: v for k, v in observation.items() if v is not None})
+    if all(observation.get(k) is True for k in OBSERVATION_FIELDS):
         stage = "complete"
-    elif observation.get("torrent_absent") is True and (
-            observation.get("failed") is not True or observation.get("blocklisted") is not True):
+    elif known.get("torrent_absent") is True and (
+            known.get("failed") is not True or known.get("blocklisted") is not True):
         stage = "manual_review"
-    elif all(observation.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
+    elif all(known.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
         stage = "replacement_pending"
     else:
         stage = "uncertain"

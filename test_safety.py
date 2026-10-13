@@ -148,6 +148,89 @@ class SafetyTests(unittest.TestCase):
         row = reconcile(self.journal, row["key"], Mock(side_effect=TimeoutError()))
         self.assertEqual(row["stage"], "uncertain")
 
+    def test_confirmed_evidence_survives_observation_outage_and_restart(self):
+        sender = Mock()
+        positives = {k: True for k in self.confirmed if k != "replacement_observed"}
+        row = self.simulate(sender, observation=positives)
+        self.assertEqual(row["stage"], "replacement_pending")
+        row = reconcile(self.journal, row["key"], Mock(side_effect=TimeoutError()))
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertEqual(row["observation"], positives)
+        self.assertEqual(row["confirmed"], positives)
+        self.assertFalse(row["observation_available"])
+        self.assertEqual(row["current_observation"], {})
+        self.journal.close()
+        self.journal = Journal(self.path)
+        self.assertEqual(self.journal.get(row["key"]), row)
+        self.assertEqual(self.simulate(sender)["stage"], "complete")
+        sender.assert_called_once()
+
+    def test_later_partial_observations_preserve_history_without_stale_completion(self):
+        sender = Mock()
+        positives = {k: True for k in self.confirmed if k != "replacement_observed"}
+        row = self.simulate(sender, observation=positives)
+        row = reconcile(self.journal, row["key"], lambda: {"replacement_observed": True})
+        self.assertEqual(row["confirmed"], self.confirmed)
+        self.assertEqual(row["observation"], self.confirmed)
+        self.assertEqual(row["current_observation"], {"replacement_observed": True})
+        self.assertTrue(row["observation_available"])
+        self.assertEqual(row["stage"], "replacement_pending")
+        # A historical union of positives is not a coherent current snapshot.
+        with self.assertRaisesRegex(SafetyError, "completion_not_verified"):
+            self.journal.transition(row["key"], "replacement_pending", "complete", {})
+        self.journal.close()
+        self.journal = Journal(self.path)
+        self.assertEqual(self.journal.get(row["key"]), row)
+        self.assertEqual(self.simulate(sender)["stage"], "complete")
+        sender.assert_called_once()
+
+    def test_unknown_and_invalid_updates_do_not_erase_confirmations(self):
+        positives = {k: True for k in self.confirmed if k != "replacement_observed"}
+        row = self.simulate(Mock(), observation=positives)
+        row = reconcile(self.journal, row["key"], lambda: {"failed": None})
+        self.assertEqual(row["confirmed"], positives)
+        self.assertEqual(row["observation"], positives)
+        self.assertEqual(row["current_observation"], {"failed": None})
+        row = reconcile(self.journal, row["key"], lambda: {"failed": "true"})
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertFalse(row["observation_available"])
+        self.assertEqual(row["confirmed"], positives)
+        self.assertEqual(row["observation"], positives)
+
+    def test_contradictions_require_review_without_erasing_historical_positives(self):
+        positives = {k: True for k in self.confirmed if k != "replacement_observed"}
+        row = self.simulate(Mock(), observation=positives)
+        row = reconcile(self.journal, row["key"], lambda: {"torrent_absent": False})
+        self.assertEqual(row["stage"], "manual_review")
+        self.assertEqual(row["confirmed"], positives)
+        self.assertFalse(row["observation"]["torrent_absent"])
+        self.assertEqual(row["current_observation"], {"torrent_absent": False})
+        self.journal.close()
+        self.journal = Journal(self.path)
+        self.assertEqual(self.journal.get(row["key"]), row)
+
+    def test_existing_journal_schema_migrates_without_losing_evidence(self):
+        import sqlite3
+        from safety import evidence
+        legacy = Path(self.folder.name)/"legacy.sqlite3"
+        positives = {k: True for k in self.confirmed if k != "replacement_observed"}
+        with sqlite3.connect(legacy) as db:
+            db.execute("CREATE TABLE actions (key TEXT PRIMARY KEY, mode TEXT NOT NULL, stage TEXT NOT NULL, "
+                       "evidence TEXT NOT NULL, observation TEXT NOT NULL, updated REAL NOT NULL)")
+            db.execute("INSERT INTO actions VALUES(?,?,?,?,?,?)", (
+                "legacy-key", "simulation", "replacement_pending", json.dumps(evidence(self.original)),
+                json.dumps(positives), 1000))
+        for _ in range(2):
+            journal = Journal(legacy)
+            try:
+                row = journal.get("legacy-key")
+                self.assertEqual(row["stage"], "replacement_pending")
+                self.assertEqual(row["observation"], positives)
+                self.assertEqual(row["confirmed"], positives)
+                self.assertFalse(row["observation_available"])
+            finally:
+                journal.close()
+
     def test_duplicates_and_concurrent_stage_changes_cannot_send_twice(self):
         row = self.journal.prepare(self.original, mode="simulation")
         self.journal.transition(row["key"], "prepared", "dispatch_recorded")

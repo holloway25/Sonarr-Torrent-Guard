@@ -115,6 +115,13 @@ requires separate positive evidence of removal, data deletion, failure,
 blocklisting and replacement. Unknown/partial results stay unresolved or require
 manual review. There is no production sender or production evidence collector.
 
+Recovery keeps historical positive confirmations separately from last-known
+results and the current observation's availability. Outages, absent fields and
+unknown values do not erase earlier evidence. Explicit contradictions require
+manual review. A union of old/partial positives cannot prove completion: all
+required results must be positive in one current observation. Existing journals
+are migrated additively, preserving their stored evidence.
+
 The journal requires an owner-private directory and mode-600 database/sidecars.
 SQLite transactions use FULL synchronization. Evidence is limited to instance,
 hash and ownership/manifest fingerprints; no titles, paths, endpoints or secrets.

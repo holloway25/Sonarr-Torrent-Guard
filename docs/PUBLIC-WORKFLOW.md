@@ -99,6 +99,18 @@ unresolved records are intentional. Corrupt journals fail closed instead of
 being reset. Production collection of independently verified observations and
 an approved live transport remain required before a controlled live test.
 
+Journal recovery stores three distinct views: historical positive `confirmed`
+flags, merged last-known `observation` values, and `current_observation` with an
+availability flag. An outage leaves historical and last-known evidence intact
+while marking the current view unavailable. Omitted/unknown fields in later
+partial responses preserve previous values. Explicit negative results update the
+last-known view; a negative contradicting a historical confirmation requires
+manual review without deleting that confirmation. Completion requires all five
+positive results in the current snapshot, never just a historical union.
+Schema migration preserves existing observations and initializes historical
+confirmations from them; it cannot reconstruct evidence already lost before
+the migration.
+
 `reports.py` renders these results for humans and emits versioned JSON data. This
 is the boundary a future read-only web UI can consume. Runtime titles are optional
 text stdout only; JSON events and rotating logs omit them.
