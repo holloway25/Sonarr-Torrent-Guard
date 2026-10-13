@@ -16,14 +16,19 @@ ID and its exact endpoint. The pinned endpoint must match both the monitored
 qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. The pinned
 ID selects the client before uniqueness checks, so other clients using the same
 category do not interfere; duplicate records for the pinned ID remain invalid.
-Default
-ports are normalized. Missing or changed bindings fail closed. Different proxy
+Default ports are normalized. Missing or changed bindings fail closed. Different proxy
 aliases are not assumed to reach the same server; configure a shared verified
 endpoint instead. Credentials and bindings stay in the external configuration.
 
 ```sh
 python3 guard.py --config /path/outside/checkout/connections.json
 ```
+
+Text reports are the default: counts, readable reasons, per-instance retry
+settings and clearly marked proposed actions. Use `--format json` for versioned
+JSON-line events suitable for future UI/scheduler integration. Optional
+`--show-titles` displays escaped torrent titles only in text stdout, never in
+JSON events or log files. Runtime reports must stay outside the repository.
 
 Optional `--log-file /path/outside/checkout/guard.log` enables one-MiB rotation
 with three backups. Keep runtime files outside Git. No service or schedule is
@@ -68,9 +73,18 @@ in charge of healthy torrents. Unknown/transitional states, incomplete manifests
 age under two minutes, ambiguous identity and failed API requests skip or abort
 assessment. This is policy checking, not malware scanning.
 
-Reports include instance, hash, reason, Sydney timestamp and proposed actions.
-They omit credentials, endpoints, filenames and download paths. A `would_fail`
-report does not mean Sonarr has failed the release.
+JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
+state, reason, Sydney timestamp and proposed actions. They omit credentials,
+endpoints, titles, filenames and download paths. Schema version 1 has readiness,
+assessment and summary events. A `would_fail` report does not mean Sonarr has
+failed the release.
+
+Read-only readiness checks inspect both failed-download retry switches. Disabled,
+missing or unreadable switches block the proposed replacement workflow; this
+program does not change settings. Request previews are data only. The API adapter
+has no DELETE or replacement-search implementation. See
+[public workflow](docs/PUBLIC-WORKFLOW.md) for the reviewed request sequence,
+verification and recovery requirements before live implementation.
 
 ## Verification and privacy
 
@@ -90,11 +104,13 @@ logs, state, payloads, personal identities or deployment details.
 
 - Validate controlled dry-run candidates.
 - Add explicit Sonarr v5 compatibility tests. This milestone uses Sonarr v4's v3 API.
-- Agree and verify live failure/removal and native replacement behaviour before
-  implementing it. Every future mutation requires fresh ownership/file checks.
-- Define private split-RAR selection, share access, safe extraction, atomic
+- Review the documented live workflow and readiness results, then implement and
+  verify live failure/removal/replacement separately. Every mutation requires
+  fresh ownership/file checks. No current switch enables live execution.
+- Longer term: define private split-RAR selection, share access, safe extraction, atomic
   publication, positive import confirmation and exact helper-file cleanup.
-- Package for containers once runtime and storage design are confirmed.
+- Package for containers once runtime and storage design are confirmed; add a
+  read-only web UI using report events after the public workflow is settled.
 
 Design reference: [qBittorrent checker](https://github.com/sergiobaiao/qbittorrent-checker).
 This is an independent implementation; no upstream script or exclusion list is

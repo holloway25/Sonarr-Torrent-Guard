@@ -17,6 +17,9 @@ import time
 import urllib.parse
 import urllib.request
 
+from reports import human_report, json_events
+from workflow import preview_failure, read_readiness
+
 
 class GuardError(Exception):
     pass
@@ -314,7 +317,7 @@ def source_for(api, hash_value, rows, max_pages):
     return next(iter(sources))
 
 
-def run(config, qb, sonarr_apis, now=None, batch_state=None):
+def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False):
     """Return one report per matched torrent. Every action is a proposal only."""
     now = time.time() if now is None else now
     maximum = config.get("max_torrents_per_run", 100)
@@ -418,6 +421,13 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None):
             files = qb.call("/api/v2/torrents/files", {"hash": h})
             reasons = assess_files(files)
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
+            report.update(public_source_confirmed=True, indexer=source,
+                          queue_ids=sorted({r["id"] for r in rows}),
+                          download_client_id=instance["download_client_binding"]["id"],
+                          file_count=len(files), selected_file_count=sum(f["priority"] > 0 for f in files),
+                          torrent_state=state)
+            if include_titles and isinstance(t.get("name"), str):
+                report["title"] = t["name"]
             if reasons:
                 report["proposed_actions"] = [
                     "blocklist_release_in_owning_sonarr",
@@ -483,7 +493,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    parser.add_argument("--show-titles", action="store_true", help="Show escaped release titles in text stdout only")
     args = parser.parse_args()
+    if args.show_titles and args.format != "text":
+        parser.error("--show-titles requires --format text")
     try:
         config = load_config(args.config)
         # Lock lives beside the external config, never in the repository.
@@ -495,7 +509,6 @@ def main():
                 raise GuardError("another_run_is_active") from None
             logger = logging.getLogger("guard")
             logger.setLevel(logging.INFO)
-            logger.addHandler(logging.StreamHandler(sys.stdout))
             if args.log_file:
                 handler = PrivateRotatingFileHandler(args.log_file)
                 logger.addHandler(handler)
@@ -505,18 +518,27 @@ def main():
             qb.login()
             batch_path = args.config.parent / "batch-state.json"
             batch_state = load_batch_state(batch_path)
+            apis = {name: Api(c, deadline=deadline) for name, c in config["sonarr"].items()}
             try:
                 with hard_deadline(deadline):
-                    reports = run(config, qb, {name: Api(c, deadline=deadline) for name, c in config["sonarr"].items()},
-                                  batch_state=batch_state)
+                    readiness = read_readiness(apis)
+                    reports = run(config, qb, apis, batch_state=batch_state, include_titles=args.show_titles)
             finally:
                 # Preserve completed assessments even if a later request aborts.
                 save_batch_state(batch_path, batch_state)
             from zoneinfo import ZoneInfo
             stamp = datetime.datetime.now(ZoneInfo("Australia/Sydney")).isoformat(timespec="seconds")
             for report in reports:
-                logger.info(json.dumps(dict(time=stamp, **report)))
-            logger.info(json.dumps({"dry_run": True, "summary": dict(collections.Counter(r["decision"] for r in reports))}))
+                if report["decision"] == "would_fail":
+                    report["workflow"] = preview_failure(report, readiness.get(report["instance"], {}))
+            if args.format == "text":
+                print(human_report(reports, readiness, stamp))
+            for event in json_events(reports, readiness, stamp):
+                line = json.dumps(event)
+                if args.format == "json":
+                    print(line)
+                if args.log_file:
+                    logger.info(line)
         return 0
     except GuardError as e:
         print(json.dumps({"dry_run": True, "error": str(e)}), file=sys.stderr)

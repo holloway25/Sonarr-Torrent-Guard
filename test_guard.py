@@ -4,6 +4,8 @@ from unittest.mock import patch
 
 from guard import (Api, GuardError, SameOriginRedirect, PrivateRotatingFileHandler,
                    assess_files, load_config, load_batch_state, save_batch_state, records, run)
+from reports import human_report, json_events
+from workflow import preview_failure, read_readiness
 
 
 def manifest(*entries):
@@ -265,6 +267,89 @@ class WorkflowTests(unittest.TestCase):
         self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [self.row, row]}
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, grab]}
         self.assertEqual(len(run(self.config, self.qb, {"HD": self.s}, now=1000)), 1)
+
+
+class ReportingWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.report = {"instance": "HD", "hash": "a" * 40, "dry_run": True,
+                       "decision": "would_fail", "reasons": ["contains_exe", "all_files_unselected"],
+                       "public_source_confirmed": True, "queue_ids": [7, 9]}
+        self.ready = {"status": "verified", "automatic_retry": True, "interactive_retry": True}
+
+    def test_proposal_has_one_sonarr_operation_and_no_extra_search(self):
+        plan = preview_failure(self.report, self.ready)
+        self.assertEqual(plan["request_preview"], {
+            "method": "DELETE", "path": "/api/v3/queue/7",
+            "params": {"removeFromClient": True, "blocklist": True,
+                       "skipRedownload": False, "changeCategory": False}})
+        self.assertFalse(plan["live_enabled"])
+        self.assertFalse(plan["extra_search"])
+        self.assertIn("fresh_recheck_required", plan["blockers"])
+        self.assertIn("live_executor_not_implemented", plan["blockers"])
+
+    def test_disabled_or_unverified_retries_are_explicit_blockers(self):
+        cases = [({}, "retry_settings_unverified"),
+                 (dict(self.ready, automatic_retry=False), "automatic_retry_disabled"),
+                 (dict(self.ready, interactive_retry=False), "interactive_retry_disabled")]
+        for ready, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertIn(reason, preview_failure(self.report, ready)["blockers"])
+
+    def test_protected_or_invalid_candidates_have_no_request_preview(self):
+        cases = [dict(self.report, decision="keep"), dict(self.report, decision="skip"),
+                 dict(self.report, public_source_confirmed=False),
+                 dict(self.report, queue_ids=[]), dict(self.report, queue_ids=[True]),
+                 dict(self.report, queue_ids=[-1])]
+        for report in cases:
+            with self.subTest(report=report):
+                self.assertIsNone(preview_failure(report, self.ready)["request_preview"])
+
+    def test_readiness_uses_get_adapter_and_distinguishes_instances(self):
+        hd = FakeApi({"/api/v3/config/downloadclient": {
+            "autoRedownloadFailed": False, "autoRedownloadFailedFromInteractiveSearch": True}})
+        uhd = FakeApi({"/api/v3/config/downloadclient": {
+            "autoRedownloadFailed": True, "autoRedownloadFailedFromInteractiveSearch": True}})
+        result = read_readiness({"HD": hd, "UHD": uhd})
+        self.assertFalse(result["HD"]["automatic_retry"])
+        self.assertTrue(result["UHD"]["automatic_retry"])
+        self.assertEqual(hd.calls, [("/api/v3/config/downloadclient", None)])
+
+    def test_failed_or_malformed_readiness_is_redacted_and_unknown(self):
+        for payload in (ValueError("sensitive error must not appear"), {},
+                        {"autoRedownloadFailed": "true", "autoRedownloadFailedFromInteractiveSearch": True}):
+            result = read_readiness({"HD": FakeApi({"/api/v3/config/downloadclient": payload})})
+            self.assertEqual(result["HD"]["status"], "unavailable")
+            self.assertIsNone(result["HD"]["automatic_retry"])
+            self.assertNotIn("sensitive error", str(result))
+
+    def test_human_report_names_failure_and_disabled_retry(self):
+        self.report["workflow"] = preview_failure(self.report, dict(self.ready, automatic_retry=False))
+        output = human_report([self.report], {"HD": dict(self.ready, automatic_retry=False)}, "test time")
+        for phrase in ("DRY RUN", "1 failure candidates", "contains an .exe", "all files are unselected",
+                       "automatic retry OFF", "No removal"):
+            self.assertIn(phrase, output)
+
+    def test_json_schema_and_counts_include_keep_skip_and_omit_titles(self):
+        self.report["title"] = "Runtime title stays out of stored events"
+        reports = [self.report, dict(self.report, decision="keep"),
+                   dict(self.report, decision="skip", reason="private_source_protected")]
+        events = list(json_events(reports, {"HD": self.ready}, "test time"))
+        self.assertTrue(all(e["schema_version"] == 1 and e["dry_run"] is True for e in events))
+        self.assertEqual(events[-1]["summary"], {"would_fail": 1, "keep": 1, "skip": 1})
+        self.assertFalse(any("title" in event for event in events))
+        self.assertNotIn(self.report["title"], str(events))
+
+    def test_optional_titles_cannot_inject_terminal_controls(self):
+        self.report["title"] = "episode\nFAKE\x1b[31m\u202eevil"
+        output = human_report([self.report], {}, "test time")
+        self.assertNotIn("\x1b", output)
+        self.assertNotIn("\u202e", output)
+        self.assertIn("episode\\nFAKE", output)
+
+    def test_empty_queue_still_shows_instance_retry_status(self):
+        output = human_report([], {"HD": self.ready}, "test time")
+        self.assertIn("0 failure candidates", output)
+        self.assertIn("retries ON", output)
 
 
 class TransportTests(unittest.TestCase):
