@@ -149,6 +149,42 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(self.check()["reason"], "sonarr_downloader_binding_mismatch")
 
+    def test_pinned_client_selected_among_same_category_downloaders(self):
+        clients = self.s.routes["/api/v3/downloadclient"]
+        pinned = copy.deepcopy(clients[0])
+        other = copy.deepcopy(pinned)
+        other.update(id=2, name="Other Downloader")
+        for field in other["fields"]:
+            if field["name"] == "host":
+                field["value"] = "other-downloader.example.invalid"
+        for ordering in ([other, pinned], [pinned, other]):
+            with self.subTest(order=[c["id"] for c in ordering]):
+                self.s.routes["/api/v3/downloadclient"] = ordering
+                self.assertEqual(self.check()["decision"], "would_fail")
+                self.assertTrue(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_duplicate_pinned_client_ids_are_still_ambiguous(self):
+        clients = self.s.routes["/api/v3/downloadclient"]
+        clients.append(copy.deepcopy(clients[0]))
+        self.assertEqual(self.check()["reason"], "ambiguous_download_client")
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_missing_or_disabled_pinned_client_does_not_fall_back(self):
+        original = copy.deepcopy(self.s.routes["/api/v3/downloadclient"][0])
+        other = dict(original, id=2, name="Other Downloader")
+        for clients in ([other], [dict(original, enable=False), other]):
+            with self.subTest(clients=[c["id"] for c in clients]):
+                self.s.routes["/api/v3/downloadclient"] = clients
+                self.assertEqual(self.check()["reason"], "ambiguous_download_client")
+                self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_queue_bound_to_other_client_id_is_still_protected(self):
+        clients = self.s.routes["/api/v3/downloadclient"]
+        clients.append(dict(clients[0], id=2, name="Other Downloader"))
+        self.s.routes["/api/v3/queue"]["records"][0]["downloadClientId"] = 2
+        self.assertEqual(self.check()["reason"], "wrong_download_client")
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
     def test_unrelated_hash_does_not_consume_budget(self):
         unrelated = dict(self.row, id=99, downloadId="b" * 40)
         self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [unrelated, self.row]}

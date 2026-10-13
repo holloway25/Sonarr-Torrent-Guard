@@ -13,7 +13,10 @@ but enter live credentials only in a file outside the checkout. Set its mode to
 
 Each instance must have `download_client_binding` with the expected Sonarr client
 ID and its exact endpoint. The pinned endpoint must match both the monitored
-qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. Default
+qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. The pinned
+ID selects the client before uniqueness checks, so other clients using the same
+category do not interfere; duplicate records for the pinned ID remain invalid.
+Default
 ports are normalized. Missing or changed bindings fail closed. Different proxy
 aliases are not assumed to reach the same server; configure a shared verified
 endpoint instead. Credentials and bindings stay in the external configuration.

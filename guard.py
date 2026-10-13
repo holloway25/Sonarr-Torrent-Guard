@@ -362,7 +362,12 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None):
                 t = by_hash.get(h)
                 if not t or t.get("category") != category:
                     raise GuardError("missing_torrent_or_wrong_category")
+                binding = instance.get("download_client_binding")
+                if (not isinstance(binding, dict) or not integer(binding.get("id"))
+                        or binding["id"] <= 0):
+                    raise GuardError("missing_or_wrong_downloader_binding")
                 compatible = [x for x in clients[label] if isinstance(x, dict)
+                              and integer(x.get("id")) and x["id"] == binding["id"]
                               and x.get("enable") is True and x.get("implementation") == "QBittorrent"
                               and any(isinstance(f, dict) and f.get("name") == "tvCategory"
                                       and f.get("value") == category for f in x.get("fields", []))]
