@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+connections*.json
+config.json
+*.log
+*.log.*
+*.lock
+state*.json
+HANDOFF*
+handoff*
+staging/
+downloads/
+local/

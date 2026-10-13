@@ -1,0 +1,31 @@
+{
+  "dry_run": true,
+  "minimum_age_seconds": 120,
+  "max_torrents_per_run": 100,
+  "max_pages": 20,
+  "qbittorrent": {
+    "url": "https://downloader.example.invalid",
+    "username": "REPLACE_ME",
+    "password": "REPLACE_ME"
+  },
+  "sonarr": {
+    "HD": {
+      "url": "http://sonarr-hd.example.invalid:8989",
+      "api_key": "REPLACE_ME",
+      "category": "tv-hd",
+      "indexers": {
+        "public": ["Public Source"],
+        "private": ["Private Source", "Private Source - Freeleech"]
+      }
+    },
+    "UHD": {
+      "url": "http://sonarr-uhd.example.invalid:8989",
+      "api_key": "REPLACE_ME",
+      "category": "tv-uhd",
+      "indexers": {
+        "public": ["Public Source"],
+        "private": ["Private Source", "Private Source - Freeleech"]
+      }
+    }
+  }
+}
