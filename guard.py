@@ -2,6 +2,7 @@
 
 import argparse
 import collections
+import contextlib
 import datetime
 import http.cookiejar
 import json
@@ -9,7 +10,9 @@ import logging
 import logging.handlers
 import os
 from pathlib import Path, PurePosixPath
+import signal
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -17,6 +20,126 @@ import urllib.request
 
 class GuardError(Exception):
     pass
+
+
+@contextlib.contextmanager
+def hard_deadline(deadline):
+    """Linux/main-thread wall-clock bound, including DNS, headers and body reads."""
+    if deadline is None:
+        yield
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GuardError("run_time_limit_reached")
+    def expired(signum, frame):
+        raise GuardError("run_time_limit_reached")
+    started = time.monotonic()
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    duration = min(remaining, previous_timer[0]) if previous_timer[0] else remaining
+    signal.setitimer(signal.ITIMER_REAL, duration)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL,
+                             max(0.000001, previous_timer[0] - (time.monotonic() - started)),
+                             previous_timer[1])
+
+
+def endpoint_key(url, origin_only=False):
+    """Conservative origin + base-path identity with normalized default ports."""
+    try:
+        value = urllib.parse.urlsplit(url)
+        if (value.scheme not in ("http", "https") or not value.hostname
+                or value.username or value.password
+                or (not origin_only and (value.query or value.fragment))):
+            raise ValueError()
+        port = value.port if value.port is not None else (443 if value.scheme == "https" else 80)
+        if not 1 <= port <= 65535:
+            raise ValueError()
+        return value.scheme, value.hostname, port, value.path.rstrip("/")
+    except (ValueError, TypeError, AttributeError):
+        raise GuardError("invalid_endpoint") from None
+
+
+def verify_client_binding(instance, monitored_url, client):
+    binding = instance.get("download_client_binding")
+    if (not isinstance(binding, dict) or not integer(binding.get("id"))
+            or binding["id"] <= 0 or binding["id"] != client.get("id")):
+        raise GuardError("missing_or_wrong_downloader_binding")
+    pinned = endpoint_key(binding.get("endpoint"))
+    if pinned != endpoint_key(monitored_url):
+        raise GuardError("monitored_downloader_binding_mismatch")
+    fields = {f.get("name"): f.get("value") for f in client.get("fields", [])
+              if isinstance(f, dict)}
+    host, port, ssl = fields.get("host"), fields.get("port"), fields.get("useSsl")
+    base = fields.get("urlBase") or ""
+    if (not isinstance(host, str) or not host or not integer(port) or not 1 <= port <= 65535
+            or not isinstance(ssl, bool) or not isinstance(base, str)
+            or "/" in host or "@" in host or "?" in host or "#" in host):
+        raise GuardError("invalid_sonarr_downloader_endpoint")
+    if ":" in host and not host.startswith("["):
+        host = "[" + host + "]"
+    actual = ("https" if ssl else "http") + "://" + host + ":" + str(port)
+    if base:
+        actual += "/" + base.lstrip("/")
+    if endpoint_key(actual) != pinned:
+        raise GuardError("sonarr_downloader_binding_mismatch")
+
+
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Protect initial/new log files and any existing rotated backups."""
+    def __init__(self, filename, maxBytes=1024*1024, backupCount=3):
+        for path in [Path(filename), *(Path(str(filename) + "." + str(n))
+                                      for n in range(1, backupCount + 1))]:
+            if path.is_symlink():
+                raise GuardError("log_symlink_refused")
+            if path.exists():
+                path.chmod(0o600)
+        super().__init__(filename, maxBytes=maxBytes, backupCount=backupCount, encoding="utf-8")
+
+    def _open(self):
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.baseFilename, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            return os.fdopen(fd, self.mode, encoding=self.encoding)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+def load_batch_state(path):
+    try:
+        if not path.exists():
+            return {}
+        state = json.loads(path.read_text())
+        after = state.get("after")
+        if (not isinstance(state, dict) or not isinstance(after, list) or len(after) != 2
+                or not isinstance(after[0], str) or not after[0]):
+            raise ValueError()
+        torrent_hash(after[1])
+        return state
+    except (ValueError, TypeError, AttributeError, OSError, GuardError):
+        raise GuardError("invalid_batch_state") from None
+
+
+def save_batch_state(path, state):
+    if not state:
+        return
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".batch-")
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(state, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def integer(value):
@@ -76,6 +199,10 @@ class Api:
             urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
     def call(self, route, params=None, login=False):
+        with hard_deadline(self.deadline):
+            return self._call(route, params, login)
+
+    def _call(self, route, params=None, login=False):
         base = self.config["url"].rstrip("/")
         url = base + route
         headers, data = {}, None
@@ -127,8 +254,7 @@ class Api:
 
 class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
-        if (old.scheme, old.hostname, old.port) != (new.scheme, new.hostname, new.port):
+        if endpoint_key(req.full_url, True)[:3] != endpoint_key(newurl, True)[:3]:
             raise GuardError("cross_origin_redirect_refused")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -188,7 +314,7 @@ def source_for(api, hash_value, rows, max_pages):
     return next(iter(sources))
 
 
-def run(config, qb, sonarr_apis, now=None):
+def run(config, qb, sonarr_apis, now=None, batch_state=None):
     """Return one report per matched torrent. Every action is a proposal only."""
     now = time.time() if now is None else now
     maximum = config.get("max_torrents_per_run", 100)
@@ -218,7 +344,7 @@ def run(config, qb, sonarr_apis, now=None):
                 owners[torrent_hash(row.get("downloadId"))].add(label)
             except GuardError:
                 pass
-    processed = 0
+    candidates = []
     for label, api in sonarr_apis.items():
         instance = config["sonarr"][label]
         category = instance["category"]
@@ -229,10 +355,6 @@ def run(config, qb, sonarr_apis, now=None):
             except GuardError:
                 continue
         for h, rows in grouped.items():
-            if processed >= maximum:
-                reports.append({"instance": label, "decision": "skip", "reason": "work_limit_reached"})
-                return reports
-            processed += 1
             report = {"instance": label, "hash": h, "dry_run": True}
             try:
                 if owners[h] != {label}:
@@ -247,40 +369,62 @@ def run(config, qb, sonarr_apis, now=None):
                 if len(compatible) != 1:
                     raise GuardError("ambiguous_download_client")
                 client = compatible[0]
+                verify_client_binding(instance, config["qbittorrent"]["url"], client)
                 for row in rows:
                     cid, cname = row.get("downloadClientId"), row.get("downloadClient")
                     if cid is not None and cid != client.get("id"):
                         raise GuardError("wrong_download_client")
                     if cid is None and (not cname or cname != client.get("name")):
                         raise GuardError("unconfirmed_download_client")
-                source = source_for(api, h, rows, max_pages)
-                policy = instance["indexers"]
-                if source in policy["private"]:
-                    raise GuardError("private_source_protected")
-                if source not in policy["public"]:
-                    raise GuardError("unclassified_source_protected")
-                state = t.get("state", "")
-                safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
-                               "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
-                               "forcedDL", "forcedUP"}
-                if state not in safe_states:
-                    raise GuardError("metadata_or_transitional_state")
-                added = t.get("added_on")
-                if not integer(added) or added <= 0 or now - added < minimum_age:
-                    raise GuardError("torrent_too_new_or_age_unknown")
-                files = qb.call("/api/v2/torrents/files", {"hash": h})
-                reasons = assess_files(files)
-                report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
-                if reasons:
-                    report["proposed_actions"] = [
-                        "blocklist_release_in_owning_sonarr",
-                        "remove_torrent_and_data_through_sonarr",
-                        "obtain_targeted_replacement_after_retry_settings_verified",
-                    ]
-                    report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
+                candidates.append((label, h, rows, t, report))
             except GuardError as e:
                 report.update(decision="skip", reason=str(e))
+                reports.append(report)
+
+    # Only scoped ownership candidates consume work. A durable key cursor rotates
+    # fairly across both instances and survives restarts and queue reordering.
+    candidates.sort(key=lambda entry: entry[:2])
+    after = tuple((batch_state or {}).get("after", ()))
+    if after:
+        candidates = ([x for x in candidates if x[:2] > after]
+                      + [x for x in candidates if x[:2] <= after])
+    for number, (label, h, rows, t, report) in enumerate(candidates):
+        if number >= maximum:
+            report.update(decision="skip", reason="work_limit_reached")
             reports.append(report)
+            continue
+        api, instance = sonarr_apis[label], config["sonarr"][label]
+        try:
+            source = source_for(api, h, rows, max_pages)
+            policy = instance["indexers"]
+            if source in policy["private"]:
+                raise GuardError("private_source_protected")
+            if source not in policy["public"]:
+                raise GuardError("unclassified_source_protected")
+            state = t.get("state", "")
+            safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
+                           "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
+                           "forcedDL", "forcedUP"}
+            if state not in safe_states:
+                raise GuardError("metadata_or_transitional_state")
+            added = t.get("added_on")
+            if not integer(added) or added <= 0 or now - added < minimum_age:
+                raise GuardError("torrent_too_new_or_age_unknown")
+            files = qb.call("/api/v2/torrents/files", {"hash": h})
+            reasons = assess_files(files)
+            report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
+            if reasons:
+                report["proposed_actions"] = [
+                    "blocklist_release_in_owning_sonarr",
+                    "remove_torrent_and_data_through_sonarr",
+                    "obtain_targeted_replacement_after_retry_settings_verified",
+                ]
+                report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
+        except GuardError as e:
+            report.update(decision="skip", reason=str(e))
+        if batch_state is not None:
+            batch_state["after"] = [label, h]
+        reports.append(report)
     return reports
 
 
@@ -311,6 +455,12 @@ def load_config(path):
                     raise GuardError("invalid_source_lists")
             if set(lists["public"]) & set(lists["private"]):
                 raise GuardError("overlapping_source_lists")
+            binding = item.get("download_client_binding")
+            if (not isinstance(binding, dict) or not integer(binding.get("id"))
+                    or binding["id"] <= 0):
+                raise GuardError("missing_or_wrong_downloader_binding")
+            if endpoint_key(binding.get("endpoint")) != endpoint_key(config["qbittorrent"]["url"]):
+                raise GuardError("monitored_downloader_binding_mismatch")
         for item in [config["qbittorrent"], *config["sonarr"].values()]:
             url = urllib.parse.urlsplit(item["url"])
             if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
@@ -342,14 +492,21 @@ def main():
             logger.setLevel(logging.INFO)
             logger.addHandler(logging.StreamHandler(sys.stdout))
             if args.log_file:
-                handler = logging.handlers.RotatingFileHandler(args.log_file, maxBytes=1024*1024, backupCount=3)
-                os.chmod(args.log_file, 0o600)
+                handler = PrivateRotatingFileHandler(args.log_file)
                 logger.addHandler(handler)
             qb = Api(config["qbittorrent"])
             deadline = time.monotonic() + 180
             qb.deadline = deadline
             qb.login()
-            reports = run(config, qb, {name: Api(c, deadline=deadline) for name, c in config["sonarr"].items()})
+            batch_path = args.config.parent / "batch-state.json"
+            batch_state = load_batch_state(batch_path)
+            try:
+                with hard_deadline(deadline):
+                    reports = run(config, qb, {name: Api(c, deadline=deadline) for name, c in config["sonarr"].items()},
+                                  batch_state=batch_state)
+            finally:
+                # Preserve completed assessments even if a later request aborts.
+                save_batch_state(batch_path, batch_state)
             from zoneinfo import ZoneInfo
             stamp = datetime.datetime.now(ZoneInfo("Australia/Sydney")).isoformat(timespec="seconds")
             for report in reports:

@@ -31,7 +31,7 @@ def main():
         name = raw.decode()
         parts = PurePosixPath(name).parts
         leaf = parts[-1].lower()
-        if (leaf.startswith("handoff") or leaf in ("connections.json", "config.json", ".env")
+        if (leaf.startswith("handoff") or leaf in ("connections.json", "config.json", "batch-state.json", ".env")
                 or leaf.endswith((".log", ".lock", ".zip"))
                 or any(x in ("local", "downloads", "staging") for x in parts)):
             issues.append((name, "prohibited runtime or handoff artifact"))
@@ -43,7 +43,10 @@ def main():
         if name == "config.example.json":
             import json, urllib.parse
             config = json.loads(text)
-            for item in [config["qbittorrent"], *config["sonarr"].values()]:
+            examples = [config["qbittorrent"], *config["sonarr"].values()]
+            examples.extend({"url": item["download_client_binding"]["endpoint"]}
+                            for item in config["sonarr"].values())
+            for item in examples:
                 host = urllib.parse.urlsplit(item["url"]).hostname or ""
                 if not host.endswith(".example.invalid"):
                     issues.append((name, "non-placeholder endpoint"))

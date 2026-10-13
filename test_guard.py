@@ -2,7 +2,8 @@ import copy
 import unittest
 from unittest.mock import patch
 
-from guard import Api, GuardError, SameOriginRedirect, assess_files, load_config, records, run
+from guard import (Api, GuardError, SameOriginRedirect, PrivateRotatingFileHandler,
+                   assess_files, load_config, load_batch_state, save_batch_state, records, run)
 
 
 def manifest(*entries):
@@ -62,6 +63,9 @@ class WorkflowTests(unittest.TestCase):
         self.h = "a" * 40
         self.config = {"sonarr": {"HD": {"category": "tv-hd", "indexers": {
             "public": ["Public Source"], "private": ["Private Source"]}}}}
+        self.config["qbittorrent"] = {"url": "https://downloader.example.invalid"}
+        self.config["sonarr"]["HD"]["download_client_binding"] = {
+            "id": 1, "endpoint": "https://downloader.example.invalid:443"}
         self.row = {"id": 1, "downloadId": self.h.upper(), "seriesId": 2,
                     "episodeId": 3, "downloadClient": "Downloader"}
         self.grab = {"id": 4, "downloadId": self.h, "seriesId": 2, "episodeId": 3,
@@ -72,7 +76,12 @@ class WorkflowTests(unittest.TestCase):
         self.s = FakeApi({"/api/v3/queue": {"totalRecords": 1, "records": [self.row]},
                           "/api/v3/history": {"totalRecords": 1, "records": [self.grab]},
                           "/api/v3/downloadclient": [{"id": 1, "name": "Downloader", "enable": True,
-                              "implementation": "QBittorrent", "fields": [{"name": "tvCategory", "value": "tv-hd"}]}]})
+                              "implementation": "QBittorrent", "fields": [
+                                  {"name": "tvCategory", "value": "tv-hd"},
+                                  {"name": "host", "value": "downloader.example.invalid"},
+                                  {"name": "port", "value": 443},
+                                  {"name": "useSsl", "value": True},
+                                  {"name": "urlBase", "value": None}]}]})
 
     def check(self):
         return run(self.config, self.qb, {"HD": self.s}, now=1000)[0]
@@ -113,6 +122,80 @@ class WorkflowTests(unittest.TestCase):
         self.s.routes["/api/v3/queue"]["records"][0]["downloadClient"] = "Other Client"
         self.assertEqual(self.check()["reason"], "unconfirmed_download_client")
 
+    def test_same_hash_on_another_downloader_is_protected(self):
+        fields = self.s.routes["/api/v3/downloadclient"][0]["fields"]
+        for field in fields:
+            if field["name"] == "host":
+                field["value"] = "other-downloader.example.invalid"
+        self.assertEqual(self.check()["reason"], "sonarr_downloader_binding_mismatch")
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_binding_pins_client_id_monitor_and_actual_endpoint(self):
+        item = self.config["sonarr"]["HD"]
+        for binding in (None, {"id": 2, "endpoint": self.config["qbittorrent"]["url"]},
+                        {"id": 1, "endpoint": "https://other.example.invalid"}):
+            with self.subTest(binding=binding):
+                item["download_client_binding"] = binding
+                self.assertEqual(self.check()["decision"], "skip")
+
+    def test_binding_endpoint_port_scheme_and_base_path_changes_are_protected(self):
+        client = self.s.routes["/api/v3/downloadclient"][0]
+        original = copy.deepcopy(client["fields"])
+        for key, value in (("port", 8443), ("useSsl", False), ("urlBase", "/different")):
+            client["fields"] = copy.deepcopy(original)
+            for field in client["fields"]:
+                if field["name"] == key:
+                    field["value"] = value
+            with self.subTest(key=key):
+                self.assertEqual(self.check()["reason"], "sonarr_downloader_binding_mismatch")
+
+    def test_unrelated_hash_does_not_consume_budget(self):
+        unrelated = dict(self.row, id=99, downloadId="b" * 40)
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [unrelated, self.row]}
+        self.config["max_torrents_per_run"] = 1
+        state = {}
+        for _ in range(2):
+            result = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+            self.assertEqual([r["hash"] for r in result if r["decision"] == "would_fail"], [self.h])
+
+    def test_later_candidates_receive_turns_across_restarts(self):
+        import tempfile
+        from pathlib import Path
+        other = "b" * 40
+        self.config["max_torrents_per_run"] = 1
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
+            self.row, dict(self.row, id=2, downloadId=other)]}
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [
+            self.grab, dict(self.grab, id=5, downloadId=other)]}
+        self.qb.routes["/api/v2/torrents/info"].append(dict(self.t, hash=other))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"batch-state.json"
+            assessed = []
+            for _ in range(4):
+                state = load_batch_state(path)
+                result = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+                assessed.extend(r["hash"] for r in result if r["decision"] == "would_fail")
+                save_batch_state(path, state)
+                # Even if the API changes ordering, stable keys preserve fairness.
+                self.s.routes["/api/v3/queue"]["records"].reverse()
+            self.assertEqual(assessed, [self.h, other, self.h, other])
+
+    def test_rotation_across_instances(self):
+        other = "b" * 40
+        uhd = copy.deepcopy(self.s)
+        uhd.routes["/api/v3/queue"]["records"][0]["downloadId"] = other
+        uhd.routes["/api/v3/history"]["records"][0]["downloadId"] = other
+        self.qb.routes["/api/v2/torrents/info"].append(dict(self.t, hash=other, category="tv-uhd"))
+        self.config["sonarr"]["UHD"] = copy.deepcopy(self.config["sonarr"]["HD"])
+        self.config["sonarr"]["UHD"]["category"] = "tv-uhd"
+        uhd.routes["/api/v3/downloadclient"][0]["fields"][0]["value"] = "tv-uhd"
+        self.config["max_torrents_per_run"] = 1
+        state, assessed = {}, []
+        for _ in range(2):
+            result = run(self.config, self.qb, {"HD": self.s, "UHD": uhd}, now=1000, batch_state=state)
+            assessed.extend(r["instance"] for r in result if r["decision"] == "would_fail")
+        self.assertEqual(assessed, ["HD", "UHD"])
+
     def test_identity_mismatch(self):
         self.s.routes["/api/v3/history"]["records"][0]["episodeId"] = 99
         self.assertEqual(self.check()["reason"], "content_identity_not_in_grab_history")
@@ -149,6 +232,72 @@ class WorkflowTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    @unittest.skipUnless(__import__("os").name == "posix", "Linux hard deadline")
+    def test_deadline_interrupts_slow_stream_before_complete_body(self):
+        import http.server, threading, time
+        class Slow(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"data":"' + b'x' * 40 + b'"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.02)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("localhost", 0), Slow)
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        start = time.monotonic()
+        try:
+            api = Api({"url": "http://localhost:" + str(server.server_port)},
+                      timeout=2, deadline=start + 0.12)
+            with self.assertRaisesRegex(GuardError, "run_time_limit_reached"):
+                api.call("/slow")
+            self.assertLess(time.monotonic() - start, 0.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    @unittest.skipUnless(__import__("os").name == "posix", "Linux permissions")
+    def test_rotated_logs_and_existing_backups_remain_private(self):
+        import logging, os, stat, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"guard.log"
+            path.write_text("old log\n")
+            backup = Path(str(path) + ".1")
+            backup.write_text("old backup\n")
+            for p in (path, backup):
+                p.chmod(0o644)
+            previous = os.umask(0o022)
+            handler = None
+            try:
+                handler = PrivateRotatingFileHandler(path, maxBytes=30, backupCount=3)
+                for _ in range(5):
+                    handler.emit(logging.LogRecord("test", logging.INFO, "", 1, "report" * 10, (), None))
+                handler.flush()
+                for p in Path(folder).iterdir():
+                    self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+            finally:
+                if handler:
+                    handler.close()
+                os.umask(previous)
+
+    def test_equivalent_default_port_redirects_are_accepted(self):
+        import urllib.request
+        for before, after in (("https://example.invalid/api?x=1", "https://example.invalid:443/api?x=2"),
+                              ("http://example.invalid:80/api", "http://example.invalid/api")):
+            req = urllib.request.Request(before)
+            redirected = SameOriginRedirect().redirect_request(req, None, 302, "", {}, after)
+            self.assertEqual(redirected.full_url, after)
+
     @unittest.skipUnless(__import__("os").name == "posix", "Linux process locking")
     def test_overlapping_cli_run_exits_before_api_access(self):
         import fcntl, json, os, subprocess, sys, tempfile
@@ -174,7 +323,8 @@ class TransportTests(unittest.TestCase):
     def test_cross_origin_and_https_downgrade_refused(self):
         import urllib.request
         req = urllib.request.Request("https://example.invalid/api")
-        for target in ("http://example.invalid/api", "https://other.invalid/api"):
+        for target in ("http://example.invalid/api", "https://other.invalid/api",
+                       "https://example.invalid:8443/api"):
             with self.assertRaises(GuardError):
                 SameOriginRedirect().redirect_request(req, None, 302, "", {}, target)
 

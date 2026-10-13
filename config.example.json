@@ -13,6 +13,10 @@
       "url": "http://sonarr-hd.example.invalid:8989",
       "api_key": "REPLACE_ME",
       "category": "tv-hd",
+      "download_client_binding": {
+        "id": 1,
+        "endpoint": "https://downloader.example.invalid"
+      },
       "indexers": {
         "public": ["Public Source"],
         "private": ["Private Source", "Private Source - Freeleech"]
@@ -22,6 +26,10 @@
       "url": "http://sonarr-uhd.example.invalid:8989",
       "api_key": "REPLACE_ME",
       "category": "tv-uhd",
+      "download_client_binding": {
+        "id": 1,
+        "endpoint": "https://downloader.example.invalid"
+      },
       "indexers": {
         "public": ["Public Source"],
         "private": ["Private Source", "Private Source - Freeleech"]

@@ -9,6 +9,7 @@ config.json
 *.log.*
 *.lock
 state*.json
+batch-state.json
 HANDOFF*
 handoff*
 staging/

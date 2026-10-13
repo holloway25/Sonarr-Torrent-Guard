@@ -11,6 +11,13 @@ share is not needed for this milestone. Use `config.example.json` as the schema,
 but enter live credentials only in a file outside the checkout. Set its mode to
 600 and its parent directory to 700. Indexer names exactly match Sonarr history.
 
+Each instance must have `download_client_binding` with the expected Sonarr client
+ID and its exact endpoint. The pinned endpoint must match both the monitored
+qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. Default
+ports are normalized. Missing or changed bindings fail closed. Different proxy
+aliases are not assumed to reach the same server; configure a shared verified
+endpoint instead. Credentials and bindings stay in the external configuration.
+
 ```sh
 python3 guard.py --config /path/outside/checkout/connections.json
 ```
@@ -20,15 +27,27 @@ with three backups. Keep runtime files outside Git. No service or schedule is
 installed. A future schedule should run every five minutes. A process lock beside
 the configuration prevents overlaps and releases on process exit.
 
+The active log and retained numbered backups have mode 600, including newly
+created files after rollover under a permissive process umask. Log symlinks are
+refused. Ownership/category/client mismatches do not consume the torrent work
+allowance. Eligible hashes rotate across both instances using an atomically
+saved, mode-600 `batch-state.json` beside the external config. The next run resumes
+after the last assessed key, so later candidates get turns even after restarts or
+queue reordering. Exceeding the work allowance reports deferred hashes explicitly.
+
 Requests have timeouts, response-size/page limits and a shared three-minute
-request deadline. Cross-origin redirects and HTTPS downgrades are refused.
+wall-clock request/assessment deadline enforced by Linux interval signals,
+including slowly streamed bodies. API calls run in the main thread. Cross-origin
+redirects and HTTPS downgrades are refused; equivalent default-port redirects
+are accepted. Failed runs do not imply any live action occurred.
 The only POST is qBittorrent authentication; assessment uses GET. TLS certificates
 are verified. Explicit public and private source lists protect unknown sources.
 
 ## Public policy
 
 Ownership requires the correct Sonarr queue hash, category, configured download
-client, known series/episode and matching grab-history provenance. Names alone
+client bound to the actual monitored endpoint, known series/episode and matching
+grab-history provenance. Names alone
 are insufficient. Multiple episode rows produce one proposal per torrent.
 Private sources are protected before file assessment.
 
