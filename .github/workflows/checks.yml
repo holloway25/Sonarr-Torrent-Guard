@@ -10,5 +10,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m unittest -v test_guard test_safety
+      - run: python -m unittest -v test_guard test_safety test_production
       - run: python tools/privacy_check.py --all

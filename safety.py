@@ -1,7 +1,4 @@
-"""Fresh-assessment validation, private journals and simulation-only recovery.
-
-There is deliberately no production sender or live execution mode.
-"""
+"""Fresh assessment and private journals; live single tests require a separate gate."""
 
 import hashlib
 import json
@@ -72,7 +69,7 @@ class Journal:
     Rows are bounded without deleting unresolved evidence. Transactions use FULL
     synchronization. Preview and simulation rows cannot authorize production work.
     """
-    def __init__(self, path, limit=1000):
+    def __init__(self, path, limit=1000, allow_single_test=False):
         self.path = Path(path)
         if self.path.is_symlink() or self.path.parent.stat().st_mode & 0o077:
             raise SafetyError("journal_requires_private_directory")
@@ -86,7 +83,15 @@ class Journal:
             if sidecar.exists():
                 sidecar.chmod(0o600)
         self.limit = limit
+        self.allow_single_test = allow_single_test is True
         self.db = sqlite3.connect(self.path, timeout=5)
+        try:
+            self._initialize()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize(self):
         self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS actions ("
@@ -101,6 +106,8 @@ class Journal:
                 "confirmed": "TEXT NOT NULL DEFAULT '{}'",
                 "current_observation": "TEXT NOT NULL DEFAULT '{}'",
                 "observation_available": "INTEGER NOT NULL DEFAULT 0",
+                "context": "TEXT NOT NULL DEFAULT '{}'",
+                "dispatched_at": "REAL",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -116,15 +123,23 @@ class Journal:
 
     def get(self, key):
         row = self.db.execute("SELECT mode,stage,evidence,observation,confirmed,current_observation,"
-                              "observation_available FROM actions WHERE key=?", (key,)).fetchone()
+                              "observation_available,context,dispatched_at FROM actions WHERE key=?", (key,)).fetchone()
         return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
                                         "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
                                         "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
-                                        "observation_available": bool(row[6])}
+                                        "observation_available": bool(row[6]), "context": json.loads(row[7]),
+                                        "dispatched_at": row[8]}
 
-    def prepare(self, report, mode="preview"):
-        if mode not in ("preview", "simulation"):
+    def prepare(self, report, mode="preview", context=None):
+        if mode not in ("preview", "simulation") and not (mode == "single_test" and self.allow_single_test):
             raise SafetyError("live_execution_disabled")
+        if mode == "single_test" and context is None:
+            raise SafetyError("operation_context_required")
+        if context is not None:
+            if mode != "single_test":
+                raise SafetyError("unexpected_action_context")
+            from production import validate_context
+            context = validate_context(context)
         value = evidence(report)
         key = hashlib.sha256(json.dumps([mode, value["instance"], value["hash"]]).encode()).hexdigest()
         with self.db:
@@ -136,8 +151,8 @@ class Journal:
                 return old
             if self.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0] >= self.limit:
                 raise SafetyError("journal_capacity_reached")
-            self.db.execute("INSERT INTO actions(key,mode,stage,evidence,observation,updated) VALUES(?,?,?,?,?,?)",
-                            (key, mode, "prepared", json.dumps(value), "{}", time.time()))
+            self.db.execute("INSERT INTO actions(key,mode,stage,evidence,observation,updated,context) VALUES(?,?,?,?,?,?,?)",
+                            (key, mode, "prepared", json.dumps(value), "{}", time.time(), json.dumps(context or {})))
         return self.get(key)
 
     def transition(self, key, expected, stage, observation=None):
@@ -154,7 +169,8 @@ class Journal:
             row = self.get(key)
             if row is None or row["stage"] != expected:
                 raise SafetyError("journal_stage_changed")
-            if stage == "dispatch_recorded" and row["mode"] != "simulation":
+            if stage == "dispatch_recorded" and not (row["mode"] == "simulation" or
+                    (row["mode"] == "single_test" and self.allow_single_test)):
                 raise SafetyError("live_execution_disabled")
             current = {} if observation is None else clean_observation(observation)
             last_known = dict(row["observation"])
@@ -168,10 +184,11 @@ class Journal:
                 raise SafetyError("completion_not_verified")
             if any(val is False and row["confirmed"].get(field) is True for field, val in current.items()):
                 stage = "manual_review"
+            dispatched_at = time.time() if stage == "dispatch_recorded" else row["dispatched_at"]
             self.db.execute("UPDATE actions SET stage=?,observation=?,confirmed=?,current_observation=?,"
-                            "observation_available=?,updated=? WHERE key=? AND stage=?",
+                            "observation_available=?,updated=?,dispatched_at=? WHERE key=? AND stage=?",
                             (stage, json.dumps(last_known), json.dumps(confirmed), json.dumps(current),
-                             observation is not None, time.time(), key, expected))
+                             observation is not None, time.time(), dispatched_at, key, expected))
         return self.get(key)
 
 
@@ -187,7 +204,7 @@ def record_preview(journal, original, recheck, now=None):
 def reconcile(journal, key, observe):
     """Read evidence only. No dispatch/retry path exists during recovery."""
     row = journal.get(key)
-    if row is None or row["mode"] != "simulation":
+    if row is None or row["mode"] not in ("simulation", "single_test"):
         raise SafetyError("live_execution_disabled")
     if row["stage"] not in ("dispatch_recorded", "uncertain", "replacement_pending"):
         return row

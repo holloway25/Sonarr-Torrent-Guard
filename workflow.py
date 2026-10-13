@@ -27,7 +27,7 @@ def preview_failure(report, readiness):
     Both retry switches are required conservatively, regardless of grab origin.
     """
     plan = {"status": "preview_only", "live_enabled": False,
-            "blockers": ["live_executor_not_implemented", "fresh_recheck_required"],
+            "blockers": ["live_sender_disabled", "fresh_recheck_required"],
             "request_preview": None, "replacement_owner": "sonarr", "extra_search": False}
     ids = report.get("queue_ids")
     if (report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True

@@ -220,6 +220,7 @@ class SafetyTests(unittest.TestCase):
             db.execute("INSERT INTO actions VALUES(?,?,?,?,?,?)", (
                 "legacy-key", "simulation", "replacement_pending", json.dumps(evidence(self.original)),
                 json.dumps(positives), 1000))
+        db.close()
         for _ in range(2):
             journal = Journal(legacy)
             try:

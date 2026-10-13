@@ -310,7 +310,7 @@ class ReportingWorkflowTests(unittest.TestCase):
         self.assertFalse(plan["live_enabled"])
         self.assertFalse(plan["extra_search"])
         self.assertIn("fresh_recheck_required", plan["blockers"])
-        self.assertIn("live_executor_not_implemented", plan["blockers"])
+        self.assertIn("live_sender_disabled", plan["blockers"])
 
     def test_disabled_or_unverified_retries_are_explicit_blockers(self):
         cases = [({}, "retry_settings_unverified"),

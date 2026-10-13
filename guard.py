@@ -1,4 +1,4 @@
-"""Public Sonarr torrent assessment. No live action implementation is present."""
+"""Public Sonarr dry-run assessment. This command never sends live actions."""
 
 import argparse
 import collections
@@ -427,6 +427,9 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
             report.update(public_source_confirmed=True, indexer=source,
                           queue_ids=sorted({r["id"] for r in rows}),
+                          download_id_spelling=rows[0]["downloadId"],
+                          series_ids=sorted({r["seriesId"] for r in rows}),
+                          episode_ids=sorted({r["episodeId"] for r in rows}),
                           download_client_id=instance["download_client_binding"]["id"],
                           file_count=len(files), selected_file_count=sum(f["priority"] > 0 for f in files),
                           torrent_state=state)

@@ -1,8 +1,10 @@
 # Sonarr Torrent Guard
 
-A standard-library Python public-download checker. This milestone reports
-proposals only. No torrent deletion, blocklist, search, resume, extraction,
-priority change or file cleanup is implemented.
+A standard-library Python public-download checker. The normal command reports
+proposals only. A separately gated single-test sender and read-only production
+verifier exist for review; the sender is disabled. No live requests have been
+approved or enabled. No routine live mode, additional search, resume, extraction,
+priority change or filesystem cleanup is implemented.
 
 ## Setup
 
@@ -90,14 +92,14 @@ failed the release.
 Read-only readiness checks inspect both failed-download retry switches. Disabled,
 missing or unreadable switches block the proposed replacement workflow; this
 program does not change settings. Request previews are data only. The API adapter
-has no DELETE or replacement-search implementation. See
+never sends DELETE or replacement searches. See
 [public workflow](docs/PUBLIC-WORKFLOW.md) for the reviewed request sequence,
 verification and recovery requirements before live implementation.
 
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety
+python3 -m unittest -v test_guard test_safety test_production
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -113,7 +115,8 @@ commit dispatch intent before a fake sender runs, interrupt/restart processing,
 and reconcile independently supplied observations without resending. Completion
 requires separate positive evidence of removal, data deletion, failure,
 blocklisting and replacement. Unknown/partial results stay unresolved or require
-manual review. There is no production sender or production evidence collector.
+manual review. The disabled single-test sender reuses the durable intent and
+reconciliation logic; the production verifier is described below.
 
 Recovery keeps historical positive confirmations separately from last-known
 results and the current observation's availability. Outages, absent fields and
@@ -130,13 +133,59 @@ retains at most 1000 rows and refuses new ones at capacity; it never silently
 deletes unresolved evidence. Changed stored evidence requires review. Do not
 delete the journal to force a retry. Backups and exports must also stay outside Git.
 
+## Production preflight and disabled single-test sender
+
+```sh
+python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
+```
+
+Preflight rereads the candidate and retry settings, captures old history/blocklist
+IDs, checks the reviewed Sonarr version, and exercises independent read-only
+outcome checks. It does not prepare a dispatch journal entry or generate approval.
+The verifier matches failure history by original hash and episode identity. New
+replacement grabs must have different valid hashes for the affected episodes and
+the same bound client. Blocklist API records have no hash: new IDs are correlated
+by original release-title digest, indexer, series and episodes. Pre-existing
+records never count as new results. After dispatch, event dates must also be at
+or after the durably recorded dispatch time; unsynchronized clocks can prevent
+confirmation and require review.
+
+`production.py` pins the reviewed Sonarr source version and fails closed on
+version/client/endpoint drift. API failures leave affected observations unknown.
+The API cannot prove download-side data deletion; `data_deleted` stays unknown,
+so API-only reconciliation cannot mark an operation completely verified. No
+download or library share is mounted/scanned for this purpose.
+
+The single-test coordinator requires all of: an enabled code release gate
+(currently false), an explicit non-dry-run invocation separate from normal CLI,
+a single-test-enabled private journal, and a human approval bound to one instance,
+hash, ownership/manifest fingerprints, nonce and expiry within five minutes. No
+approval file is created by the app. There is no CLI live switch. It takes the
+worker lock, captures baselines, rechecks immediately before intent/dispatch,
+commits the exact queue operation context and dispatch timestamp, and sends only
+the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
+It never directly deletes from qBittorrent or submits an extra search.
+
+Existing single-test records, including prepared/uncertain records, only enter
+read-only recovery, never a second send. Following any future approved test:
+
+```sh
+python3 production.py --config /path/outside/checkout/connections.json --observe INSTANCE TORRENT_HASH
+```
+
+This reconciles a recorded single-test operation without approval or dispatch.
+Preview/simulation journal namespaces cannot authorize a single test. Production
+context stores only exact IDs, public indexer identity, times and digests, not raw
+release titles, endpoint addresses or credentials. Live integration and independent
+file-deletion confirmation remain required before any activation decision.
+
 ## Remaining milestones
 
 - Validate controlled dry-run candidates.
 - Add explicit Sonarr v5 compatibility tests. This milestone uses Sonarr v4's v3 API.
-- Review the documented live workflow and readiness results, then implement and
-  verify live failure/removal/replacement separately. Every mutation requires
-  fresh ownership/file checks. No current switch enables live execution.
+- Review the disabled sender and production verifier, then explicitly approve a
+  controlled single-torrent integration test separately. Define independent data
+  deletion confirmation. No current CLI switch enables live execution.
 - Longer term: define private split-RAR selection, share access, safe extraction, atomic
   publication, positive import confirmation and exact helper-file cleanup.
 - Package for containers once runtime and storage design are confirmed; add a

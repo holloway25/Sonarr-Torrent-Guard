@@ -1,13 +1,14 @@
-# Public failure workflow: specification and preview only
+# Public failure workflow: dry-run and disabled single-test implementation
 
-No live executor exists. This document defines the next implementation milestone;
-unit-tested request previews do not establish production mutation behaviour.
+A gated single-test sender and read-only production verifier exist for review.
+The release gate is false; unit-tested requests do not establish production
+mutation behaviour, and no live test is currently authorized.
 Private-source downloads, the private archive helper, Docker deployment and the
 web UI remain separate future work. Existing seeding/removal policies stay intact.
 
 Fresh read-only assessment and a private SQLite journal are now implemented.
-Dispatch/recovery behaviour is tested using a simulation-only harness; no
-production sender or result-verification adapter exists yet. Enable
+Dispatch/recovery behaviour is tested using simulations and mocked production
+adapters. Enable
 `--check-safeguards` to exercise rechecks and preview journaling against the APIs.
 
 ## Proposed normal path
@@ -73,7 +74,7 @@ appropriate client-side verification without adding broad filesystem access.
 
 `workflow.py` only reads retry configuration and creates a `request_preview`
 dictionary. It never sends the described request. Every preview remains blocked
-by `live_executor_not_implemented` and `fresh_recheck_required`, plus any retry
+by `live_sender_disabled` and `fresh_recheck_required`, plus any retry
 setting problems. A protected/kept/unidentified candidate gets no request preview.
 Multiple queue rows yield one preview, and no additional search is planned.
 
@@ -96,8 +97,8 @@ response, 2xx status or disappeared queue item is never sufficient by itself.
 Journal records omit raw endpoints, file paths, titles and credentials. The
 private directory/database requirements, bounded row count and preservation of
 unresolved records are intentional. Corrupt journals fail closed instead of
-being reset. Production collection of independently verified observations and
-an approved live transport remain required before a controlled live test.
+being reset. The separately gated sender and read-only verifier extend these
+requirements without enabling the normal CLI to mutate anything.
 
 Journal recovery stores three distinct views: historical positive `confirmed`
 flags, merged last-known `observation` values, and `current_observation` with an
@@ -110,6 +111,38 @@ positive results in the current snapshot, never just a historical union.
 Schema migration preserves existing observations and initializes historical
 confirmations from them; it cannot reconstruct evidence already lost before
 the migration.
+
+## Production verification and sender gates
+
+`production.py --preflight INSTANCE HASH` rereads an exact candidate, confirms
+retry settings and reviewed-version/client binding, and captures baseline IDs.
+Its read-only verifier independently checks qBittorrent torrent absence, new
+Sonarr failure history, new blocklist records and newer replacement grabs for
+the affected episodes. It does not infer results from queue disappearance.
+The blocklist API has no download hash; correlation uses a release-title digest,
+indexer, series/episodes and newly added record IDs. Failure history additionally
+must match the original hash; replacement hashes must differ. Client-name
+digests bind matching history records to the configured downloader.
+
+Dispatch time is stored with intent, and matching result events must be at or
+after that timestamp as well as absent from the pre-dispatch baselines. Missing
+timestamps, API outages, malformed identities or clock disagreement prevent
+positive confirmation. These checks establish observed results, not proof that
+every concurrent manual action was caused by the guard.
+
+Production observations always leave `data_deleted` unknown because no supported
+API proves download-side deletion. Consequently the production verifier cannot
+claim complete verification without a separately designed independent proof.
+No filesystem/share access was added, and no library path can be deleted.
+
+The sender requires a currently disabled code release gate, a separate explicit
+non-dry-run invocation, an armed single-test journal and a short-lived approval
+for one hash/instance and exact evidence fingerprints. It takes the worker lock,
+captures baselines and performs a final fresh check before recording dispatch.
+There is no general live CLI mode or approval generator. Request redirects and
+retries are refused. Existing prepared/uncertain single-test records only recover
+through observations, never automatic dispatch. `--observe INSTANCE HASH` exposes
+that read-only recovery route using the stored operation context.
 
 `reports.py` renders these results for humans and emits versioned JSON data. This
 is the boundary a future read-only web UI can consume. Runtime titles are optional
