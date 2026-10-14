@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from authorization import RoutineAuthorization, code_digest, scope_digest, RULE
+from authorization import RoutineAuthorization, code_digest, scope_digest, RULE, MAX_TRIAL_SECONDS
 from guard import run
 import production
 import routine
@@ -53,7 +53,8 @@ class RoutineTests(unittest.TestCase):
     def test_disabled_expired_future_or_overlong_permission_is_refused(self):
         now = time.time()
         for changes in ({"enabled": False}, {"expires_at": now - 1}, {"issued_at": now + 20},
-                        {"expires_at": now + 172801}, {"rule": "other-workflow"}, {"grant_id": "bad"}):
+                        {"expires_at": self.grant["issued_at"] + MAX_TRIAL_SECONDS + 1},
+                        {"rule": "other-workflow"}, {"grant_id": "bad"}):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 RoutineAuthorization(dict(self.grant, **changes), self.f.config)
 
@@ -67,6 +68,18 @@ class RoutineTests(unittest.TestCase):
         self.authority.value["expires_at"] += 1
         with self.assertRaises(SafetyError):
             self.authority.validate(self.f.config)
+
+    def test_seven_day_trial_accepts_boundary_and_refuses_expiry_or_longer_grant(self):
+        self.assertEqual(MAX_TRIAL_SECONDS, 7 * 24 * 60 * 60)
+        grant = dict(self.grant, expires_at=self.grant["issued_at"] + MAX_TRIAL_SECONDS)
+        authority = RoutineAuthorization(grant, self.f.config)
+        with patch("time.time", return_value=grant["expires_at"] - 0.001):
+            authority.validate(self.f.config)
+        with patch("time.time", return_value=grant["expires_at"]), self.assertRaisesRegex(
+                SafetyError, "routine_authorization_expired_or_scope_changed"):
+            authority.validate(self.f.config)
+        with self.assertRaises(SafetyError):
+            RoutineAuthorization(dict(grant, expires_at=grant["expires_at"] + 1), self.f.config)
 
     def test_private_unknown_and_nonfailure_reports_cannot_be_authorized(self):
         for changes in ({"indexer": "Private Source"}, {"indexer": "Unknown Source"},

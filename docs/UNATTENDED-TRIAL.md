@@ -15,7 +15,9 @@ directory must be owner-private, outside the checkout. It contains exactly:
 - `enabled`: true only for an explicitly approved trial.
 - `rule`: `public-sonarr-cleanup-v2` (includes the explicitly agreed metadata timeout).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
-- `issued_at`, `expires_at`: UTC epoch times, no longer than 48 hours apart.
+- `issued_at`, `expires_at`: UTC epoch times, no longer than seven days apart.
+  Increasing the code limit does not extend an existing grant. Any extension
+  requires explicit operator approval and a newly issued grant; no automatic renewal.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
 - `code_digest`: `authorization.code_digest()` for the reviewed application files.
 

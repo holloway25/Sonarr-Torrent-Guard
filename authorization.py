@@ -10,7 +10,7 @@ from guard import endpoint_key, METADATA_TIMEOUT_SECONDS
 from safety import SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v2"
-MAX_TRIAL_SECONDS = 48 * 60 * 60
+MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
 SOURCE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
                 "authorization.py", "routine.py", "workflow.py", "reports.py")
 

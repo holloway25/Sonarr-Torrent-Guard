@@ -274,7 +274,7 @@ Paths are templates; review them for the chosen installation before any use.
 ## Unattended trial entry point
 
 `routine.py --live` uses a separate explicit, owner-private authorization grant
-bound to the reviewed application and configured scope, for at most 48 hours.
+bound to the reviewed application and configured scope, for at most seven days.
 There is no installed/enabled grant by default. It uses the same coordinator and
 Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
 action and grant digest; old uncertain evidence is preserved, while a strictly
