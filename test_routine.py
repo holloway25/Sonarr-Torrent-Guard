@@ -181,6 +181,38 @@ class RoutineTests(unittest.TestCase):
         self.assertIn("OnUnitInactiveSec=10min", (folder / "sonarr-torrent-guard-live.timer").read_text())
         self.assertIn("routine.py --live", (folder / "sonarr-torrent-guard-live.service").read_text())
 
+    def test_full_journal_hold_records_reason_and_grant_without_sending(self):
+        f = self.f
+        f.journal.limit = 0
+        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
+                    "recovery": []}
+        events = []
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal, events.append)
+        action = result["actions"][0]
+        self.assertEqual(action["stage"], "held")
+        self.assertEqual(action["stop_reason"], "journal_capacity_reached")
+        self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
+        self.assertEqual(events, result["actions"])
+        send.assert_not_called()
+
+    def test_held_errors_only_log_exact_allowlisted_reasons(self):
+        f = self.f
+        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
+                    "recovery": []}
+        for error in (SafetyError("previous_attempt_unresolved"),
+                      SafetyError("journal_capacity_reached secret-payload"),
+                      routine.GuardError("private-response secret-payload")):
+            with self.subTest(error=type(error).__name__), patch(
+                    "production.execute_routine_attempt", side_effect=error):
+                result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal)
+            action = result["actions"][0]
+            expected = ("previous_attempt_unresolved" if str(error) == "previous_attempt_unresolved"
+                        else "maintenance_or_safety_check_unavailable")
+            self.assertEqual(action["stop_reason"], expected)
+            self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
+            self.assertNotIn("secret-payload", json.dumps(result))
+
 
 if __name__ == "__main__":
     unittest.main()

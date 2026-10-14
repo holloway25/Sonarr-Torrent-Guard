@@ -13,7 +13,15 @@ from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, l
                    load_batch_state, save_batch_state)
 import production
 import public
-from safety import Journal, SafetyError
+from safety import DISPATCH_STOP_REASONS, Journal, SafetyError
+
+
+HELD_REASONS = DISPATCH_STOP_REASONS | {
+    "journal_capacity_reached", "previous_attempt_unresolved", "another_run_is_active",
+    "approval_already_consumed", "new_attempt_not_confirmed", "attempt_identity_required",
+    "routine_authorization_invalid", "routine_code_not_authorized",
+    "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
+}
 
 
 def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None):
@@ -33,8 +41,11 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
                 "key": row["key"], "stage": row["stage"], "confirmed": row["confirmed"],
                 "current_observation": row["current_observation"], "stop_reason": row["stop_reason"],
                 "routine_grant_digest": authority.identifier})
-        except (GuardError, SafetyError):
-            actions.append({"instance": report["instance"], "hash": report["hash"], "stage": "held"})
+        except (GuardError, SafetyError) as error:
+            # Only exact known codes may reach logs; exception text can contain secrets.
+            reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
+            actions.append({"instance": report["instance"], "hash": report["hash"], "stage": "held",
+                "stop_reason": reason, "routine_grant_digest": authority.identifier})
         if on_action is not None:
             on_action(actions[-1])
     return {"mode": "routine", "live_authorized": True, "status": "completed", "retry_after_seconds": 600,

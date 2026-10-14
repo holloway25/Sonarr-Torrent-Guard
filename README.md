@@ -175,7 +175,7 @@ The single-test coordinator requires all of: an enabled code release gate
 (currently false), an explicit non-dry-run invocation separate from normal CLI,
 a single-test-enabled private journal, and a human approval bound to one instance,
 hash, ownership/manifest fingerprints, nonce and expiry within five minutes. No
-approval file is created by the app. There is no CLI live switch. It takes the
+approval file is created by the app. There is no single-test CLI live switch. It takes the
 worker lock, captures baselines, rechecks immediately before intent/dispatch,
 commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
@@ -289,7 +289,8 @@ maintenance, expiry, reporting and capacity boundaries.
 - Add explicit Sonarr v5 compatibility tests. This milestone uses Sonarr v4's v3 API.
 - Review the disabled sender and production verifier, then explicitly approve a
   controlled single-torrent integration test separately. Define independent data
-  deletion confirmation. No current CLI switch enables live execution.
+  deletion confirmation. Guard/public commands remain dry-run; the routine worker
+  requires explicit live mode and a valid, unexpired grant.
 - Longer term: define private split-RAR selection, share access, safe extraction, atomic
   publication, positive import confirmation and exact helper-file cleanup.
 - Package for containers once runtime and storage design are confirmed; add a
