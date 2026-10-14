@@ -8,7 +8,8 @@ priority change or filesystem cleanup is implemented.
 
 ## Setup
 
-Linux, Python 3.9+ and Australia/Sydney timezone data are required. The download
+Linux and Python 3.9+ are required. Configure the operating system's local
+timezone for reporting; no particular regional timezone is required. The download
 share is not needed for this milestone. Use `config.example.json` as the schema,
 but enter live credentials only in a file outside the checkout. Set its mode to
 600 and its parent directory to 700. Indexer names exactly match Sonarr history.

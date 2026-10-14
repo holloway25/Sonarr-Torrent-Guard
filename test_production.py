@@ -215,6 +215,34 @@ class ProductionTests(unittest.TestCase):
                 production.validate_approval(dict(self.approval, **change), self.report)
         production.validate_approval(self.approval, self.report)
 
+    def test_changed_sonarr_endpoint_invalidates_original_approval_before_send(self):
+        self.config["sonarr"]["HD"]["url"] = "https://other-sonarr.example.invalid"
+        refreshed = run(self.config, self.qb, self.apis)[0]
+        with self.assertRaisesRegex(SafetyError, "approval_expired_or_target_mismatch"):
+            production.validate_approval(self.approval, refreshed)
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete") as sender:
+            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
+                production.execute_single_test(self.config, self.qb, self.apis,
+                                               self.journal, self.report, self.approval)
+            sender.assert_not_called()
+
+    def test_sonarr_endpoint_drift_during_final_recheck_cancels_dispatch(self):
+        original = production.recheck_candidate
+        checks = []
+        def recheck(*args):
+            checks.append(1)
+            if len(checks) == 2:
+                self.config["sonarr"]["HD"]["url"] = "https://other-sonarr.example.invalid"
+            return original(*args)
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.recheck_candidate", side_effect=recheck), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "cancelled")
+            sender.assert_not_called()
+
     def test_controlled_sender_records_intent_then_sends_exactly_once(self):
         stages = []
         def send(api, queue_id):

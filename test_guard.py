@@ -68,6 +68,7 @@ class WorkflowTests(unittest.TestCase):
         self.config = {"sonarr": {"HD": {"category": "tv-hd", "indexers": {
             "public": ["Public Source"], "private": ["Private Source"]}}}}
         self.config["qbittorrent"] = {"url": "https://downloader.example.invalid"}
+        self.config["sonarr"]["HD"]["url"] = "https://sonarr.example.invalid"
         self.config["sonarr"]["HD"]["download_client_binding"] = {
             "id": 1, "endpoint": "https://downloader.example.invalid:443"}
         self.row = {"id": 1, "downloadId": self.h.upper(), "seriesId": 2,
@@ -170,6 +171,16 @@ class WorkflowTests(unittest.TestCase):
         original = self.check()
         self.qb.routes["/api/v2/torrents/info"][0]["name"] = "Different display name"
         self.assertEqual(original["attempt_fingerprint"], self.check()["attempt_fingerprint"])
+
+    def test_ownership_binds_normalized_sonarr_endpoint(self):
+        original = self.check()["ownership_fingerprint"]
+        self.config["sonarr"]["HD"]["url"] = "https://sonarr.example.invalid:443/"
+        self.assertEqual(original, self.check()["ownership_fingerprint"])
+        for url in ("https://other.example.invalid", "http://sonarr.example.invalid",
+                    "https://sonarr.example.invalid:8443", "https://sonarr.example.invalid/another"):
+            with self.subTest(url=url):
+                self.config["sonarr"]["HD"]["url"] = url
+                self.assertNotEqual(original, self.check()["ownership_fingerprint"])
 
     def test_mixed_latest_episode_sources_are_ambiguous(self):
         row = dict(self.row, id=2, episodeId=5)

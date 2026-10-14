@@ -450,6 +450,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                 json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
             ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
                          "client_id": report["download_client_id"],
+                         "sonarr_endpoint": endpoint_key(instance["url"]),
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
                          "attempt": report["attempt_fingerprint"],
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}

@@ -85,13 +85,23 @@ changing download progress; filenames themselves are not journaled. A fresh read
 still cannot eliminate the small race with external changes before a future
 mutation. Production execution must recheck directly before dispatch.
 
+Ownership binds both normalized endpoints: the owning Sonarr instance and the
+monitored qBittorrent server. Changing Sonarr's host, scheme, effective port or
+base path invalidates the reviewed fingerprint and approval even if the new
+server returns identical IDs and content. Equivalent default-port spelling does
+not change identity. Earlier snapshots lacking this binding must be freshly
+assessed; existing journal evidence is not silently rewritten to match.
+
 The external journal uses transactional, fully synchronized SQLite with a unique
-mode/instance/hash key. Preview rows never enter dispatch states. Simulation rows
-commit `dispatch_recorded` before invoking the fake sender. Recovery from that
+mode/instance/hash key for legacy and single-test records. New preview/simulation
+keys also include the attempt fingerprint. Preview rows never enter dispatch
+states. Simulation rows commit `dispatch_recorded` before invoking the fake sender. Recovery from that
 stage, a lost response or restart reconciles observations only and never invokes
-the sender again. Data removal without confirmed failure/blocklisting requires
-manual review; confirmed failure without replacement or data-deletion evidence
-stays pending. Complete requires all five positive observations. A missing
+the sender again. After observed removal, explicitly negative failure/blocklist
+evidence requires manual review; unknown results remain uncertain. Contradictions
+of historical positive evidence also require manual review. Confirmed failure
+and blocklisting without replacement or data-deletion evidence stays pending.
+Complete requires all five positive observations. A missing
 response, 2xx status or disappeared queue item is never sufficient by itself.
 
 Journal records omit raw endpoints, file paths, titles and credentials. The
