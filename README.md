@@ -3,7 +3,8 @@
 A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
-are currently authorized. No routine live CLI, additional search, resume, extraction,
+are currently enabled by default. An explicitly granted, expiring routine CLI is
+available for review. No additional search, resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Setup
@@ -102,7 +103,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public test_timing
+python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -240,7 +241,9 @@ armed journal and exact short-lived approval requirement. It does not authorize
 itself from the scheduler. Each action binds the attempt and approval digest;
 a later confirmed grab needs a new approval and newer addition/grab identities.
 Uncertain, prepared or manual-review production records prevent another cleanup
-for that instance/hash through either sender mode, including single-test actions.
+of that same attempt through either sender mode, including single-test actions.
+An independently confirmed newer grab can supersede an older hold without
+rewriting historical evidence; see the unattended trial rules below.
 Definite unsent cancelled/blocked records are preserved;
 after maintenance a new exact approval may prepare a distinct operation, never
 resend from recovery or reuse the old approval. Final connectivity/version,
@@ -258,6 +261,18 @@ before unattended long-term activation.
 dry-run CLI. They are not installed or enabled. The timer waits ten minutes after
 each completed cycle, avoids catch-up bursts and cannot enable either sender.
 Paths are templates; review them for the chosen installation before any use.
+
+## Unattended trial entry point
+
+`routine.py --live` uses a separate explicit, owner-private authorization grant
+bound to the reviewed application and configured scope, for at most 48 hours.
+There is no installed/enabled grant by default. It uses the same coordinator and
+Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
+action and grant digest; old uncertain evidence is preserved, while a strictly
+newer confirmed grab may be handled independently. Separate live user-unit
+templates are provided but not automatically installed. See
+[unattended trial](docs/UNATTENDED-TRIAL.md) for exact permission, supersession,
+maintenance, expiry, reporting and capacity boundaries.
 
 ## Remaining milestones
 

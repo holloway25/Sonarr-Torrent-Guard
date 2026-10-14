@@ -11,7 +11,8 @@ OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted",
 DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
                          "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
-                         "dispatch_clock_unavailable"}
+                         "dispatch_clock_unavailable", "routine_authorization_expired_or_scope_changed",
+                         "routine_candidate_not_authorized"}
 
 
 def clean_observation(observation):

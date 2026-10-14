@@ -1,0 +1,11 @@
+[Unit]
+Description=Sonarr Torrent Guard authorised ten-minute public trial
+
+[Timer]
+OnActiveSec=1s
+OnUnitInactiveSec=10min
+Unit=sonarr-torrent-guard-live.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

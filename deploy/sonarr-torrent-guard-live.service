@@ -1,0 +1,10 @@
+[Unit]
+Description=Sonarr Torrent Guard explicitly authorised public trial
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Sonarr-Torrent-Guard
+ExecStart=/usr/bin/python3 %h/Sonarr-Torrent-Guard/routine.py --live --config %h/.config/sonarr-torrent-guard/connections.json --authorization %h/.config/sonarr-torrent-guard/routine-authorization.json --log-file %h/.config/sonarr-torrent-guard/routine.log
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=210

@@ -81,7 +81,7 @@ def cycle(config, qb, apis, journal, batch_state=None):
         try:
             fresh = recheck_candidate(report, config, qb, apis)
             check_fresh(report, fresh)
-            check_prior_attempts(journal, report)
+            check_prior_attempts(journal, report, config=config)
             report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
         except (SafetyError, GuardError) as error:
             report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}

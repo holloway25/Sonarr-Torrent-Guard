@@ -307,7 +307,7 @@ def source_for(api, hash_value, rows, max_pages, added=None):
                and str(r.get("downloadId", "")).lower() == hash_value]
     if not matches:
         raise GuardError("no_sonarr_grab_history")
-    sources, grab_ids = set(), set()
+    sources, grab_ids, grab_times = set(), set(), []
     for row in rows:
         series_id, episode_id = row.get("seriesId"), row.get("episodeId")
         if not integer(series_id) or series_id <= 0 or not integer(episode_id) or episode_id <= 0:
@@ -327,6 +327,7 @@ def source_for(api, hash_value, rows, max_pages, added=None):
             raise GuardError("grab_not_bound_to_current_download") from None
         matching = [latest]
         grab_ids.add(latest["id"])
+        grab_times.append(stamp.timestamp())
         for r in matching:
             data = r.get("data")
             if not isinstance(data, dict) or not isinstance(data.get("indexer"), str):
@@ -334,7 +335,7 @@ def source_for(api, hash_value, rows, max_pages, added=None):
             sources.add(data["indexer"])
     if len(sources) != 1 or not next(iter(sources)):
         raise GuardError("ambiguous_indexer_identity")
-    return next(iter(sources)), sorted(grab_ids)
+    return next(iter(sources)), sorted(grab_ids), min(grab_times)
 
 
 def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False, target=None):
@@ -428,7 +429,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             added = t.get("added_on")
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
-            source, grab_ids = source_for(api, h, rows, max_pages, added)
+            source, grab_ids, grab_time_floor = source_for(api, h, rows, max_pages, added)
             policy = instance["indexers"]
             if source in policy["private"]:
                 raise GuardError("private_source_protected")
@@ -453,6 +454,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                           torrent_state=state)
             report["download_added_on"] = added
             report["grab_ids"] = grab_ids
+            report["grab_time_floor"] = grab_time_floor
             report["attempt_fingerprint"] = hashlib.sha256(
                 json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
             ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
@@ -460,6 +462,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "sonarr_endpoint": endpoint_key(instance["url"]),
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
                          "attempt": report["attempt_fingerprint"],
+                         "grab_time_floor": grab_time_floor,
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
                         for f in sorted(files, key=lambda f: f["index"])]

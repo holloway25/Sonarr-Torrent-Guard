@@ -1,7 +1,8 @@
 # Public failure workflow: dry-run and disabled senders
 
 A gated single-test sender and read-only production verifier exist for review.
-Both release gates are false; unit-tested requests do not establish production
+Manual sender release gates are false; the separate unattended entry point needs
+an explicit expiring routine grant. Unit-tested requests do not establish production
 mutation behaviour, and no live test is currently authorized.
 Private-source downloads, the private archive helper, Docker deployment and the
 web UI remain separate future work. Existing seeding/removal policies stay intact.
@@ -177,11 +178,13 @@ API proves download-side deletion. Consequently the production verifier cannot
 claim complete verification without a separately designed independent proof.
 No filesystem/share access was added, and no library path can be deleted.
 
-The sender requires a currently disabled code release gate, a separate explicit
+The manual sender requires a currently disabled code release gate, a separate explicit
 non-dry-run invocation, an armed single-test journal and a short-lived approval
 for one hash/instance and exact evidence fingerprints. It takes the worker lock,
 captures baselines and performs a final fresh check before recording dispatch.
-There is no general live CLI mode or approval generator. Request redirects and
+`production.py` has no live CLI mode or approval generator. The separately granted
+`routine.py` worker is described in [unattended trial](UNATTENDED-TRIAL.md).
+Request redirects and
 retries are refused. Existing prepared/uncertain single-test records only recover
 through observations, never automatic dispatch. `--observe INSTANCE HASH` exposes
 that read-only recovery route using the stored operation context.
@@ -215,12 +218,20 @@ fingerprint and approval digest. Its separate false release gate, armed journal,
 non-dry-run invocation and exact expiring approval are all mandatory. Both the
 addition time and all current grab IDs must advance beyond earlier resolved
 operations; addition must also be after the earlier dispatch intent. Unresolved
-legacy or per-attempt production records hold the same instance/hash, not other
+legacy or per-attempt production records hold the same attempt, not unrelated
 candidates. Definitely unsent cancelled/blocked records can be followed by a new
 exact approval after maintenance, preserving both records. Recovery never sends.
 Both sender modes perform this related-record check before preparing a new
-action; a single-test approval cannot bypass a public-attempt hold or repeat a
+action; a single-test approval cannot bypass a hold on the same attempt or repeat a
 resolved incarnation. Recovery of an already-recorded operation is read-only.
+
+A confirmed successor may be handled despite an older unresolved record only
+with a different attempt fingerprint, strictly later downloader addition and
+latest affected-episode grab timestamps, and unchanged endpoint/client binding.
+Known earlier grab IDs must advance too. Legacy records without grab IDs need
+the same strictly later timestamp proof. Hash/name/file matches alone do not
+release holds; historical records are never erased or relabelled. Grab timestamps
+are now included in fresh ownership evidence. See the trial document for details.
 
 For this namespace only, `cleanup_resolved` requires all three cleanup positives
 in one current observation: original absence, failure and blocklisting. A union

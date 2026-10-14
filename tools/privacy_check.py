@@ -31,7 +31,7 @@ def main():
         name = raw.decode()
         parts = PurePosixPath(name).parts
         leaf = parts[-1].lower()
-        if (leaf.startswith("handoff") or leaf in ("connections.json", "config.json", "batch-state.json", ".env")
+        if (leaf.startswith("handoff") or leaf in ("connections.json", "config.json", "batch-state.json", ".env", "routine-authorization.json")
                 or leaf.endswith((".log", ".lock", ".zip", ".sqlite3")) or ".sqlite3-" in leaf
                 or any(x in ("local", "downloads", "staging") for x in parts)):
             issues.append((name, "prohibited runtime or handoff artifact"))

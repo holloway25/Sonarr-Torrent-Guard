@@ -25,6 +25,7 @@ from maintenance import require_connectivity
 # Deliberately false until code review and explicit human approval for one test.
 SINGLE_TEST_RELEASE_ENABLED = False
 PUBLIC_ATTEMPT_RELEASE_ENABLED = False
+ROUTINE_RELEASE_ENABLED = False
 SUPPORTED_SONARR_VERSION = "4.0.20.3014"
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
@@ -37,7 +38,8 @@ def digest(value):
 
 
 def validate_context(value):
-    if not isinstance(value, dict) or set(value) not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS):
+    if not isinstance(value, dict) or set(value) not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS,
+            CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | {"routine_grant_digest"}):
         raise SafetyError("invalid_operation_context")
     try:
         if torrent_hash(value["hash"]) != value["hash"]:
@@ -68,6 +70,8 @@ def validate_context(value):
                     or sorted(set(grabs)) != grabs or value["attempt_fingerprint"] != digest(
                         [value["instance"], value["hash"], added, grabs])):
                 raise ValueError()
+        if "routine_grant_digest" in value and not valid_digest(value["routine_grant_digest"]):
+            raise ValueError()
     except (ValueError, TypeError, GuardError):
         raise SafetyError("invalid_operation_context") from None
     return json.loads(json.dumps(value))
@@ -322,7 +326,8 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
 
 def _send_queue_delete(api, queue_id):
     """Narrow transport; called only after the coordinator's gates and durable intent."""
-    if SINGLE_TEST_RELEASE_ENABLED is not True and PUBLIC_ATTEMPT_RELEASE_ENABLED is not True:
+    if (SINGLE_TEST_RELEASE_ENABLED is not True and PUBLIC_ATTEMPT_RELEASE_ENABLED is not True
+            and ROUTINE_RELEASE_ENABLED is not True):
         raise SafetyError("live_execution_disabled")
     if not integer(queue_id) or queue_id <= 0:
         raise SafetyError("invalid_queue_id")
@@ -353,19 +358,61 @@ def execute_public_attempt(config, qb, apis, journal, report, approval):
     return _execute(config, qb, apis, journal, report, approval, "public_attempt")
 
 
-def _enabled(config, journal, mode):
+def execute_routine_attempt(config, qb, apis, journal, report, authority):
+    """Delegated permission is explicit and expiring, not a fabricated human test approval."""
+    from authorization import RoutineAuthorization
+    import secrets
+    if not isinstance(authority, RoutineAuthorization):
+        raise SafetyError("routine_authorization_invalid")
+    authority.validate(config, report)
+    # Exact short-lived execution token is derived under the routine grant. It
+    # cannot authorize another target or outlive the grant; no user is prompted.
+    approval = {k: report[k] for k in ("instance", "hash", "ownership_fingerprint", "manifest_fingerprint")}
+    approval.update(operation="sonarr_fail_remove_retry", nonce=secrets.token_hex(32),
+                    expires_at=min(time.time() + 120, authority.value["expires_at"]))
+    return _execute(config, qb, apis, journal, report, approval, "public_attempt", authority=authority)
+
+
+def _enabled(config, journal, mode, authority=None):
+    if authority is not None:
+        return (mode == "public_attempt" and ROUTINE_RELEASE_ENABLED is True
+                and config.get("dry_run") is False and journal.allow_public_attempt)
     return config.get("dry_run") is False and (
         (mode == "single_test" and SINGLE_TEST_RELEASE_ENABLED is True and journal.allow_single_test)
         or (mode == "public_attempt" and PUBLIC_ATTEMPT_RELEASE_ENABLED is True and journal.allow_public_attempt))
 
 
-def check_prior_attempts(journal, report, approval_digest=None):
+def confirmed_successor(previous, report, config):
+    """A current validated grab can supersede a hold on an older incarnation.
+
+    No release from a hash/name/file match alone, missing new-grab identity, or a
+    changed downloader binding. Earlier observations and stages remain intact.
+    """
+    if config is None or previous["dispatched_at"] is None:
+        return False
+    prior = previous["context"]
+    anchors = prior.get("grab_ids") or prior.get("baseline_history_ids")
+    grab_time = report.get("grab_time_floor")
+    return bool(valid_digest(report.get("attempt_fingerprint"))
+                and prior.get("binding_digest") == binding_digest(config, report["instance"])
+                and integer(report.get("download_added_on"))
+                and report["download_added_on"] > previous["dispatched_at"]
+                and report["download_added_on"] > prior.get("download_added_on", 0)
+                and isinstance(grab_time, (int, float)) and not isinstance(grab_time, bool)
+                and math.isfinite(grab_time) and grab_time > previous["dispatched_at"]
+                and report.get("grab_ids") and (not anchors or min(report["grab_ids"]) > max(anchors))
+                and report.get("attempt_fingerprint") != previous["evidence"].get("attempt_fingerprint"))
+
+
+def check_prior_attempts(journal, report, approval_digest=None, config=None):
     for previous in journal.related(report["instance"], report["hash"]):
         if previous["stage"] in ("cancelled", "dispatch_blocked"):
             if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
                 raise SafetyError("approval_already_consumed")
             continue
         if previous["stage"] not in ("cleanup_resolved", "complete"):
+            if confirmed_successor(previous, report, config):
+                continue
             raise SafetyError("previous_attempt_unresolved")
         prior = previous["context"]
         if ("download_added_on" not in prior or
@@ -376,10 +423,14 @@ def check_prior_attempts(journal, report, approval_digest=None):
             raise SafetyError("new_attempt_not_confirmed")
 
 
-def _execute(config, qb, apis, journal, report, approval, mode):
-    if not _enabled(config, journal, mode):
+def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
+    if not _enabled(config, journal, mode, authority):
         raise SafetyError("live_execution_disabled")
-    validate_approval(approval, report)
+    def validate():
+        validate_approval(approval, report)
+        if authority is not None:
+            authority.validate(config, report)
+    validate()
     with open(journal.path.parent / "guard.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -399,16 +450,18 @@ def _execute(config, qb, apis, journal, report, approval, mode):
         # Both sender modes share related-record holds. A single-test approval
         # must never provide an alternate route around a public-attempt hold.
         # Recovery of this exact existing operation above remains read-only.
-        check_prior_attempts(journal, report, digest(approval["nonce"]))
+        check_prior_attempts(journal, report, digest(approval["nonce"]), config=config)
         require_connectivity(config, apis[report["instance"]], report["instance"])
         fresh = recheck_candidate(report, config, qb, apis)
         check_fresh(report, fresh)
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
+        if authority is not None:
+            context["routine_grant_digest"] = authority.identifier
         row = journal.prepare(report, mode=mode, context=context)
         try:
             final_snapshot = recheck_candidate(report, config, qb, apis)
             check_fresh(report, final_snapshot)
-            validate_approval(approval, report)
+            validate()
             require_connectivity(config, apis[report["instance"]], report["instance"])
         except Exception:
             return journal.transition(row["key"], "prepared", "cancelled")
@@ -418,28 +471,30 @@ def _execute(config, qb, apis, journal, report, approval, mode):
         try:
             wait_for_event_boundary(row["dispatched_at"])
             check_fresh(report, final_snapshot)
-            validate_approval(approval, report)
+            validate()
             # Recheck after waiting. Refresh and durably retain the baselines so
             # events already present before this send cannot become its outcome.
             final_snapshot = recheck_candidate(report, config, qb, apis)
             check_fresh(report, final_snapshot)
-            validate_approval(approval, report)
+            validate()
             refreshed_context = capture_context(config, apis[report["instance"]],
                 final_snapshot["assessment"], digest(approval["nonce"]))
+            if authority is not None:
+                refreshed_context["routine_grant_digest"] = authority.identifier
             row = journal.refresh_baselines(row["key"], refreshed_context)
             context = row["context"]
             require_connectivity(config, apis[report["instance"]], report["instance"])
             status = apis[report["instance"]].call("/api/v3/system/status")
             if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
                 raise SafetyError("unreviewed_sonarr_version")
-            if not _enabled(config, journal, mode):
+            if not _enabled(config, journal, mode, authority):
                 raise SafetyError("live_execution_disabled")
             if (binding_digest(config, report["instance"]) != context["binding_digest"] or
                     endpoint_key(apis[report["instance"]].config["url"]) !=
                     endpoint_key(config["sonarr"][report["instance"]]["url"])):
                 raise SafetyError("identity_or_manifest_changed")
             check_fresh(report, final_snapshot)
-            validate_approval(approval, report)
+            validate()
             if not event_boundary_reached(row["dispatched_at"]):
                 raise SafetyError("dispatch_clock_unavailable")
         except Exception as error:
