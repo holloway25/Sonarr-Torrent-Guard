@@ -87,6 +87,15 @@ in charge of healthy torrents. Unknown/transitional states, incomplete manifests
 age under two minutes, ambiguous identity and failed API requests skip or abort
 assessment. This is policy checking, not malware scanning.
 
+The separate agreed metadata-timeout rule applies only to confirmed public
+Sonarr attempts still actively retrieving metadata (`metaDL`/`forcedMetaDL`)
+30 minutes after addition, with zero progress, unknown size and an empty file
+list. It does not depend on qBittorrent's potentially stalled active-time counter.
+Paused/stopped, private, unknown and inconsistent cases remain protected. This
+records a metadata failure, not a malware finding, and uses the same fresh
+checks and Sonarr-only cleanup. Metadata arriving before dispatch cancels the
+timeout proposal. See the unattended trial document for the full conditions.
+
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
 state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
 endpoints, titles, filenames and download paths. Schema version 1 has readiness,
@@ -103,7 +112,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine
+python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```

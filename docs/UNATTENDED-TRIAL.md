@@ -13,7 +13,7 @@ approving the reviewed code and configured public workflow. The file and parent
 directory must be owner-private, outside the checkout. It contains exactly:
 
 - `enabled`: true only for an explicitly approved trial.
-- `rule`: `public-sonarr-cleanup-v1`.
+- `rule`: `public-sonarr-cleanup-v2` (includes the explicitly agreed metadata timeout).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
 - `issued_at`, `expires_at`: UTC epoch times, no longer than 48 hours apart.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
@@ -67,6 +67,27 @@ observations and confirmations remain intact; the independently proven new
 incarnation is assessed on its own merits. A changed endpoint, missing provenance,
 same-second ambiguous grab date, manual re-add using old history, or unchanged
 addition time remains held. Both manual sender modes use these same rules.
+
+## Public metadata timeout
+
+The v2 rule may fail a confirmed public Sonarr-owned attempt still in `metaDL` or
+`forcedMetaDL` after 30 elapsed minutes since addition. qBittorrent's active-time
+counter is not used: it can stall during metadata retrieval. It requires zero
+progress, unknown total size (-1 or 0), and a successfully retrieved EMPTY file
+list. Contradictory size/progress/files, API failures, other transitional states and paused/stopped
+downloads are not evidence for this rule. Private/unknown sources, unmatched
+downloads and wrong clients remain protected before timeout assessment.
+The elapsed age includes earlier pauses; a resumed, still-unresolved magnet
+older than the limit can qualify immediately, but cannot qualify while stopped.
+
+`metadata_timeout` is a failed metadata-retrieval outcome, NOT proof of malware.
+An empty list here is not classified as all-files-unselected. The metadata sentinel
+is separately fingerprinted; if metadata arrives before dispatch, the fresh
+check cancels this action (even if the now-visible files independently qualify)
+and a later pass reassesses the files. Owning Sonarr alone removes/blocklists and
+handles native retry. No DHT/PeX/tracker settings are changed. New rule/code/scope
+digests require reissuing explicit permission; an existing trial deadline must
+not be extended merely to deploy the fix.
 
 ## Scheduling, reporting and bounds
 

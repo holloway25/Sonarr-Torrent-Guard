@@ -20,6 +20,12 @@ adapters. Enable
    provenance, content identity and public-source classification.
 2. Assess a complete qBittorrent manifest under the agreed failure rules. Do not
    infer failure from paused/stopped state, size alone or warning text.
+   Separately, the agreed public metadata-timeout rule can fail active
+   `metaDL`/`forcedMetaDL` attempts after 30 elapsed minutes since addition, requiring
+   zero progress, unknown size and a successfully read empty manifest. It is a
+   metadata failure, not a malware verdict; private/unknown sources remain
+   protected. Contradictory/missing information skips. Metadata arriving before
+   dispatch changes the fingerprint and cancels the timeout action.
 3. Inspect Sonarr retry settings. Both `autoRedownloadFailed` and
    `autoRedownloadFailedFromInteractiveSearch` must be true for the proposed native
    retry path. Require booleans from a successful response, never default unknown

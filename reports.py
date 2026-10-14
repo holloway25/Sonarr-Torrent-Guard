@@ -5,6 +5,8 @@ import json
 
 
 REASONS = {
+    "metadata_timeout": "metadata unavailable 30 minutes after addition (not a malware verdict)",
+    "metadata_timeout_not_reached": "waiting for metadata; 30-minute timeout not reached",
     "contains_exe": "contains an .exe (selected or unselected)",
     "contains_scr": "contains an .scr (selected or unselected)",
     "all_files_unselected": "all files are unselected",

@@ -319,7 +319,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.check()["reason"], "content_identity_not_in_grab_history")
 
     def test_metadata_age_and_transitional_states(self):
-        for state in ("metaDL", "checkingUP", "moving", "error", "unknown"):
+        for state in ("checkingUP", "moving", "error", "unknown"):
             with self.subTest(state=state):
                 self.qb.routes["/api/v2/torrents/info"][0]["state"] = state
                 self.assertEqual(self.check()["decision"], "skip")

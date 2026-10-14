@@ -22,6 +22,8 @@ from reports import human_report, json_events
 from workflow import preview_failure, read_readiness
 from safety import Journal, SafetyError, record_preview
 
+METADATA_TIMEOUT_SECONDS = 30 * 60
+
 
 class GuardError(Exception):
     pass
@@ -439,10 +441,22 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
                            "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
                            "forcedDL", "forcedUP"}
-            if state not in safe_states:
+            metadata_pending = state in {"metaDL", "forcedMetaDL"}
+            if metadata_pending:
+                if now - added < METADATA_TIMEOUT_SECONDS:
+                    raise GuardError("metadata_timeout_not_reached")
+                if (isinstance(t.get("progress"), bool) or t.get("progress") != 0
+                        or not integer(t.get("total_size")) or t["total_size"] not in (-1, 0)):
+                    raise GuardError("metadata_state_inconsistent")
+            elif state not in safe_states:
                 raise GuardError("metadata_or_transitional_state")
             files = qb.call("/api/v2/torrents/files", {"hash": h})
-            reasons = assess_files(files)
+            if metadata_pending:
+                if files != []:
+                    raise GuardError("metadata_state_inconsistent")
+                reasons = ["metadata_timeout"]
+            else:
+                reasons = assess_files(files)
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
             report.update(public_source_confirmed=True, indexer=source,
                           queue_ids=sorted({r["id"] for r in rows}),
@@ -466,6 +480,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
                         for f in sorted(files, key=lambda f: f["index"])]
+            if metadata_pending:
+                manifest = {"metadata_pending": True, "timeout_seconds": METADATA_TIMEOUT_SECONDS}
             report["ownership_fingerprint"] = hashlib.sha256(
                 json.dumps(ownership, sort_keys=True).encode()).hexdigest()
             report["manifest_fingerprint"] = hashlib.sha256(
