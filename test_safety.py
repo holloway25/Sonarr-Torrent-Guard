@@ -125,10 +125,48 @@ class SafetyTests(unittest.TestCase):
 
     def test_partial_removal_requires_manual_review_without_retry(self):
         sender = Mock()
-        row = self.simulate(sender, observation={"torrent_absent": True})
+        row = self.simulate(sender, observation={"torrent_absent": True, "failed": False})
         self.assertEqual(row["stage"], "manual_review")
         self.assertEqual(self.simulate(sender)["stage"], "manual_review")
         sender.assert_called_once()
+
+    def test_timestamp_uncertainty_preserves_pending_recovery_after_restart(self):
+        row = self.simulate(Mock(), observation={"torrent_absent": True, "failed": None, "blocklisted": None})
+        self.assertEqual(row["stage"], "uncertain")
+        self.journal.close()
+        self.journal = Journal(self.path)
+        row = reconcile(self.journal, row["key"], lambda: {"failed": None, "blocklisted": None})
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertTrue(row["confirmed"]["torrent_absent"])
+
+    def test_distinct_attempts_keep_separate_records_and_do_not_resend_on_restart(self):
+        self.original["attempt_fingerprint"] = "d" * 64
+        self.fresh["assessment"] = copy.deepcopy(self.original)
+        sender = Mock()
+        first = self.simulate(sender)
+        self.original["attempt_fingerprint"] = "e" * 64
+        self.original["ownership_fingerprint"] = "f" * 64
+        self.fresh["assessment"] = copy.deepcopy(self.original)
+        second = self.simulate(sender)
+        self.assertNotEqual(first["key"], second["key"])
+        self.journal.close()
+        self.journal = Journal(self.path)
+        self.assertEqual(self.simulate(sender)["key"], second["key"])
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual(self.journal.get(first["key"]), first)
+
+    def test_legacy_row_is_preserved_when_attempt_aware_preview_is_added(self):
+        old = self.journal.prepare(self.original)
+        self.original["attempt_fingerprint"] = "d" * 64
+        new = self.journal.prepare(self.original)
+        self.assertNotEqual(old["key"], new["key"])
+        self.assertEqual(self.journal.get(old["key"]), old)
+
+    def test_attempt_change_during_recheck_blocks_preparation(self):
+        self.original["attempt_fingerprint"] = "d" * 64
+        self.fresh["assessment"]["attempt_fingerprint"] = "e" * 64
+        with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
+            check_fresh(self.original, self.fresh, now=1000)
 
     def test_no_replacement_or_unverified_data_deletion_stays_pending(self):
         for field in ("data_deleted", "replacement_observed"):

@@ -37,6 +37,10 @@ def evidence(report):
     """Whitelist persisted evidence; titles, endpoints and credentials excluded."""
     fields = ("instance", "hash", "ownership_fingerprint", "manifest_fingerprint")
     result = {k: report.get(k) for k in fields}
+    if "attempt_fingerprint" in report:
+        if not valid_digest(report["attempt_fingerprint"]):
+            raise SafetyError("invalid_action_evidence")
+        result["attempt_fingerprint"] = report["attempt_fingerprint"]
     if (not isinstance(result["instance"], str) or not result["instance"]
             or not isinstance(result["hash"], str) or len(result["hash"]) not in (40, 64)
             or any(c not in "0123456789abcdef" for c in result["hash"])
@@ -144,7 +148,12 @@ class Journal:
             from production import validate_context
             context = validate_context(context)
         value = evidence(report)
-        key = hashlib.sha256(json.dumps([mode, value["instance"], value["hash"]]).encode()).hexdigest()
+        identity = [mode, value["instance"], value["hash"]]
+        # Single-test approval remains one action per hash, including re-grabs.
+        # Only non-live namespaces can track successive download incarnations.
+        if mode != "single_test" and "attempt_fingerprint" in value:
+            identity.append(value["attempt_fingerprint"])
+        key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             old = self.get(key)
@@ -226,7 +235,7 @@ def reconcile(journal, key, observe):
     if all(observation.get(k) is True for k in OBSERVATION_FIELDS):
         stage = "complete"
     elif known.get("torrent_absent") is True and (
-            known.get("failed") is not True or known.get("blocklisted") is not True):
+            known.get("failed") is False or known.get("blocklisted") is False):
         stage = "manual_review"
     elif all(known.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
         stage = "replacement_pending"

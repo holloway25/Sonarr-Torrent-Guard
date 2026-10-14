@@ -290,7 +290,7 @@ def records(api, route, params=None, max_pages=20):
     raise GuardError("pagination_limit_reached")
 
 
-def source_for(api, hash_value, rows, max_pages):
+def source_for(api, hash_value, rows, max_pages, added=None):
     history = records(api, "/api/v3/history", {
         # Preserve Sonarr's original spelling for its case-sensitive DB filter.
         "eventType": 1, "downloadId": rows[0]["downloadId"],
@@ -300,7 +300,7 @@ def source_for(api, hash_value, rows, max_pages):
                and str(r.get("downloadId", "")).lower() == hash_value]
     if not matches:
         raise GuardError("no_sonarr_grab_history")
-    sources = set()
+    sources, grab_ids = set(), set()
     for row in rows:
         series_id, episode_id = row.get("seriesId"), row.get("episodeId")
         if not integer(series_id) or series_id <= 0 or not integer(episode_id) or episode_id <= 0:
@@ -309,6 +309,17 @@ def source_for(api, hash_value, rows, max_pages):
                     and r.get("episodeId") == episode_id]
         if not matching:
             raise GuardError("content_identity_not_in_grab_history")
+        # A repeated hash can have older grabs from other sources. Bind only
+        # the newest grab for each affected episode to this download incarnation.
+        latest = max(matching, key=lambda r: r["id"])
+        try:
+            stamp = datetime.datetime.fromisoformat(latest["date"].replace("Z", "+00:00"))
+            if stamp.tzinfo is None or added is None or abs(stamp.timestamp() - added) > 120:
+                raise ValueError()
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise GuardError("grab_not_bound_to_current_download") from None
+        matching = [latest]
+        grab_ids.add(latest["id"])
         for r in matching:
             data = r.get("data")
             if not isinstance(data, dict) or not isinstance(data.get("indexer"), str):
@@ -316,7 +327,7 @@ def source_for(api, hash_value, rows, max_pages):
             sources.add(data["indexer"])
     if len(sources) != 1 or not next(iter(sources)):
         raise GuardError("ambiguous_indexer_identity")
-    return next(iter(sources))
+    return next(iter(sources)), sorted(grab_ids)
 
 
 def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False, target=None):
@@ -407,7 +418,10 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             continue
         api, instance = sonarr_apis[label], config["sonarr"][label]
         try:
-            source = source_for(api, h, rows, max_pages)
+            added = t.get("added_on")
+            if not integer(added) or added <= 0 or now - added < minimum_age:
+                raise GuardError("torrent_too_new_or_age_unknown")
+            source, grab_ids = source_for(api, h, rows, max_pages, added)
             policy = instance["indexers"]
             if source in policy["private"]:
                 raise GuardError("private_source_protected")
@@ -419,9 +433,6 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                            "forcedDL", "forcedUP"}
             if state not in safe_states:
                 raise GuardError("metadata_or_transitional_state")
-            added = t.get("added_on")
-            if not integer(added) or added <= 0 or now - added < minimum_age:
-                raise GuardError("torrent_too_new_or_age_unknown")
             files = qb.call("/api/v2/torrents/files", {"hash": h})
             reasons = assess_files(files)
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
@@ -433,9 +444,14 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                           download_client_id=instance["download_client_binding"]["id"],
                           file_count=len(files), selected_file_count=sum(f["priority"] > 0 for f in files),
                           torrent_state=state)
+            report["download_added_on"] = added
+            report["grab_ids"] = grab_ids
+            report["attempt_fingerprint"] = hashlib.sha256(
+                json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
             ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
                          "client_id": report["download_client_id"],
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
+                         "attempt": report["attempt_fingerprint"],
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
                         for f in sorted(files, key=lambda f: f["index"])]
@@ -569,8 +585,7 @@ def main():
             finally:
                 # Preserve completed assessments even if a later request aborts.
                 save_batch_state(batch_path, batch_state)
-            from zoneinfo import ZoneInfo
-            stamp = datetime.datetime.now(ZoneInfo("Australia/Sydney")).isoformat(timespec="seconds")
+            stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
             for report in reports:
                 if report["decision"] == "would_fail":
                     report["workflow"] = preview_failure(report, readiness.get(report["instance"], {}))

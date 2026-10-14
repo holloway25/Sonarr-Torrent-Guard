@@ -125,7 +125,13 @@ must match the original hash; replacement hashes must differ. Client-name
 digests bind matching history records to the configured downloader.
 
 Dispatch time is stored with intent, and matching result events must be at or
-after that timestamp as well as absent from the pre-dispatch baselines. Missing
+after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's
+truncated timestamps are interpreted as intervals at their published precision.
+An interval overlapping dispatch (including the same whole second) is unknown,
+not false or confirmed: the API cannot establish ordering inside that interval.
+No blanket one-second tolerance accepts potentially pre-dispatch evidence.
+Unknown failure/blocklist evidence after removal remains uncertain; explicit
+negative or contradictory evidence still requires review. Missing
 timestamps, API outages, malformed identities or clock disagreement prevent
 positive confirmation. These checks establish observed results, not proof that
 every concurrent manual action was caused by the guard.
@@ -143,6 +149,28 @@ There is no general live CLI mode or approval generator. Request redirects and
 retries are refused. Existing prepared/uncertain single-test records only recover
 through observations, never automatic dispatch. `--observe INSTANCE HASH` exposes
 that read-only recovery route using the stored operation context.
+
+### Repeated hashes and download attempts
+
+Assessment binds the newest grab ID for each affected episode to the current
+qBittorrent addition time (within 120 seconds; missing dates, clock skew or a
+larger gap fail closed). The newest episode grabs must agree on one classified
+source. This prevents older sources for a repeated hash making the current
+source ambiguous, without treating an old grab as authority for a manual re-add.
+The bounded time correlation is not proof against concurrent manual operations.
+
+An attempt fingerprint binds the instance/hash, addition time and current grab
+IDs. Ownership/fresh rechecks include it: a re-grab during validation cancels the
+old proposal. Preview and simulation journals use separate records for successive
+attempts and preserve the previous action's evidence across restarts. Existing
+legacy rows are retained unchanged. Filename changes alone are not new attempts.
+
+The disabled single-test sender deliberately retains its one-action-per-hash
+key. A re-grab cannot reuse a consumed approval, bypass a manual-review record or
+trigger another live deletion. Routine live attempt scheduling is not implemented
+or enabled; it needs a separate reviewed authorization/recovery policy. The next
+manual dry-run can assess a new bad attempt, but cannot remove it. A same-hash
+re-grab is not reported as a useful verified replacement.
 
 The dispatch-intent commit is followed by a fresh version request. Only after that
 request completes are the final candidate snapshot's age and approval expiration

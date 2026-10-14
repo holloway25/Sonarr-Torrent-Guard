@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 import sys
 import time
@@ -109,6 +110,20 @@ def event_time(row):
         raise SafetyError("invalid_event_timestamp") from None
 
 
+def event_after(row, boundary):
+    """A truncated timestamp represents an interval, not an exact instant."""
+    start = event_time(row)
+    match = re.search(r"T\d{2}:\d{2}:\d{2}(?:[.,](\d+))?", row["date"])
+    if match is None:
+        raise SafetyError("invalid_event_timestamp")
+    precision = min(len(match[1]), 6) if match[1] else 0
+    if start >= boundary:
+        return True
+    if start + 10 ** (-precision) <= boundary:
+        return False
+    return None
+
+
 def capture_context(config, api, report, approval_digest, now=None):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
@@ -127,7 +142,8 @@ def capture_context(config, api, report, approval_digest, now=None):
                     "downloadId": report["download_id_spelling"]}, config.get("max_pages", 20))
     grabs = [g for g in grabs if str(g.get("downloadId", "")).lower() == report["hash"]
              and g.get("eventType") in (1, "grabbed") and g.get("seriesId") == series[0]
-             and g.get("episodeId") in report["episode_ids"]]
+             and g.get("episodeId") in report["episode_ids"]
+             and g.get("id") in report["grab_ids"]]
     titles = {g.get("sourceTitle") for g in grabs}
     if (not grabs or len(titles) != 1 or not all(isinstance(t, str) and t for t in titles)
             or {g["episodeId"] for g in grabs} != set(report["episode_ids"])):
@@ -179,13 +195,14 @@ class OutcomeVerifier:
         try:
             rows = history_since(api, c["window_start"])
             new = [r for r in rows if r["id"] not in c["baseline_history_ids"]]
-            failed, replacement = set(), set()
+            failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             for r in new:
                 if not integer(r.get("seriesId")) or not integer(r.get("episodeId")):
                     raise SafetyError("invalid_history_identity")
                 if r.get("seriesId") != c["series_id"] or r.get("episodeId") not in c["episode_ids"]:
                     continue
-                if event_time(r) < self.not_before:
+                after = event_after(r, self.not_before)
+                if after is False:
                     continue
                 data = r.get("data")
                 if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
@@ -193,20 +210,22 @@ class OutcomeVerifier:
                 h = str(r.get("downloadId", "")).lower()
                 if (r.get("eventType") in (4, "downloadFailed") and h == c["hash"]
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
-                    failed.add(r["episodeId"])
+                    (failed if after else ambiguous_failed).add(r["episodeId"])
                 if r.get("eventType") in (1, "grabbed") and h != c["hash"]:
                     try:
                         torrent_hash(h)
                     except GuardError:
                         continue
-                    replacement.add(r["episodeId"])
-            result["failed"] = failed == set(c["episode_ids"])
-            result["replacement_observed"] = replacement == set(c["episode_ids"])
+                    (replacement if after else ambiguous_replacement).add(r["episodeId"])
+            required = set(c["episode_ids"])
+            result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
+            result["replacement_observed"] = True if replacement == required else (
+                None if ambiguous_replacement - replacement else False)
         except Exception:
             pass
         try:
             rows = records(api, "/api/v3/blocklist", {"seriesIds": c["series_id"]}, self.config.get("max_pages", 20))
-            matched = set()
+            matched, ambiguous = set(), set()
             for r in rows:
                 if not integer(r.get("seriesId")):
                     raise SafetyError("invalid_blocklist_identity")
@@ -214,13 +233,15 @@ class OutcomeVerifier:
                         or r.get("indexer") != c["indexer"]
                         or digest(r.get("sourceTitle")) != c["release_title_digest"]):
                     continue
-                if event_time(r) < self.not_before:
+                after = event_after(r, self.not_before)
+                if after is False:
                     continue
                 ids = r.get("episodeIds")
                 if not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
                     raise ValueError()
-                matched.update(set(ids) & set(c["episode_ids"]))
-            result["blocklisted"] = matched == set(c["episode_ids"])
+                (matched if after else ambiguous).update(set(ids) & set(c["episode_ids"]))
+            result["blocklisted"] = True if matched == set(c["episode_ids"]) else (
+                None if ambiguous - matched else False)
         except Exception:
             pass
         return result
@@ -235,7 +256,7 @@ def validate_approval(approval, report, now=None):
     if (approval["operation"] != "sonarr_fail_remove_retry" or not valid_digest(approval["nonce"])
             or isinstance(expires, bool) or not isinstance(expires, (int, float))
             or not 0 < expires - now <= 300
-            or any(approval.get(k) != v for k, v in evidence(report).items())):
+            or any(approval.get(k) != v for k, v in evidence(report).items() if k in fields)):
         raise SafetyError("approval_expired_or_target_mismatch")
 
 

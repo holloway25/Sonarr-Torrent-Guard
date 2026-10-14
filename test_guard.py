@@ -73,7 +73,8 @@ class WorkflowTests(unittest.TestCase):
         self.row = {"id": 1, "downloadId": self.h.upper(), "seriesId": 2,
                     "episodeId": 3, "downloadClient": "Downloader"}
         self.grab = {"id": 4, "downloadId": self.h, "seriesId": 2, "episodeId": 3,
-                     "eventType": "grabbed", "data": {"indexer": "Public Source"}}
+                     "eventType": "grabbed", "date": "1970-01-01T00:01:40Z",
+                     "data": {"indexer": "Public Source"}}
         self.t = {"hash": self.h, "category": "tv-hd", "state": "stoppedUP", "added_on": 100}
         self.qb = FakeApi({"/api/v2/torrents/info": [self.t],
                            "/api/v2/torrents/files": manifest(("episode.exe", 0))})
@@ -144,6 +145,49 @@ class WorkflowTests(unittest.TestCase):
         self.check()
         queries = [params for route, params in self.s.calls if route == "/api/v3/history"]
         self.assertEqual(queries[0]["downloadId"], self.h.upper())
+
+    def test_same_hash_regrab_uses_current_source_and_changes_attempt(self):
+        first = self.check()
+        latest = dict(self.grab, id=6, date="1970-01-01T00:05:00Z",
+                      data={"indexer": "Other Public Source"})
+        self.config["sonarr"]["HD"]["indexers"]["public"].append("Other Public Source")
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [latest, self.grab]}
+        self.qb.routes["/api/v2/torrents/info"][0]["added_on"] = 300
+        second = self.check()
+        self.assertEqual(second["decision"], "would_fail")
+        self.assertEqual(second["indexer"], "Other Public Source")
+        self.assertEqual(second["grab_ids"], [6])
+        self.assertNotEqual(first["attempt_fingerprint"], second["attempt_fingerprint"])
+        self.assertNotEqual(first["ownership_fingerprint"], second["ownership_fingerprint"])
+        self.s.routes["/api/v3/history"]["records"].reverse()
+        self.assertEqual(second["attempt_fingerprint"], self.check()["attempt_fingerprint"])
+
+    def test_old_grab_does_not_authorize_manual_same_hash_readd(self):
+        self.qb.routes["/api/v2/torrents/info"][0]["added_on"] = 600
+        self.assertEqual(self.check()["reason"], "grab_not_bound_to_current_download")
+
+    def test_rename_does_not_create_another_attempt(self):
+        original = self.check()
+        self.qb.routes["/api/v2/torrents/info"][0]["name"] = "Different display name"
+        self.assertEqual(original["attempt_fingerprint"], self.check()["attempt_fingerprint"])
+
+    def test_mixed_latest_episode_sources_are_ambiguous(self):
+        row = dict(self.row, id=2, episodeId=5)
+        grab = dict(self.grab, id=5, episodeId=5, data={"indexer": "Private Source"})
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [self.row, row]}
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, grab]}
+        self.assertEqual(self.check()["reason"], "ambiguous_indexer_identity")
+
+    def test_latest_private_or_unknown_regrab_stays_protected(self):
+        for source in ("Private Source", "Unknown Source"):
+            latest = dict(self.grab, id=6, data={"indexer": source})
+            self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, latest]}
+            self.assertEqual(self.check()["decision"], "skip")
+
+    def test_missing_naive_and_invalid_grab_dates_fail_closed(self):
+        for stamp in (None, "not-a-date", "1970-01-01T00:01:40"):
+            self.s.routes["/api/v3/history"]["records"][0]["date"] = stamp
+            self.assertEqual(self.check()["reason"], "grab_not_bound_to_current_download")
 
     def test_other_client_not_assessed(self):
         self.s.routes["/api/v3/queue"]["records"][0]["downloadClient"] = "Other Client"

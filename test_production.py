@@ -26,7 +26,8 @@ class ProductionTests(unittest.TestCase):
         self.grab = {"id": 5, "eventType": "grabbed", "downloadId": self.hash.upper(),
                      "seriesId": 2, "episodeId": 3, "sourceTitle": "Example Show S01E01",
                      "data": {"indexer": "Public Source", "downloadClientName": "Downloader"}}
-        self.grab["date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        added = int(time.time()) - 600
+        self.grab["date"] = datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat()
         self.s = FakeApi({
             "/api/v3/queue": {"totalRecords": 1, "records": [{"id": 7, "downloadId": self.hash.upper(),
                                 "seriesId": 2, "episodeId": 3, "downloadClientId": 1}]},
@@ -36,7 +37,7 @@ class ProductionTests(unittest.TestCase):
             "/api/v3/config/downloadclient": {"autoRedownloadFailed": True, "autoRedownloadFailedFromInteractiveSearch": True}})
         self.s.config, self.s.deadline = self.config["sonarr"]["HD"], None
         self.qb = FakeApi({"/api/v2/torrents/info": [{"hash": self.hash, "category": "tv-hd",
-                                                   "state": "stoppedUP", "added_on": 1}],
+                                                   "state": "stoppedUP", "added_on": added}],
                            "/api/v2/torrents/files": manifest(("episode.exe", 0))})
         self.apis = {"HD": self.s}
         self.report = run(self.config, self.qb, self.apis)[0]
@@ -94,6 +95,46 @@ class ProductionTests(unittest.TestCase):
         for field in ("failed", "blocklisted", "replacement_observed"):
             self.assertFalse(result[field])
 
+    def test_same_second_results_are_uncertain_not_missing_or_confirmed(self):
+        self.results()
+        stamp = "2026-01-01T00:00:10Z"
+        for row in self.s.routes["/api/v3/history/since"][1:]:
+            row["date"] = stamp
+        self.s.routes["/api/v3/blocklist"]["records"][0]["date"] = stamp
+        boundary = production.event_time({"date": stamp}) + .25
+        result = production.OutcomeVerifier(self.config, self.qb, self.apis, self.context, boundary).observe()
+        for field in ("failed", "blocklisted", "replacement_observed"):
+            self.assertIsNone(result[field])
+
+    def test_timestamp_precision_timezone_and_predispatch_boundaries(self):
+        boundary = production.event_time({"date": "2026-01-01T00:00:10.25Z"})
+        for stamp, expected in (("2026-01-01T00:00:09Z", False),
+                                ("2026-01-01T00:00:10Z", None),
+                                ("2026-01-01T00:00:10.1Z", False),
+                                ("2026-01-01T00:00:10.2Z", None),
+                                ("2026-01-01T00:00:10.249Z", False),
+                                ("2026-01-01T00:00:10.25Z", True),
+                                ("2026-01-01T00:00:11Z", True),
+                                ("2026-01-01T11:00:10+11:00", None)):
+            with self.subTest(stamp=stamp):
+                self.assertIs(production.event_after({"date": stamp}, boundary), expected)
+
+    def test_same_second_baseline_records_still_cannot_confirm_outcomes(self):
+        self.results()
+        self.context["baseline_history_ids"] = [5, 6, 8]
+        self.context["baseline_blocklist_ids"] = [9]
+        result = self.observe()
+        self.assertFalse(result["failed"])
+        self.assertFalse(result["blocklisted"])
+
+    def test_single_test_regrab_cannot_reuse_consumed_approval(self):
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=TimeoutError()) as sender:
+            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.report["attempt_fingerprint"] = "e" * 64
+            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            sender.assert_called_once()
+
     def test_missing_event_timestamps_are_unknown_not_confirmations(self):
         self.results()
         del self.s.routes["/api/v3/history/since"][1]["date"]
@@ -137,6 +178,12 @@ class ProductionTests(unittest.TestCase):
             self.assertNotIn(value, text)
         with self.assertRaises(SafetyError):
             production.validate_context(dict(self.context, password="not allowed"))
+
+    def test_context_title_comes_from_current_grab_not_older_same_hash(self):
+        old = dict(self.grab, id=4, sourceTitle="An older display title")
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [old, self.grab]}
+        context = production.capture_context(self.config, self.s, self.report, production.digest("approval"))
+        self.assertEqual(context["release_title_digest"], production.digest(self.grab["sourceTitle"]))
 
     def test_endpoint_drift_and_unreviewed_version_stop_observation(self):
         self.s.routes["/api/v3/system/status"]["version"] = "unreviewed"

@@ -84,7 +84,7 @@ age under two minutes, ambiguous identity and failed API requests skip or abort
 assessment. This is policy checking, not malware scanning.
 
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
-state, reason, Sydney timestamp and proposed actions. They omit credentials,
+state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
 endpoints, titles, filenames and download paths. Schema version 1 has readiness,
 assessment and summary events. A `would_fail` report does not mean Sonarr has
 failed the release.
