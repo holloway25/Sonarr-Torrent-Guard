@@ -144,6 +144,16 @@ retries are refused. Existing prepared/uncertain single-test records only recove
 through observations, never automatic dispatch. `--observe INSTANCE HASH` exposes
 that read-only recovery route using the stored operation context.
 
+The dispatch-intent commit is followed by a fresh version request. Only after that
+request completes are the final candidate snapshot's age and approval expiration
+checked again. A slow commit or slow status response cannot carry an expired
+approval/stale snapshot into the sender. Version drift, status outages or failed
+post-commit expiry checks leave a durable `dispatch_blocked` record, preserving
+identity, context, historical evidence and an allowlisted stop reason. This stage
+means the request was not sent and is terminal for automatic processing. A crash
+before a blocked result is recorded instead leaves dispatch intent requiring
+read-only reconciliation; it never permits blind re-sending.
+
 `reports.py` renders these results for humans and emits versioned JSON data. This
 is the boundary a future read-only web UI can consume. Runtime titles are optional
 text stdout only; JSON events and rotating logs omit them.

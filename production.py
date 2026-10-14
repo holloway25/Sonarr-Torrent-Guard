@@ -17,7 +17,7 @@ import urllib.request
 
 from guard import (Api, GuardError, endpoint_key, hard_deadline, integer, load_config,
                    records, recheck_candidate, run, torrent_hash, verify_client_binding)
-from safety import Journal, SafetyError, check_fresh, evidence, reconcile, valid_digest
+from safety import Journal, SafetyError, DISPATCH_STOP_REASONS, check_fresh, evidence, reconcile, valid_digest
 
 
 # Deliberately false until code review and explicit human approval for one test.
@@ -284,11 +284,28 @@ def execute_single_test(config, qb, apis, journal, report, approval):
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
         row = journal.prepare(report, mode="single_test", context=context)
         try:
-            check_fresh(report, recheck_candidate(report, config, qb, apis))
+            final_snapshot = recheck_candidate(report, config, qb, apis)
+            check_fresh(report, final_snapshot)
             validate_approval(approval, report)
         except Exception:
             return journal.transition(row["key"], "prepared", "cancelled")
         row = journal.transition(row["key"], "prepared", "dispatch_recorded")
+        # FULL-sync commit and the status request may take time. There must be no
+        # disk/network work between the final local expiry checks and send.
+        try:
+            status = apis[report["instance"]].call("/api/v3/system/status")
+            if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
+                raise SafetyError("unreviewed_sonarr_version")
+            if (SINGLE_TEST_RELEASE_ENABLED is not True or config.get("dry_run") is not False
+                    or not journal.allow_single_test):
+                raise SafetyError("live_execution_disabled")
+            check_fresh(report, final_snapshot)
+            validate_approval(approval, report)
+        except Exception as error:
+            reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "dispatch_validation_failed"
+            if reason not in DISPATCH_STOP_REASONS:
+                reason = "dispatch_validation_failed"
+            return journal.transition(row["key"], "dispatch_recorded", "dispatch_blocked", stop_reason=reason)
         try:
             _send_queue_delete(apis[report["instance"]], context["queue_id"])
         except Exception:
@@ -325,6 +342,7 @@ def main():
                 row = reconcile(journal, key, verifier.observe)
                 print(json.dumps({"live_sender_enabled": False, "instance": target[0], "hash": target[1],
                                   "stage": row["stage"], "confirmed": row["confirmed"],
+                                  "stop_reason": row["stop_reason"],
                                   "observation": row["observation"], "current_observation": row["current_observation"],
                                   "observation_available": row["observation_available"]}))
                 return 0

@@ -225,6 +225,102 @@ class ProductionTests(unittest.TestCase):
                     production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
                 sender.assert_not_called()
 
+    def after_dispatch_commit(self, effect):
+        original = self.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[1:3] == ("prepared", "dispatch_recorded"):
+                effect()
+            return row
+        return transition
+
+    def test_approval_expiring_during_commit_preserves_unsent_record_after_restart(self):
+        def expire():
+            self.approval["expires_at"] = time.time() - 1
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(expire)), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "dispatch_blocked")
+            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
+            self.assertIsNotNone(row["dispatched_at"])
+            self.assertEqual(row["evidence"]["hash"], self.hash)
+            self.assertEqual(row["context"]["queue_id"], 7)
+            sender.assert_not_called()
+        self.journal.close()
+        self.journal = Journal(Path(self.folder.name)/"actions.sqlite3", allow_single_test=True)
+        self.assertEqual(self.journal.get(row["key"]), row)
+        observe = Mock()
+        self.assertEqual(production.reconcile(self.journal, row["key"], observe), row)
+        observe.assert_not_called()
+
+    def test_snapshot_expiring_during_commit_blocks_send(self):
+        snapshots = []
+        original = production.recheck_candidate
+        def recheck(*args):
+            fresh = original(*args)
+            snapshots.append(fresh)
+            return fresh
+        def expire():
+            snapshots[-1]["assessment"]["checked_at"] = time.time()-11
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.recheck_candidate", side_effect=recheck), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(expire)), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "dispatch_blocked")
+            self.assertEqual(row["stop_reason"], "fresh_assessment_expired")
+            sender.assert_not_called()
+
+    def test_version_change_after_context_capture_blocks_final_send(self):
+        original = production.capture_context
+        def capture(*args):
+            result = original(*args)
+            self.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
+            return result
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.capture_context", side_effect=capture), patch("production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "dispatch_blocked")
+            self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
+            sender.assert_not_called()
+
+    def test_version_change_during_commit_blocks_send(self):
+        def change():
+            self.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
+            sender.assert_not_called()
+
+    def test_post_commit_version_outage_blocks_send(self):
+        def outage():
+            self.s.routes["/api/v3/system/status"] = TimeoutError()
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(outage)), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "dispatch_blocked")
+            self.assertEqual(row["stop_reason"], "dispatch_validation_failed")
+            sender.assert_not_called()
+
+    def test_approval_expiring_during_final_version_request_blocks_send(self):
+        original = self.s.call
+        def call(route, params=None):
+            key = production.digest(["single_test", "HD", self.hash])
+            row = self.journal.get(key)
+            if route == "/api/v3/system/status" and row is not None and row["stage"] == "dispatch_recorded":
+                self.approval["expires_at"] = time.time()-1
+            return original(route, params)
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+            self.assertEqual(row["stage"], "dispatch_blocked")
+            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
+            sender.assert_not_called()
+
     def test_sender_refuses_production_transport_when_release_gate_is_off(self):
         with patch("urllib.request.build_opener") as opener:
             with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):

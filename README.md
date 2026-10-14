@@ -166,6 +166,14 @@ commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
 It never directly deletes from qBittorrent or submits an extra search.
 
+After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
+version, then revalidates the saved final snapshot's freshness and approval expiry
+immediately before calling the transport. Commit latency and version-check latency
+cannot bypass those checks. A failed check preserves the intent/context in the
+terminal `dispatch_blocked` stage with an allowlisted `stop_reason`; it sends
+nothing and cannot automatically retry that record. The recorded dispatch time
+denotes durable intent, not proof that a request reached the server.
+
 Existing single-test records, including prepared/uncertain records, only enter
 read-only recovery, never a second send. Following any future approved test:
 

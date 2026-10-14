@@ -8,6 +8,8 @@ import sqlite3
 import time
 
 OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
+DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
+                         "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed"}
 
 
 def clean_observation(observation):
@@ -108,6 +110,7 @@ class Journal:
                 "observation_available": "INTEGER NOT NULL DEFAULT 0",
                 "context": "TEXT NOT NULL DEFAULT '{}'",
                 "dispatched_at": "REAL",
+                "stop_reason": "TEXT",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -123,12 +126,12 @@ class Journal:
 
     def get(self, key):
         row = self.db.execute("SELECT mode,stage,evidence,observation,confirmed,current_observation,"
-                              "observation_available,context,dispatched_at FROM actions WHERE key=?", (key,)).fetchone()
+                              "observation_available,context,dispatched_at,stop_reason FROM actions WHERE key=?", (key,)).fetchone()
         return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
                                         "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
                                         "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
                                         "observation_available": bool(row[6]), "context": json.loads(row[7]),
-                                        "dispatched_at": row[8]}
+                                        "dispatched_at": row[8], "stop_reason": row[9]}
 
     def prepare(self, report, mode="preview", context=None):
         if mode not in ("preview", "simulation") and not (mode == "single_test" and self.allow_single_test):
@@ -155,15 +158,20 @@ class Journal:
                             (key, mode, "prepared", json.dumps(value), "{}", time.time(), json.dumps(context or {})))
         return self.get(key)
 
-    def transition(self, key, expected, stage, observation=None):
+    def transition(self, key, expected, stage, observation=None, stop_reason=None):
         allowed = {
             "prepared": {"preview_verified", "cancelled", "dispatch_recorded"},
-            "dispatch_recorded": {"uncertain", "replacement_pending", "manual_review", "complete"},
+            "dispatch_recorded": {"dispatch_blocked", "uncertain", "replacement_pending", "manual_review", "complete"},
             "uncertain": {"uncertain", "replacement_pending", "manual_review", "complete"},
             "replacement_pending": {"uncertain", "replacement_pending", "manual_review", "complete"},
         }
         if stage not in allowed.get(expected, set()):
             raise SafetyError("invalid_journal_transition")
+        if stage == "dispatch_blocked":
+            if stop_reason not in DISPATCH_STOP_REASONS:
+                raise SafetyError("invalid_dispatch_stop_reason")
+        elif stop_reason is not None:
+            raise SafetyError("unexpected_dispatch_stop_reason")
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.get(key)
@@ -186,9 +194,10 @@ class Journal:
                 stage = "manual_review"
             dispatched_at = time.time() if stage == "dispatch_recorded" else row["dispatched_at"]
             self.db.execute("UPDATE actions SET stage=?,observation=?,confirmed=?,current_observation=?,"
-                            "observation_available=?,updated=?,dispatched_at=? WHERE key=? AND stage=?",
+                            "observation_available=?,updated=?,dispatched_at=?,stop_reason=? WHERE key=? AND stage=?",
                             (stage, json.dumps(last_known), json.dumps(confirmed), json.dumps(current),
-                             observation is not None, time.time(), dispatched_at, key, expected))
+                             observation is not None, time.time(), dispatched_at,
+                             stop_reason if stage == "dispatch_blocked" else row["stop_reason"], key, expected))
         return self.get(key)
 
 
