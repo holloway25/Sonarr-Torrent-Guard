@@ -105,6 +105,12 @@ actions even if the shared three-minute deadline interrupts a later action.
 Waiting, grant expiry/code mismatch and held results are visible; no credentials,
 raw endpoints or file paths are logged. No application file deletion is added.
 
+Pre-dispatch validation failures retain `stage: cancelled`, an exact allowlisted
+`stop_reason` and the grant reference in both the private journal and routine
+action report. Unknown errors use `cancellation_validation_failed`; raw exception
+text is never logged. Cancellation is definitely unsent and has no dispatch
+timestamp. Existing legacy cancellations without a reason are left unchanged.
+
 Trial expiry stops new actions automatically, though an installed timer may keep
 recording waiting runs until disabled. Journal capacity remains 1000 rows and
 fails closed when full; no old or uncertain action is purged. This bounds the

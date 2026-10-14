@@ -72,6 +72,15 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(row["stage"], "cancelled")
         sender.assert_not_called()
 
+    def test_cancellation_reasons_are_allowlisted_and_optional_for_legacy_callers(self):
+        row = self.journal.prepare(self.original)
+        with self.assertRaisesRegex(SafetyError, "invalid_cancellation_stop_reason"):
+            self.journal.transition(row["key"], "prepared", "cancelled", stop_reason="private-response")
+        self.assertEqual(self.journal.get(row["key"])["stage"], "prepared")
+        row = self.journal.transition(row["key"], "prepared", "cancelled",
+                                      stop_reason="cancellation_validation_failed")
+        self.assertEqual(row["stop_reason"], "cancellation_validation_failed")
+
     def test_durable_dispatch_record_exists_before_simulated_send(self):
         observed_stages = []
         def sender():

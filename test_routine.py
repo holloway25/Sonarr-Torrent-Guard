@@ -181,6 +181,58 @@ class RoutineTests(unittest.TestCase):
         self.assertIn("OnUnitInactiveSec=10min", (folder / "sonarr-torrent-guard-live.timer").read_text())
         self.assertIn("routine.py --live", (folder / "sonarr-torrent-guard-live.service").read_text())
 
+    def assert_cancellation_report(self, reason, recheck_effect=None, connection_error=None):
+        f = self.f
+        original = production.recheck_candidate
+        calls = []
+        def recheck(*args):
+            fresh = original(*args)
+            calls.append(1)
+            if len(calls) == 2 and recheck_effect is not None:
+                recheck_effect(fresh)
+            return fresh
+        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
+                    "recovery": []}
+        events = []
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production.recheck_candidate", side_effect=recheck), patch(
+                "production.require_connectivity", side_effect=[None, connection_error]), patch(
+                "production._send_queue_delete") as send:
+            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal, events.append)
+        action = result["actions"][0]
+        self.assertEqual(action["stage"], "cancelled")
+        self.assertEqual(action["stop_reason"], reason)
+        self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
+        self.assertEqual(events, result["actions"])
+        send.assert_not_called()
+        reopened = routine.Journal(f.journal.path)
+        try:
+            row = reopened.get(action["key"])
+            self.assertEqual(row["stop_reason"], reason)
+            self.assertIsNone(row["dispatched_at"])
+            self.assertEqual(row["context"]["routine_grant_digest"], self.authority.identifier)
+        finally:
+            reopened.close()
+        self.assertNotIn("secret-payload", json.dumps(result))
+
+    def test_pre_dispatch_connectivity_cancellation_retains_reason_and_grant(self):
+        self.assert_cancellation_report("sonarr_connectivity_unavailable",
+            connection_error=routine.GuardError("sonarr_connectivity_unavailable"))
+
+    def test_pre_dispatch_file_change_cancellation_retains_reason_and_grant(self):
+        self.assert_cancellation_report("identity_or_manifest_changed",
+            recheck_effect=lambda fresh: fresh["assessment"].update(manifest_fingerprint="e" * 64))
+
+    def test_pre_dispatch_withdrawn_permission_retains_reason_and_grant(self):
+        self.assert_cancellation_report("routine_authorization_expired_or_scope_changed",
+            recheck_effect=lambda fresh: self.authority.value.update(enabled=False))
+
+    def test_pre_dispatch_unknown_error_is_redacted(self):
+        for error in (SafetyError("sonarr_connectivity_unavailable secret-payload"),
+                      RuntimeError("identity_or_manifest_changed secret-payload")):
+            with self.subTest(error=type(error).__name__):
+                self.assert_cancellation_report("cancellation_validation_failed", connection_error=error)
+
     def test_full_journal_hold_records_reason_and_grant_without_sending(self):
         f = self.f
         f.journal.limit = 0

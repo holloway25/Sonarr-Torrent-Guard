@@ -13,6 +13,8 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
                          "dispatch_clock_unavailable", "routine_authorization_expired_or_scope_changed",
                          "routine_candidate_not_authorized"}
+CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
+                                                    "candidate_no_longer_eligible"}
 
 
 def clean_observation(observation):
@@ -190,6 +192,11 @@ class Journal:
         if stage == "dispatch_blocked":
             if stop_reason not in DISPATCH_STOP_REASONS:
                 raise SafetyError("invalid_dispatch_stop_reason")
+        elif stage == "cancelled":
+            # Legacy/test-only cancellations may have no reason. New production
+            # cancellations provide an exact safe code, never raw exception text.
+            if stop_reason is not None and stop_reason not in CANCELLATION_STOP_REASONS:
+                raise SafetyError("invalid_cancellation_stop_reason")
         elif stop_reason is not None:
             raise SafetyError("unexpected_dispatch_stop_reason")
         with self.db:
@@ -223,7 +230,7 @@ class Journal:
                             "observation_available=?,updated=?,dispatched_at=?,stop_reason=? WHERE key=? AND stage=?",
                             (stage, json.dumps(last_known), json.dumps(confirmed), json.dumps(current),
                              observation is not None, time.time(), dispatched_at,
-                             stop_reason if stage == "dispatch_blocked" else row["stop_reason"], key, expected))
+                             stop_reason if stage in ("dispatch_blocked", "cancelled") else row["stop_reason"], key, expected))
         return self.get(key)
 
     def related(self, instance, hash_value):

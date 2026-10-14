@@ -18,7 +18,8 @@ import urllib.request
 
 from guard import (Api, GuardError, endpoint_key, hard_deadline, integer, load_config,
                    records, recheck_candidate, run, torrent_hash, verify_client_binding)
-from safety import Journal, SafetyError, DISPATCH_STOP_REASONS, check_fresh, evidence, reconcile, valid_digest
+from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
+                    check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
 
 
@@ -463,8 +464,11 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             check_fresh(report, final_snapshot)
             validate()
             require_connectivity(config, apis[report["instance"]], report["instance"])
-        except Exception:
-            return journal.transition(row["key"], "prepared", "cancelled")
+        except Exception as error:
+            reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "cancellation_validation_failed"
+            if reason not in CANCELLATION_STOP_REASONS:
+                reason = "cancellation_validation_failed"
+            return journal.transition(row["key"], "prepared", "cancelled", stop_reason=reason)
         row = journal.transition(row["key"], "prepared", "dispatch_recorded")
         # FULL-sync commit and the status request may take time. There must be no
         # disk/network work between the final local expiry checks and send.

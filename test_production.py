@@ -287,6 +287,7 @@ class ProductionTests(unittest.TestCase):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production.recheck_candidate", side_effect=recheck), patch("production._send_queue_delete") as sender:
             row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
             self.assertEqual(row["stage"], "cancelled")
+            self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
             sender.assert_not_called()
 
     def test_approval_expiring_during_preparation_cancels_before_send(self):
@@ -296,6 +297,7 @@ class ProductionTests(unittest.TestCase):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production.capture_context", side_effect=capture), patch("production._send_queue_delete") as sender:
             row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
             self.assertEqual(row["stage"], "cancelled")
+            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
             sender.assert_not_called()
 
     def test_worker_overlap_blocks_sender(self):
