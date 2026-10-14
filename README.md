@@ -202,8 +202,15 @@ This bounded CLI is always dry-run, even if a release flag is changed. It first
 asks both owning Sonarr instances to test their configured qBittorrent connection.
 If either is unavailable/unverified, it returns `waiting` with a 600-second retry
 interval; it never falls back to downloader-only cleanup. When available, it
-reconciles pending action evidence and assesses candidates with fresh checks and
-the existing fair batch cursor. Unresolved actions hold only that instance/hash.
+assesses candidates first with fresh checks and the existing fair batch cursor.
+Only afterward does it reconcile a rotating slice of pending action evidence:
+at most five records, five seconds per observation, and thirty seconds total
+within the remaining cycle deadline (leaving two seconds for final persistence).
+Adapter deadlines also enforce each observation's bound if an API branch catches
+a timeout. Recovery's independent cursor is saved beside the assessment cursor
+and survives restarts, including runs without candidates. Unresolved actions
+hold only that instance/hash, even when their recovery is deferred. A hold cleared
+by recovery can be reassessed on the next cycle; no stale proposal is dispatched.
 
 `maintenance.py` uses the reviewed Sonarr version's non-saving download-client
 test endpoint, not cached absence of health warnings. Temporary test categories
@@ -220,7 +227,8 @@ armed journal and exact short-lived approval requirement. It does not authorize
 itself from the scheduler. Each action binds the attempt and approval digest;
 a later confirmed grab needs a new approval and newer addition/grab identities.
 Uncertain, prepared or manual-review production records prevent another cleanup
-for that instance/hash. Definite unsent cancelled/blocked records are preserved;
+for that instance/hash through either sender mode, including single-test actions.
+Definite unsent cancelled/blocked records are preserved;
 after maintenance a new exact approval may prepare a distinct operation, never
 resend from recovery or reuse the old approval. Final connectivity/version,
 endpoint binding, snapshot freshness and approval checks run after intent commit.

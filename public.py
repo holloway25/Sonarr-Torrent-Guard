@@ -12,22 +12,68 @@ from maintenance import RETRY_AFTER_SECONDS, require_connectivity
 from production import OutcomeVerifier, check_prior_attempts
 from safety import Journal, SafetyError, check_fresh, reconcile
 
+RECOVERY_LIMIT = 5
+RECOVERY_SECONDS = 30
+RECOVERY_ITEM_SECONDS = 5
+
+
+def recover_pending(config, qb, apis, journal, batch_state, deadline):
+    """Small rotating slice, after assessment; never spend its reserved time."""
+    keys = sorted(r[0] for r in journal.db.execute(
+        "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt') "
+        "AND stage IN ('dispatch_recorded','uncertain','replacement_pending')").fetchall())
+    after = batch_state.get("recovery_after", "")
+    keys = [k for k in keys if k > after] + [k for k in keys if k <= after]
+    end = min(deadline - 2, time.monotonic() + RECOVERY_SECONDS)
+    recovered = []
+    adapters = [qb, *apis.values()]
+    for key in keys[:RECOVERY_LIMIT]:
+        if time.monotonic() >= end:
+            break
+        item_end = min(end, time.monotonic() + RECOVERY_ITEM_SECONDS)
+        old_deadlines = [(api, hasattr(api, "deadline"), getattr(api, "deadline", None)) for api in adapters]
+        try:
+            # Some observation branches deliberately catch failures. Propagate
+            # the sub-deadline into every adapter too, so a caught alarm cannot
+            # let the next branch start another long request.
+            for api, _, old in old_deadlines:
+                api.deadline = min(old, item_end) if old is not None else item_end
+            row = journal.get(key)
+            try:
+                with hard_deadline(item_end):
+                    verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
+                    observation = verifier.observe()
+            except Exception:
+                observation = None
+            # Commit uncertainty outside the observation alarm's scope.
+            def observe():
+                if observation is None:
+                    raise SafetyError("recovery_observation_unavailable")
+                return observation
+            row = reconcile(journal, key, observe)
+            recovered.append({"key": key, "stage": row["stage"], "confirmed": row["confirmed"]})
+        finally:
+            batch_state["recovery_after"] = key
+            for api, existed, old in old_deadlines:
+                if existed:
+                    api.deadline = old
+                else:
+                    del api.deadline
+    return recovered
+
 
 def cycle(config, qb, apis, journal, batch_state=None):
+    if batch_state is None:
+        batch_state = {}
+    deadlines = [getattr(api, "deadline", None) for api in [qb, *apis.values()]]
+    deadline = min([d for d in deadlines if d is not None] + [time.monotonic() + 180])
     # Fail closed across both owners. Do not fall back to downloader-only work
     # when either ownership queue or Sonarr-side connectivity is unavailable.
     for label, api in apis.items():
         require_connectivity(config, api, label)
     qb.login()
-    recovered = []
-    keys = [r[0] for r in journal.db.execute(
-        "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt') "
-        "AND stage IN ('dispatch_recorded','uncertain','replacement_pending')").fetchall()]
-    for key in keys:
-        row = journal.get(key)
-        verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
-        row = reconcile(journal, key, verifier.observe)
-        recovered.append({"key": key, "stage": row["stage"], "confirmed": row["confirmed"]})
+    # Reserve assessment's opportunity by doing it first. Recovery backlog is
+    # never allowed to consume the cycle before the candidate cursor advances.
     reports = run(config, qb, apis, batch_state=batch_state)
     for report in reports:
         if report["decision"] != "would_fail":
@@ -39,6 +85,7 @@ def cycle(config, qb, apis, journal, batch_state=None):
             report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
         except (SafetyError, GuardError) as error:
             report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
+    recovered = recover_pending(config, qb, apis, journal, batch_state, deadline)
     return {"dry_run": True, "status": "assessed", "retry_after_seconds": RETRY_AFTER_SECONDS,
             "live_sender_enabled": False, "recovery": recovered, "assessment": reports}
 

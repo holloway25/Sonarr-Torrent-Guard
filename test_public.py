@@ -2,12 +2,14 @@ import copy
 import datetime
 import time
 import unittest
+from contextlib import closing, nullcontext
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import maintenance
 import production
 import public
-from guard import run
+from guard import run, load_batch_state, save_batch_state
 from safety import Journal, SafetyError, reconcile
 import test_production as fixtures
 
@@ -74,6 +76,141 @@ class PublicTests(unittest.TestCase):
             with self.assertRaisesRegex(SafetyError, "new_attempt_not_confirmed"):
                 self.execute()
             send.assert_called_once()
+
+    def test_single_test_cannot_bypass_public_holds(self):
+        f = self.f
+        for stage in ("prepared", "dispatch_recorded", "uncertain", "replacement_pending", "manual_review"):
+            with self.subTest(stage=stage), closing(Journal(Path(f.folder.name) / (stage + ".sqlite3"),
+                    allow_single_test=True, allow_public_attempt=True)) as journal:
+                row = journal.prepare(f.report, mode="public_attempt", context=f.context)
+                if stage != "prepared":
+                    row = journal.transition(row["key"], "prepared", "dispatch_recorded")
+                if stage not in ("prepared", "dispatch_recorded"):
+                    journal.transition(row["key"], "dispatch_recorded", stage)
+                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+                    with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
+                        production.execute_single_test(f.config, f.qb, f.apis, journal, f.report, f.approval)
+                    send.assert_not_called()
+
+    def test_single_test_cannot_repeat_resolved_public_attempt(self):
+        f = self.f
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=lambda *a: self.result()):
+            self.execute()
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+            with self.assertRaisesRegex(SafetyError, "new_attempt_not_confirmed"):
+                production.execute_single_test(f.config, f.qb, f.apis, f.journal, f.report, f.approval)
+            send.assert_not_called()
+
+    def pending_records(self, count):
+        f = self.f
+        keys = []
+        for number in range(1, count + 1):
+            h = format(number, "040x")
+            fingerprint = production.digest(["HD", h, f.context["download_added_on"], f.context["grab_ids"]])
+            report = dict(f.report, hash=h, attempt_fingerprint=fingerprint)
+            context = dict(f.context, hash=h, attempt_fingerprint=fingerprint)
+            row = f.journal.prepare(report, mode="public_attempt", context=context)
+            f.journal.transition(row["key"], "prepared", "dispatch_recorded")
+            keys.append(row["key"])
+        return sorted(keys)
+
+    def test_recovery_backlog_rotates_across_restarts_without_starving_assessment(self):
+        f = self.f
+        keys = self.pending_records(12)
+        state_path = Path(f.folder.name) / "batch-state.json"
+        visited = []
+        events = []
+        class Verifier:
+            def __init__(self, config, qb, apis, context, not_before):
+                self.context = context
+            def observe(self):
+                events.append("recovery")
+                visited.append(self.context["hash"])
+                raise TimeoutError()
+        original_run = public.run
+        def assess(*args, **kwargs):
+            events.append("assessment")
+            return original_run(*args, **kwargs)
+        for _ in range(3):
+            events.clear()
+            state = load_batch_state(state_path)
+            with patch("public.require_connectivity", return_value={}), patch("public.OutcomeVerifier", Verifier), patch(
+                    "public.run", side_effect=assess):
+                result = public.cycle(f.config, f.qb, f.apis, f.journal, state)
+            self.assertEqual(events[0], "assessment")
+            self.assertEqual(len(result["recovery"]), public.RECOVERY_LIMIT)
+            self.assertEqual(state["after"], ["HD", f.hash])
+            self.assertEqual(result["assessment"][0]["decision"], "would_fail")
+            save_batch_state(state_path, state)
+            f.journal.close()
+            f.journal = Journal(f.journal.path, allow_public_attempt=True)
+        self.assertEqual(len(set(visited)), 12)
+        self.assertTrue(all(f.journal.get(k)["stage"] == "uncertain" for k in keys))
+
+    def test_recovery_budget_caps_each_observation_and_restores_adapter_deadlines(self):
+        f = self.f
+        keys = self.pending_records(8)
+        now = [100.0]
+        seen = []
+        f.qb.deadline, f.s.deadline = 280.0, 270.0
+        class Verifier:
+            def __init__(self, *args):
+                pass
+            def observe(self):
+                seen.append((f.qb.deadline, f.s.deadline))
+                now[0] += 5
+                raise TimeoutError()
+        state = {}
+        with patch("public.time.monotonic", side_effect=lambda: now[0]), patch(
+                "public.hard_deadline", side_effect=lambda d: nullcontext()), patch(
+                "public.OutcomeVerifier", Verifier):
+            result = public.recover_pending(f.config, f.qb, f.apis, f.journal, state, 112.0)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(seen, [(105.0, 105.0), (110.0, 110.0)])
+        self.assertEqual((f.qb.deadline, f.s.deadline), (280.0, 270.0))
+        self.assertEqual(state["recovery_after"], keys[1])
+
+    def test_recovery_only_cursor_survives_restart_and_invalid_cursor_is_refused(self):
+        path = Path(self.f.folder.name) / "batch-state.json"
+        state = {"recovery_after": "a" * 64}
+        save_batch_state(path, state)
+        self.assertEqual(load_batch_state(path), state)
+        save_batch_state(path, {"recovery_after": "invalid"})
+        from guard import GuardError
+        with self.assertRaises(GuardError):
+            load_batch_state(path)
+
+    def test_recovery_slow_observation_is_interrupted_without_delaying_assessment(self):
+        f = self.f
+        keys = self.pending_records(2)
+        class SlowVerifier:
+            def __init__(self, *args):
+                pass
+            def observe(self):
+                time.sleep(1)
+                return {}
+        state = {}
+        started = time.monotonic()
+        with patch("public.require_connectivity", return_value={}), patch(
+                "public.OutcomeVerifier", SlowVerifier), patch("public.RECOVERY_ITEM_SECONDS", .02):
+            result = public.cycle(f.config, f.qb, f.apis, f.journal, state)
+        self.assertLess(time.monotonic() - started, .5)
+        self.assertEqual(state["after"], ["HD", f.hash])
+        self.assertEqual(len(result["assessment"]), 1)
+        self.assertEqual(len(result["recovery"]), 2)
+        self.assertTrue(all(f.journal.get(k)["stage"] == "uncertain" for k in keys))
+
+    def test_recovery_with_no_remaining_allowance_preserves_pending_hold(self):
+        f = self.f
+        keys = self.pending_records(1)
+        state = {}
+        with patch("public.OutcomeVerifier") as verifier:
+            self.assertEqual(public.recover_pending(f.config, f.qb, f.apis, f.journal,
+                                                    state, time.monotonic()), [])
+            verifier.assert_not_called()
+        self.assertEqual(state, {})
+        self.assertEqual(f.journal.get(keys[0])["stage"], "dispatch_recorded")
 
     def test_attempt_context_rejects_forged_or_partial_identity(self):
         f = self.f

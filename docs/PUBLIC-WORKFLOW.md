@@ -200,6 +200,9 @@ operations; addition must also be after the earlier dispatch intent. Unresolved
 legacy or per-attempt production records hold the same instance/hash, not other
 candidates. Definitely unsent cancelled/blocked records can be followed by a new
 exact approval after maintenance, preserving both records. Recovery never sends.
+Both sender modes perform this related-record check before preparing a new
+action; a single-test approval cannot bypass a public-attempt hold or repeat a
+resolved incarnation. Recovery of an already-recorded operation is read-only.
 
 For this namespace only, `cleanup_resolved` requires all three cleanup positives
 in one current observation: original absence, failure and blocklisting. A union
@@ -210,8 +213,18 @@ resolution. Historical replacement evidence remains preserved. `data_deleted` re
 stage is not `complete` and must not be presented as full end-to-end verification.
 Existing single-test/manual-review rows and their evidence are not reset.
 
-The always-dry-run `public.py` CLI performs connectivity checks, pending recovery
-and fresh proposals in a bounded, locked cycle with the existing fair cursor.
+The always-dry-run `public.py` CLI performs connectivity checks and candidate
+assessment/fresh proposals BEFORE pending recovery, in a bounded, locked cycle
+with the existing fair cursor. Recovery is limited to five records per cycle,
+five seconds per observation and thirty seconds overall, capped by the remaining
+run deadline with two seconds left for persistence. Each adapter temporarily
+inherits the observation deadline too, preventing caught timeouts from starting
+another long request; previous deadlines are restored afterward. Its separately
+validated, durable `recovery_after` cursor rotates across pending keys and
+survives restarts, even with no assessment candidates. Deferred/unobserved records
+remain held; recovery never discards their evidence. Holds cleared after
+assessment are reassessed next cycle. A slow recovery backlog cannot consume the
+assessment opportunity or keep restarting at its first record.
 `maintenance.py` uses Sonarr's reviewed non-saving provider test with blank
 temporary categories, avoiding its category-creation branch. Original provider
 ID/connection fields resolve Sonarr's own masked credentials. No settings are

@@ -122,11 +122,18 @@ def load_batch_state(path):
         if not path.exists():
             return {}
         state = json.loads(path.read_text())
-        after = state.get("after")
-        if (not isinstance(state, dict) or not isinstance(after, list) or len(after) != 2
-                or not isinstance(after[0], str) or not after[0]):
+        if not isinstance(state, dict) or set(state) - {"after", "recovery_after"}:
             raise ValueError()
-        torrent_hash(after[1])
+        if "after" in state:
+            after = state["after"]
+            if (not isinstance(after, list) or len(after) != 2
+                    or not isinstance(after[0], str) or not after[0]):
+                raise ValueError()
+            torrent_hash(after[1])
+        if "recovery_after" in state:
+            from safety import valid_digest
+            if not valid_digest(state["recovery_after"]):
+                raise ValueError()
         return state
     except (ValueError, TypeError, AttributeError, OSError, GuardError):
         raise GuardError("invalid_batch_state") from None

@@ -369,10 +369,10 @@ def _execute(config, qb, apis, journal, report, approval, mode):
         if old is not None:
             verifier = OutcomeVerifier(config, qb, apis, old["context"], old["dispatched_at"])
             return reconcile(journal, key, verifier.observe)
-        if mode == "public_attempt":
-            # Definitely unsent rows can be followed by a new exact approval;
-            # recovery itself never sends or rewrites their historical intent.
-            check_prior_attempts(journal, report, digest(approval["nonce"]))
+        # Both sender modes share related-record holds. A single-test approval
+        # must never provide an alternate route around a public-attempt hold.
+        # Recovery of this exact existing operation above remains read-only.
+        check_prior_attempts(journal, report, digest(approval["nonce"]))
         require_connectivity(config, apis[report["instance"]], report["instance"])
         fresh = recheck_candidate(report, config, qb, apis)
         check_fresh(report, fresh)
