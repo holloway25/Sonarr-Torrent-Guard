@@ -134,6 +134,33 @@ def event_after(row, boundary):
     return None
 
 
+def event_boundary_reached(dispatched_at):
+    now = time.time()
+    return math.isfinite(now) and now >= math.floor(dispatched_at) + 1
+
+
+def wait_for_event_boundary(dispatched_at):
+    """Keep whole-second outcome timestamps after fractional durable intent.
+
+    This changes sending, never the verifier's acceptance of old evidence.
+    Bound the wait and fail closed on a backward/stalled wall clock.
+    """
+    if (isinstance(dispatched_at, bool) or not isinstance(dispatched_at, (int, float))
+            or not math.isfinite(dispatched_at) or dispatched_at <= 0):
+        raise SafetyError("dispatch_clock_unavailable")
+    boundary = math.floor(dispatched_at) + 1
+    stop = time.monotonic() + 1.1
+    while not event_boundary_reached(dispatched_at):
+        now = time.time()
+        if not math.isfinite(now):
+            raise SafetyError("dispatch_clock_unavailable")
+        remaining = min(boundary - now + .01, stop - time.monotonic())
+        if remaining <= 0:
+            raise SafetyError("dispatch_clock_unavailable")
+        time.sleep(min(remaining, .1))
+    return boundary
+
+
 def capture_context(config, api, report, approval_digest, now=None):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
@@ -389,6 +416,18 @@ def _execute(config, qb, apis, journal, report, approval, mode):
         # FULL-sync commit and the status request may take time. There must be no
         # disk/network work between the final local expiry checks and send.
         try:
+            wait_for_event_boundary(row["dispatched_at"])
+            check_fresh(report, final_snapshot)
+            validate_approval(approval, report)
+            # Recheck after waiting. Refresh and durably retain the baselines so
+            # events already present before this send cannot become its outcome.
+            final_snapshot = recheck_candidate(report, config, qb, apis)
+            check_fresh(report, final_snapshot)
+            validate_approval(approval, report)
+            refreshed_context = capture_context(config, apis[report["instance"]],
+                final_snapshot["assessment"], digest(approval["nonce"]))
+            row = journal.refresh_baselines(row["key"], refreshed_context)
+            context = row["context"]
             require_connectivity(config, apis[report["instance"]], report["instance"])
             status = apis[report["instance"]].call("/api/v3/system/status")
             if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
@@ -401,6 +440,8 @@ def _execute(config, qb, apis, journal, report, approval, mode):
                 raise SafetyError("identity_or_manifest_changed")
             check_fresh(report, final_snapshot)
             validate_approval(approval, report)
+            if not event_boundary_reached(row["dispatched_at"]):
+                raise SafetyError("dispatch_clock_unavailable")
         except Exception as error:
             reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "dispatch_validation_failed"
             if reason not in DISPATCH_STOP_REASONS:

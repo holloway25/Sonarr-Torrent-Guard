@@ -10,7 +10,8 @@ import time
 OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
 DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
-                         "sonarr_connectivity_unavailable", "identity_or_manifest_changed"}
+                         "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
+                         "dispatch_clock_unavailable"}
 
 
 def clean_observation(observation):
@@ -232,6 +233,34 @@ class Journal:
             if row["evidence"]["instance"] == instance and row["evidence"]["hash"] == hash_value:
                 result.append(row)
         return result
+
+    def refresh_baselines(self, key, refreshed):
+        """Only the armed, not-yet-sent coordinator may extend baseline IDs.
+
+        Recovery never calls this. Preserve identity, original window and all
+        existing baseline IDs; do not change dispatch time or observations.
+        """
+        from production import validate_context
+        refreshed = validate_context(refreshed)
+        mutable = {"baseline_history_ids", "baseline_blocklist_ids", "window_start"}
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.get(key)
+            if (row is None or row["stage"] != "dispatch_recorded" or not (
+                    (row["mode"] == "single_test" and self.allow_single_test) or
+                    (row["mode"] == "public_attempt" and self.allow_public_attempt))):
+                raise SafetyError("baseline_refresh_forbidden")
+            previous = validate_context(row["context"])
+            if ({k: v for k, v in previous.items() if k not in mutable} !=
+                    {k: v for k, v in refreshed.items() if k not in mutable}):
+                raise SafetyError("identity_or_manifest_changed")
+            merged = dict(previous)
+            for field in ("baseline_history_ids", "baseline_blocklist_ids"):
+                merged[field] = sorted(set(previous[field]) | set(refreshed[field]))
+            merged = validate_context(merged)
+            self.db.execute("UPDATE actions SET context=?,updated=? WHERE key=? AND stage='dispatch_recorded'",
+                            (json.dumps(merged), time.time(), key))
+        return self.get(key)
 
 
 def record_preview(journal, original, recheck, now=None):

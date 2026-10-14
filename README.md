@@ -102,7 +102,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public
+python3 -m unittest -v test_guard test_safety test_production test_public test_timing
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -178,6 +178,19 @@ cannot bypass those checks. A failed check preserves the intent/context in the
 terminal `dispatch_blocked` stage with an allowlisted `stop_reason`; it sends
 nothing and cannot automatically retry that record. The recorded dispatch time
 denotes durable intent, not proof that a request reached the server.
+
+To avoid manufacturing timestamp ambiguity on normally synchronized clocks,
+the disabled senders wait until the next whole UTC second after durable intent
+before sending. The wait is bounded to 1.1 seconds. They then recheck the complete
+candidate and capture/commit extended baseline IDs before final connectivity,
+version, endpoint, freshness and expiry checks. IDs already observed during the
+wait cannot become outcome evidence. Identity, intent time, original observation
+window and older baseline IDs are preserved. A backward/stalled clock, changed
+files or expired approval stops without sending. The verifier is not relaxed:
+same-second overlapping events remain unknown, and clock skew can still prevent
+confirmation. This does not prove that concurrent manual actions were caused by
+the guard. There is no retrospective rewrite/automatic release of existing
+timestamp holds; those require a separately reviewed resolution.
 
 Existing single-test records, including prepared/uncertain records, only enter
 read-only recovery, never a second send. Following any future approved test:

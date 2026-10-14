@@ -154,6 +154,24 @@ timestamps, API outages, malformed identities or clock disagreement prevent
 positive confirmation. These checks establish observed results, not proof that
 every concurrent manual action was caused by the guard.
 
+For new sends, the coordinator now waits across the next whole UTC second after
+the durably stored fractional intent time. This prevents ordinary whole-second
+Sonarr results from overlapping that intent when clocks agree. It does not round
+intent down or introduce an acceptance tolerance. The wait has a 1.1-second
+monotonic bound; a stalled/backward wall clock fails closed. Freshness/approval
+are checked after waiting, then the full candidate is reread and version-bound
+context recaptured. A transaction unions refreshed pre-send baseline IDs with
+the original IDs, preserving identity, original window, intent and observations.
+Only an armed coordinator at dispatch-recorded stage may extend these baselines;
+recovery never calls that operation. Final connection/version/endpoint, age,
+expiry and clock-boundary checks follow this commit immediately before sending.
+Events already present during the wait are therefore excluded from outcomes.
+
+The UTC clocks must remain synchronized; changing display timezone does not
+solve clock skew. Ambiguous historical results remain unknown under the same
+verifier rules. Existing held tests are not reset or automatically relabelled;
+their resolution requires separate explicit review, not another removal request.
+
 Production observations always leave `data_deleted` unknown because no supported
 API proves download-side deletion. Consequently the production verifier cannot
 claim complete verification without a separately designed independent proof.

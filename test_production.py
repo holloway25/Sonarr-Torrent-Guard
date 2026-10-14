@@ -13,6 +13,10 @@ from test_guard import FakeApi, manifest
 
 class ProductionTests(unittest.TestCase):
     def setUp(self):
+        for name, value in (("wait_for_event_boundary", None), ("event_boundary_reached", True)):
+            boundary = patch("production." + name, return_value=value)
+            boundary.start()
+            self.addCleanup(boundary.stop)
         connectivity = patch("production.require_connectivity", return_value={"status": "verified"})
         connectivity.start()
         self.addCleanup(connectivity.stop)
