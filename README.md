@@ -2,8 +2,8 @@
 
 A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
-verifier exist for review; the sender is disabled. No live requests have been
-approved or enabled. No routine live mode, additional search, resume, extraction,
+verifier exist for review; both sender release gates are disabled. No live requests
+are currently authorized. No routine live CLI, additional search, resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Setup
@@ -43,7 +43,7 @@ option cannot send removal, blocklist or replacement requests.
 
 Optional `--log-file /path/outside/checkout/guard.log` enables one-MiB rotation
 with three backups. Keep runtime files outside Git. No service or schedule is
-installed. A future schedule should run every five minutes. A process lock beside
+installed. The planned interval is ten minutes. A process lock beside
 the configuration prevents overlaps and releases on process exit.
 
 The active log and retained numbered backups have mode 600, including newly
@@ -59,7 +59,9 @@ wall-clock request/assessment deadline enforced by Linux interval signals,
 including slowly streamed bodies. API calls run in the main thread. Cross-origin
 redirects and HTTPS downgrades are refused; equivalent default-port redirects
 are accepted. Failed runs do not imply any live action occurred.
-The only POST is qBittorrent authentication; assessment uses GET. TLS certificates
+In `guard.py`, the only POST is qBittorrent authentication; assessment uses GET.
+The new maintenance-aware cycle also uses a non-saving Sonarr diagnostic POST,
+described below. TLS certificates
 are verified. Explicit public and private source lists protect unknown sources.
 
 ## Public policy
@@ -100,7 +102,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production
+python3 -m unittest -v test_guard test_safety test_production test_public
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -122,7 +124,8 @@ reconciliation logic; the production verifier is described below.
 Recovery keeps historical positive confirmations separately from last-known
 results and the current observation's availability. Outages, absent fields and
 unknown values do not erase earlier evidence. Explicit contradictions require
-manual review. A union of old/partial positives cannot prove completion: all
+manual review (only cleanup fields affect the new per-attempt cleanup stage).
+A union of old/partial positives cannot prove completion: all
 required results must be positive in one current observation. Existing journals
 are migrated additively, preserving their stored evidence.
 
@@ -145,7 +148,8 @@ IDs, checks the reviewed Sonarr version, and exercises independent read-only
 outcome checks. It does not prepare a dispatch journal entry or generate approval.
 The verifier matches failure history by original hash and episode identity. New
 replacement grabs must have different valid hashes for the affected episodes and
-the same bound client. Blocklist API records have no hash: new IDs are correlated
+the same bound client, or a corroborated newer incarnation of the same hash.
+An observed grab is not a verified safe download or import. Blocklist API records have no hash: new IDs are correlated
 by original release-title digest, indexer, series and episodes. Pre-existing
 records never count as new results. After dispatch, event dates must also be at
 or after the durably recorded dispatch time; unsynchronized clocks can prevent
@@ -187,6 +191,52 @@ Preview/simulation journal namespaces cannot authorize a single test. Production
 context stores only exact IDs, public indexer identity, times and digests, not raw
 release titles, endpoint addresses or credentials. Live integration and independent
 file-deletion confirmation remain required before any activation decision.
+
+## Ten-minute public cycle and maintenance safeguards
+
+```sh
+python3 public.py --config /path/outside/checkout/connections.json
+```
+
+This bounded CLI is always dry-run, even if a release flag is changed. It first
+asks both owning Sonarr instances to test their configured qBittorrent connection.
+If either is unavailable/unverified, it returns `waiting` with a 600-second retry
+interval; it never falls back to downloader-only cleanup. When available, it
+reconciles pending action evidence and assesses candidates with fresh checks and
+the existing fair batch cursor. Unresolved actions hold only that instance/hash.
+
+`maintenance.py` uses the reviewed Sonarr version's non-saving download-client
+test endpoint, not cached absence of health warnings. Temporary test categories
+are blank to prevent category creation, and the original provider ID resolves
+Sonarr's own stored/masked credentials. It never substitutes guard credentials,
+saves settings, changes file priorities or adds/removes torrents. Sonarr may
+update its native connection-health status. Redirects, unexpected warnings/errors,
+outages and malformed responses mean wait. Only the expected blank-category
+warning is accepted alongside an otherwise successful test. The older `guard.py`
+assessment CLI remains GET-only apart from qBittorrent session login.
+
+The disabled `execute_public_attempt` coordinator adds a separate release gate,
+armed journal and exact short-lived approval requirement. It does not authorize
+itself from the scheduler. Each action binds the attempt and approval digest;
+a later confirmed grab needs a new approval and newer addition/grab identities.
+Uncertain, prepared or manual-review production records prevent another cleanup
+for that instance/hash. Definite unsent cancelled/blocked records are preserved;
+after maintenance a new exact approval may prepare a distinct operation, never
+resend from recovery or reuse the old approval. Final connectivity/version,
+endpoint binding, snapshot freshness and approval checks run after intent commit.
+
+For these new attempt records, `cleanup_resolved` requires current positive
+original-incarnation absence, failure and blocklisting. It does not claim file
+deletion, a safe replacement or import; those remain separately reported. Legacy
+single-test records retain their original stages and one-action-per-hash rule.
+The 1000-row bound remains fail-closed; no records are automatically purged or
+uncertain evidence discarded. A safe retention/archive policy is still needed
+before unattended long-term activation.
+
+`deploy/` contains optional user-service and ten-minute timer templates for this
+dry-run CLI. They are not installed or enabled. The timer waits ten minutes after
+each completed cycle, avoids catch-up bursts and cannot enable either sender.
+Paths are templates; review them for the chosen installation before any use.
 
 ## Remaining milestones
 

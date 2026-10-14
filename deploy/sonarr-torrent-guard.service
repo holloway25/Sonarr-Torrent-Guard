@@ -1,0 +1,10 @@
+[Unit]
+Description=Sonarr Torrent Guard public dry-run check
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Sonarr-Torrent-Guard
+ExecStart=/usr/bin/python3 %h/Sonarr-Torrent-Guard/public.py --config %h/.config/sonarr-torrent-guard/connections.json
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=210

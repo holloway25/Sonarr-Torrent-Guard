@@ -1,0 +1,11 @@
+[Unit]
+Description=Sonarr Torrent Guard ten-minute dry-run interval
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=10min
+Unit=sonarr-torrent-guard.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

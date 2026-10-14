@@ -13,6 +13,9 @@ from test_guard import FakeApi, manifest
 
 class ProductionTests(unittest.TestCase):
     def setUp(self):
+        connectivity = patch("production.require_connectivity", return_value={"status": "verified"})
+        connectivity.start()
+        self.addCleanup(connectivity.stop)
         self.hash = "a" * 40
         self.config = {"dry_run": False, "qbittorrent": {"url": "https://downloader.example.invalid"},
                        "sonarr": {"HD": {"url": "https://sonarr.example.invalid", "api_key": "REPLACE_ME",

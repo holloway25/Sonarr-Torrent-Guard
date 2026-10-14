@@ -19,14 +19,17 @@ import urllib.request
 from guard import (Api, GuardError, endpoint_key, hard_deadline, integer, load_config,
                    records, recheck_candidate, run, torrent_hash, verify_client_binding)
 from safety import Journal, SafetyError, DISPATCH_STOP_REASONS, check_fresh, evidence, reconcile, valid_digest
+from maintenance import require_connectivity
 
 
 # Deliberately false until code review and explicit human approval for one test.
 SINGLE_TEST_RELEASE_ENABLED = False
+PUBLIC_ATTEMPT_RELEASE_ENABLED = False
 SUPPORTED_SONARR_VERSION = "4.0.20.3014"
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
                   "window_start", "baseline_history_ids", "baseline_blocklist_ids", "approval_digest"}
+ATTEMPT_CONTEXT_FIELDS = {"attempt_fingerprint", "download_added_on", "grab_ids"}
 
 
 def digest(value):
@@ -34,7 +37,7 @@ def digest(value):
 
 
 def validate_context(value):
-    if not isinstance(value, dict) or set(value) != CONTEXT_FIELDS:
+    if not isinstance(value, dict) or set(value) not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS):
         raise SafetyError("invalid_operation_context")
     try:
         if torrent_hash(value["hash"]) != value["hash"]:
@@ -58,6 +61,13 @@ def validate_context(value):
         stamp = value["window_start"]
         if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or stamp <= 0:
             raise ValueError()
+        if "attempt_fingerprint" in value:
+            added, grabs = value["download_added_on"], value["grab_ids"]
+            if (not integer(added) or added <= 0 or not isinstance(grabs, list) or not grabs
+                    or len(grabs) > 10000 or any(not integer(i) or i <= 0 for i in grabs)
+                    or sorted(set(grabs)) != grabs or value["attempt_fingerprint"] != digest(
+                        [value["instance"], value["hash"], added, grabs])):
+                raise ValueError()
     except (ValueError, TypeError, GuardError):
         raise SafetyError("invalid_operation_context") from None
     return json.loads(json.dumps(value))
@@ -151,7 +161,7 @@ def capture_context(config, api, report, approval_digest, now=None):
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
     blocklist = records(api, "/api/v3/blocklist", {"seriesIds": series[0]}, config.get("max_pages", 20))
-    return validate_context({
+    context = {
         "instance": report["instance"], "hash": report["hash"], "series_id": series[0],
         "episode_ids": report["episode_ids"], "queue_id": min(report["queue_ids"]),
         "client_id": client["id"], "indexer": report["indexer"],
@@ -159,7 +169,9 @@ def capture_context(config, api, report, approval_digest, now=None):
         "client_name_digest": digest(client["name"]), "release_title_digest": digest(next(iter(titles))),
         "window_start": start, "baseline_history_ids": [r["id"] for r in baseline_history],
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
-    })
+    }
+    context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
+    return validate_context(context)
 
 
 class OutcomeVerifier:
@@ -182,6 +194,7 @@ class OutcomeVerifier:
             raise SafetyError("observation_client_changed")
         # APIs cannot prove download-side file deletion. Never infer this from absence.
         result = {k: None for k in ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")}
+        current_torrent = None
         try:
             torrents = self.qb.call("/api/v2/torrents/info")
             if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
@@ -190,12 +203,18 @@ class OutcomeVerifier:
             if len(hashes) != len(set(hashes)):
                 raise ValueError()
             result["torrent_absent"] = c["hash"] not in hashes
+            current_torrent = next((t for t in torrents if torrent_hash(t["hash"]) == c["hash"]), None)
+            if current_torrent is not None and "download_added_on" in c and (
+                    current_torrent.get("added_on") != c["download_added_on"]):
+                # A different incarnation needs corroborating new Sonarr grabs.
+                result["torrent_absent"] = None
         except Exception:
             pass
         try:
             rows = history_since(api, c["window_start"])
             new = [r for r in rows if r["id"] not in c["baseline_history_ids"]]
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
+            regrab = set()
             for r in new:
                 if not integer(r.get("seriesId")) or not integer(r.get("episodeId")):
                     raise SafetyError("invalid_history_identity")
@@ -208,6 +227,12 @@ class OutcomeVerifier:
                 if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
                     continue
                 h = str(r.get("downloadId", "")).lower()
+                added = current_torrent.get("added_on") if current_torrent else None
+                if (r.get("eventType") in (1, "grabbed") and h == c["hash"] and after is True
+                        and "grab_ids" in c and r["id"] > max(c["grab_ids"])
+                        and integer(added) and added > max(c["download_added_on"], self.not_before)
+                        and abs(event_time(r) - added) <= 120):
+                    regrab.add(r["episodeId"])
                 if (r.get("eventType") in (4, "downloadFailed") and h == c["hash"]
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
                     (failed if after else ambiguous_failed).add(r["episodeId"])
@@ -221,6 +246,9 @@ class OutcomeVerifier:
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
             result["replacement_observed"] = True if replacement == required else (
                 None if ambiguous_replacement - replacement else False)
+            if regrab == required:
+                result["torrent_absent"] = True  # Original incarnation, not all copies of this hash.
+                result["replacement_observed"] = True  # Observed is not verified safe/imported.
         except Exception:
             pass
         try:
@@ -267,7 +295,7 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
 
 def _send_queue_delete(api, queue_id):
     """Narrow transport; called only after the coordinator's gates and durable intent."""
-    if SINGLE_TEST_RELEASE_ENABLED is not True:
+    if SINGLE_TEST_RELEASE_ENABLED is not True and PUBLIC_ATTEMPT_RELEASE_ENABLED is not True:
         raise SafetyError("live_execution_disabled")
     if not integer(queue_id) or queue_id <= 0:
         raise SafetyError("invalid_queue_id")
@@ -287,7 +315,42 @@ def _send_queue_delete(api, queue_id):
 
 def execute_single_test(config, qb, apis, journal, report, approval):
     """Disabled production coordinator. No approval file or CLI live mode exists."""
-    if SINGLE_TEST_RELEASE_ENABLED is not True or config.get("dry_run") is not False or not journal.allow_single_test:
+    return _execute(config, qb, apis, journal, report, approval, "single_test")
+
+
+def execute_public_attempt(config, qb, apis, journal, report, approval):
+    """Disabled per-attempt sender; still requires exact short-lived approval.
+
+    No automatic policy approval is inferred from a timer or a previous approval.
+    """
+    return _execute(config, qb, apis, journal, report, approval, "public_attempt")
+
+
+def _enabled(config, journal, mode):
+    return config.get("dry_run") is False and (
+        (mode == "single_test" and SINGLE_TEST_RELEASE_ENABLED is True and journal.allow_single_test)
+        or (mode == "public_attempt" and PUBLIC_ATTEMPT_RELEASE_ENABLED is True and journal.allow_public_attempt))
+
+
+def check_prior_attempts(journal, report, approval_digest=None):
+    for previous in journal.related(report["instance"], report["hash"]):
+        if previous["stage"] in ("cancelled", "dispatch_blocked"):
+            if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
+                raise SafetyError("approval_already_consumed")
+            continue
+        if previous["stage"] not in ("cleanup_resolved", "complete"):
+            raise SafetyError("previous_attempt_unresolved")
+        prior = previous["context"]
+        if ("download_added_on" not in prior or
+                report["download_added_on"] <= prior["download_added_on"] or
+                (previous["dispatched_at"] is not None and
+                 report["download_added_on"] <= previous["dispatched_at"]) or
+                min(report["grab_ids"]) <= max(prior["grab_ids"])):
+            raise SafetyError("new_attempt_not_confirmed")
+
+
+def _execute(config, qb, apis, journal, report, approval, mode):
+    if not _enabled(config, journal, mode):
         raise SafetyError("live_execution_disabled")
     validate_approval(approval, report)
     with open(journal.path.parent / "guard.lock", "a") as lock:
@@ -295,31 +358,47 @@ def execute_single_test(config, qb, apis, journal, report, approval):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SafetyError("another_run_is_active") from None
-        key = digest(["single_test", report["instance"], report["hash"]])
+        identity = [mode, report["instance"], report["hash"]]
+        if mode == "public_attempt":
+            if not valid_digest(report.get("attempt_fingerprint")):
+                raise SafetyError("attempt_identity_required")
+            identity.append(report["attempt_fingerprint"])
+            identity.append(digest(approval["nonce"]))
+        key = digest(identity)
         old = journal.get(key)
         if old is not None:
             verifier = OutcomeVerifier(config, qb, apis, old["context"], old["dispatched_at"])
             return reconcile(journal, key, verifier.observe)
+        if mode == "public_attempt":
+            # Definitely unsent rows can be followed by a new exact approval;
+            # recovery itself never sends or rewrites their historical intent.
+            check_prior_attempts(journal, report, digest(approval["nonce"]))
+        require_connectivity(config, apis[report["instance"]], report["instance"])
         fresh = recheck_candidate(report, config, qb, apis)
         check_fresh(report, fresh)
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
-        row = journal.prepare(report, mode="single_test", context=context)
+        row = journal.prepare(report, mode=mode, context=context)
         try:
             final_snapshot = recheck_candidate(report, config, qb, apis)
             check_fresh(report, final_snapshot)
             validate_approval(approval, report)
+            require_connectivity(config, apis[report["instance"]], report["instance"])
         except Exception:
             return journal.transition(row["key"], "prepared", "cancelled")
         row = journal.transition(row["key"], "prepared", "dispatch_recorded")
         # FULL-sync commit and the status request may take time. There must be no
         # disk/network work between the final local expiry checks and send.
         try:
+            require_connectivity(config, apis[report["instance"]], report["instance"])
             status = apis[report["instance"]].call("/api/v3/system/status")
             if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
                 raise SafetyError("unreviewed_sonarr_version")
-            if (SINGLE_TEST_RELEASE_ENABLED is not True or config.get("dry_run") is not False
-                    or not journal.allow_single_test):
+            if not _enabled(config, journal, mode):
                 raise SafetyError("live_execution_disabled")
+            if (binding_digest(config, report["instance"]) != context["binding_digest"] or
+                    endpoint_key(apis[report["instance"]].config["url"]) !=
+                    endpoint_key(config["sonarr"][report["instance"]]["url"])):
+                raise SafetyError("identity_or_manifest_changed")
             check_fresh(report, final_snapshot)
             validate_approval(approval, report)
         except Exception as error:

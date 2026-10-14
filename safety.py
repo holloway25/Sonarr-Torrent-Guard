@@ -9,7 +9,8 @@ import time
 
 OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
 DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
-                         "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed"}
+                         "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
+                         "sonarr_connectivity_unavailable", "identity_or_manifest_changed"}
 
 
 def clean_observation(observation):
@@ -75,7 +76,7 @@ class Journal:
     Rows are bounded without deleting unresolved evidence. Transactions use FULL
     synchronization. Preview and simulation rows cannot authorize production work.
     """
-    def __init__(self, path, limit=1000, allow_single_test=False):
+    def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False):
         self.path = Path(path)
         if self.path.is_symlink() or self.path.parent.stat().st_mode & 0o077:
             raise SafetyError("journal_requires_private_directory")
@@ -90,6 +91,7 @@ class Journal:
                 sidecar.chmod(0o600)
         self.limit = limit
         self.allow_single_test = allow_single_test is True
+        self.allow_public_attempt = allow_public_attempt is True
         self.db = sqlite3.connect(self.path, timeout=5)
         try:
             self._initialize()
@@ -138,21 +140,28 @@ class Journal:
                                         "dispatched_at": row[8], "stop_reason": row[9]}
 
     def prepare(self, report, mode="preview", context=None):
-        if mode not in ("preview", "simulation") and not (mode == "single_test" and self.allow_single_test):
+        if mode not in ("preview", "simulation") and not (
+                mode == "single_test" and self.allow_single_test) and not (
+                mode == "public_attempt" and self.allow_public_attempt):
             raise SafetyError("live_execution_disabled")
-        if mode == "single_test" and context is None:
+        if mode in ("single_test", "public_attempt") and context is None:
             raise SafetyError("operation_context_required")
         if context is not None:
-            if mode != "single_test":
+            if mode not in ("single_test", "public_attempt"):
                 raise SafetyError("unexpected_action_context")
             from production import validate_context
             context = validate_context(context)
         value = evidence(report)
+        if mode == "public_attempt" and ("attempt_fingerprint" not in value
+                or context.get("attempt_fingerprint") != value["attempt_fingerprint"]):
+            raise SafetyError("attempt_identity_required")
         identity = [mode, value["instance"], value["hash"]]
         # Single-test approval remains one action per hash, including re-grabs.
-        # Only non-live namespaces can track successive download incarnations.
+        # Preview/simulation and the separately gated attempt sender track incarnations.
         if mode != "single_test" and "attempt_fingerprint" in value:
             identity.append(value["attempt_fingerprint"])
+        if mode == "public_attempt":
+            identity.append(context["approval_digest"])
         key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -170,9 +179,9 @@ class Journal:
     def transition(self, key, expected, stage, observation=None, stop_reason=None):
         allowed = {
             "prepared": {"preview_verified", "cancelled", "dispatch_recorded"},
-            "dispatch_recorded": {"dispatch_blocked", "uncertain", "replacement_pending", "manual_review", "complete"},
-            "uncertain": {"uncertain", "replacement_pending", "manual_review", "complete"},
-            "replacement_pending": {"uncertain", "replacement_pending", "manual_review", "complete"},
+            "dispatch_recorded": {"dispatch_blocked", "uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
+            "uncertain": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
+            "replacement_pending": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
         }
         if stage not in allowed.get(expected, set()):
             raise SafetyError("invalid_journal_transition")
@@ -187,7 +196,8 @@ class Journal:
             if row is None or row["stage"] != expected:
                 raise SafetyError("journal_stage_changed")
             if stage == "dispatch_recorded" and not (row["mode"] == "simulation" or
-                    (row["mode"] == "single_test" and self.allow_single_test)):
+                    (row["mode"] == "single_test" and self.allow_single_test) or
+                    (row["mode"] == "public_attempt" and self.allow_public_attempt)):
                 raise SafetyError("live_execution_disabled")
             current = {} if observation is None else clean_observation(observation)
             last_known = dict(row["observation"])
@@ -199,7 +209,12 @@ class Journal:
                     confirmed[field] = True
             if stage == "complete" and not all(current.get(field) is True for field in OBSERVATION_FIELDS):
                 raise SafetyError("completion_not_verified")
-            if any(val is False and row["confirmed"].get(field) is True for field, val in current.items()):
+            if stage == "cleanup_resolved" and (row["mode"] != "public_attempt" or not all(
+                    current.get(field) is True for field in ("torrent_absent", "failed", "blocklisted"))):
+                raise SafetyError("cleanup_not_verified")
+            contradiction_fields = ("torrent_absent", "failed", "blocklisted") if row["mode"] == "public_attempt" else OBSERVATION_FIELDS
+            if any(current.get(field) is False and row["confirmed"].get(field) is True
+                   for field in contradiction_fields):
                 stage = "manual_review"
             dispatched_at = time.time() if stage == "dispatch_recorded" else row["dispatched_at"]
             self.db.execute("UPDATE actions SET stage=?,observation=?,confirmed=?,current_observation=?,"
@@ -208,6 +223,15 @@ class Journal:
                              observation is not None, time.time(), dispatched_at,
                              stop_reason if stage == "dispatch_blocked" else row["stop_reason"], key, expected))
         return self.get(key)
+
+    def related(self, instance, hash_value):
+        """Bounded journal scan; keep legacy production records in safety scope."""
+        result = []
+        for (key,) in self.db.execute("SELECT key FROM actions WHERE mode IN ('single_test','public_attempt')").fetchall():
+            row = self.get(key)
+            if row["evidence"]["instance"] == instance and row["evidence"]["hash"] == hash_value:
+                result.append(row)
+        return result
 
 
 def record_preview(journal, original, recheck, now=None):
@@ -222,7 +246,7 @@ def record_preview(journal, original, recheck, now=None):
 def reconcile(journal, key, observe):
     """Read evidence only. No dispatch/retry path exists during recovery."""
     row = journal.get(key)
-    if row is None or row["mode"] not in ("simulation", "single_test"):
+    if row is None or row["mode"] not in ("simulation", "single_test", "public_attempt"):
         raise SafetyError("live_execution_disabled")
     if row["stage"] not in ("dispatch_recorded", "uncertain", "replacement_pending"):
         return row
@@ -232,7 +256,10 @@ def reconcile(journal, key, observe):
         return journal.transition(key, row["stage"], "uncertain")
     known = dict(row["observation"])
     known.update({k: v for k, v in observation.items() if v is not None})
-    if all(observation.get(k) is True for k in OBSERVATION_FIELDS):
+    if row["mode"] == "public_attempt" and all(
+            observation.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
+        stage = "cleanup_resolved"
+    elif all(observation.get(k) is True for k in OBSERVATION_FIELDS):
         stage = "complete"
     elif known.get("torrent_absent") is True and (
             known.get("failed") is False or known.get("blocklisted") is False):
