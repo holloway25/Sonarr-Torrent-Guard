@@ -58,6 +58,12 @@ If a new replacement grab has already been positively observed, mark
 Sonarr-side connectivity, reviewed version and endpoint checks; reject a
 reappearing original hash or newly queued affected episode. A stale original
 queue row alone is ignored only while qBittorrent confirms that hash is absent.
+Refresh replacement grab history after the intent commit as well: queue
+visibility can lag history. A new post-removal-intent grab for ANY affected
+episode from the bound client (same hash or different hash) suppresses the entire
+extra search with `replacement_already_grabbed`. Baseline/pre-intent/other-client
+grabs do not qualify. Unavailable, malformed or ambiguous relevant history
+blocks the search rather than treating missing evidence as no replacement.
 Revalidate the exact execution token, routine permission and live gates
 immediately before transport. No network/disk work follows those final local
 permission checks before the search call.
@@ -87,6 +93,8 @@ Recovery remains read-only: it may confirm removal and reach `retry_removed`,
 but it never issues a deferred search. Crashes between removal and search, lost
 responses, or blocked searches need operator inspection; leaving a download
 absent is preferable to duplicate commands. No replay of either request occurs.
+Restart tests reopen the journal and re-enter the actual coordinator at both
+`retry_removed` and `retry_search_recorded`, not just the reconciliation helper.
 The same attempt remains held. Strictly newer proven Sonarr grabs may supersede
 older holds under the existing identity/time/binding rules without erasing them.
 

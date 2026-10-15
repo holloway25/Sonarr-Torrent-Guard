@@ -422,6 +422,23 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         if any(r.get("seriesId") == c["series_id"] and r.get("episodeId") in c["episode_ids"]
                and r.get("id") != c["queue_id"] for r in queue):
             raise SafetyError("replacement_already_queued")
+        # Queue visibility can lag a successful grab. Refresh history AFTER the
+        # search-intent commit too; any affected episode already grabbed makes
+        # searching the whole set redundant. This is request evidence only,
+        # not proof of original removal, successful download or import.
+        for event in history_since(apis[c["instance"]], c["window_start"]):
+            if (event["id"] in c["baseline_history_ids"] or event.get("eventType") not in (1, "grabbed")
+                    or event.get("seriesId") != c["series_id"] or event.get("episodeId") not in c["episode_ids"]):
+                continue
+            data = event.get("data")
+            if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
+                continue
+            torrent_hash(event.get("downloadId"))
+            after = event_after(event, row["dispatched_at"])
+            if after is None:
+                raise SafetyError("replacement_history_ambiguous")
+            if after is True:
+                raise SafetyError("replacement_already_grabbed")
         status = apis[c["instance"]].call("/api/v3/system/status")
         if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
             raise SafetyError("unreviewed_sonarr_version")

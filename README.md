@@ -4,7 +4,8 @@ A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
 are currently enabled by default. An explicitly granted, expiring routine CLI is
-available for review. No additional search, resume, extraction,
+available for review. A metadata-only removal and additional episode search is
+implemented behind a separate disabled release gate. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Setup

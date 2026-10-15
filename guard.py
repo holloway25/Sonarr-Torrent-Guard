@@ -495,6 +495,11 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     "remove_torrent_and_data_through_sonarr",
                     "obtain_targeted_replacement_after_retry_settings_verified",
                 ]
+                if reasons == ["metadata_timeout"]:
+                    report["proposed_actions"] = [
+                        "remove_torrent_and_data_through_sonarr_without_blocklisting",
+                        "request_owning_sonarr_episode_search_after_confirmed_removal_and_final_checks",
+                    ]
                 report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
         except GuardError as e:
             report.update(decision="skip", reason=str(e))

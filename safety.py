@@ -12,7 +12,8 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
                          "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
                          "dispatch_clock_unavailable", "routine_authorization_expired_or_scope_changed",
-                         "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued"}
+                         "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued",
+                         "replacement_already_grabbed", "replacement_history_ambiguous"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible"}
 

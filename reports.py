@@ -56,7 +56,11 @@ def human_report(reports, readiness, timestamp):
                 message += ": " + safety["reason"].replace("_", " ")
             lines.append("  Fresh recheck/journal: " + message + " (live execution disabled)")
         if report["decision"] == "would_fail":
-            lines.append("  Proposed after approval/checks: Sonarr removes torrent/data, blocklists and handles retry.")
+            if report.get("reasons") == ["metadata_timeout"]:
+                lines.append("  Proposed after approval/checks: Sonarr removes torrent/data WITHOUT blocklisting; "
+                             "after confirmed removal and final checks, request an affected-episode search.")
+            else:
+                lines.append("  Proposed after approval/checks: Sonarr removes torrent/data, blocklists and handles retry.")
             blockers = report.get("workflow", {}).get("blockers", [])
             lines.append("  Not enabled: " + ", ".join(b.replace("_", " ") for b in blockers))
     lines.append("No removal, blocklisting, replacement search or setting changes were sent.")

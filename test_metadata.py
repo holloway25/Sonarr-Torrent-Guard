@@ -8,6 +8,7 @@ from guard import run, recheck_candidate
 import production
 from safety import Journal, SafetyError, check_fresh, reconcile
 from workflow import preview_failure
+from reports import human_report, json_events
 import test_guard as guard_fixtures
 import test_production as production_fixtures
 
@@ -64,6 +65,27 @@ class MetadataTests(unittest.TestCase):
         for state in ("pausedDL", "stoppedDL", "checkingDL", "error"):
             self.t["state"] = state
             self.assertEqual(self.assess()["decision"], "skip")
+
+    def test_metadata_human_and_json_proposals_do_not_promise_blocklisting(self):
+        report = self.assess()
+        self.assertNotIn("blocklist_release_in_owning_sonarr", report["proposed_actions"])
+        self.assertIn("remove_torrent_and_data_through_sonarr_without_blocklisting", report["proposed_actions"])
+        self.assertIn("request_owning_sonarr_episode_search_after_confirmed_removal_and_final_checks", report["proposed_actions"])
+        output = human_report([report], {}, "test time")
+        self.assertIn("WITHOUT blocklisting", output)
+        self.assertIn("affected-episode search", output)
+        self.assertNotIn("blocklists and handles retry", output)
+        event = list(json_events([report], {}, "test time"))[0]
+        self.assertEqual(event["proposed_actions"], report["proposed_actions"])
+
+    def test_file_failure_human_and_json_proposals_still_blocklist(self):
+        self.t["state"] = "stalledUP"
+        self.f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
+        report = self.assess()
+        self.assertIn("blocklist_release_in_owning_sonarr", report["proposed_actions"])
+        self.assertIn("blocklists and handles retry", human_report([report], {}, "test time"))
+        event = list(json_events([report], {}, "test time"))[0]
+        self.assertIn("blocklist_release_in_owning_sonarr", event["proposed_actions"])
 
 
 class MetadataSenderTests(unittest.TestCase):
@@ -309,6 +331,120 @@ class MetadataSenderTests(unittest.TestCase):
             row = self.execute()
         self.assertEqual(row["stage"], "retry_superseded")
         search.assert_not_called()
+
+    def assert_coordinator_restart_does_not_replay(self, crash_stage):
+        f = self.f
+        original_finish = production.finish_metadata_retry
+        original_transition = f.journal.transition
+        def finish(*args, **kwargs):
+            if crash_stage == "retry_removed":
+                raise RuntimeError("simulated crash")
+            return original_finish(*args, **kwargs)
+        def transition(*args, **kwargs):
+            row = original_transition(*args, **kwargs)
+            if args[2] == crash_stage:
+                raise RuntimeError("simulated crash")
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch(
+                "production.finish_metadata_retry", side_effect=finish), patch.object(
+                f.journal, "transition", side_effect=transition):
+            with self.assertRaises(RuntimeError):
+                self.execute()
+        previous = f.journal.related("HD", f.hash)[0]
+        self.assertEqual(previous["stage"], crash_stage)
+        f.journal.close()
+        f.journal = Journal(f.journal.path, allow_public_attempt=True)
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete") as remove, patch("production._send_episode_search") as search:
+            recovered = self.execute()  # Actual coordinator entry, not just reconcile().
+        self.assertEqual(recovered, previous)
+        remove.assert_not_called()
+        search.assert_not_called()
+
+    def test_coordinator_restart_after_removal_never_sends_deferred_search(self):
+        self.assert_coordinator_restart_does_not_replay("retry_removed")
+
+    def test_coordinator_restart_after_search_intent_never_replays_either_request(self):
+        self.assert_coordinator_restart_does_not_replay("retry_search_recorded")
+
+    def test_final_history_refresh_suppresses_new_grab_even_when_queue_is_empty(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                replacement = dict(f.grab, id=18, downloadId="b" * 40,
+                    date=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
+        search.assert_not_called()
+
+    def test_final_history_same_hash_new_grab_also_suppresses_search(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                replacement = dict(f.grab, id=18, date=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
+        search.assert_not_called()
+
+    def test_final_history_outage_blocks_search_without_disclosing_response(self):
+        f = self.f
+        original = f.s.call
+        state = {"intent": False}
+        original_transition = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original_transition(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                state["intent"] = True
+            return row
+        def call(path, *args, **kwargs):
+            if path == "/api/v3/history/since" and state["intent"]:
+                raise RuntimeError("private-response")
+            return original(path, *args, **kwargs)
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch.object(
+                f.s, "call", side_effect=call), patch("production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "dispatch_validation_failed")
+        self.assertNotIn("private-response", json.dumps(row))
+        search.assert_not_called()
+
+    def test_final_history_old_or_other_client_grabs_do_not_suppress_search(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                old = dict(f.grab, id=18, downloadId="b" * 40)
+                other = dict(f.grab, id=19, downloadId="c" * 40,
+                    data={"downloadClientName": "Other"},
+                    date=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                f.s.routes["/api/v3/history/since"] = [f.grab, old, other]
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        search.assert_called_once()
 
     def test_unexpected_blocklisting_requires_review_not_another_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
