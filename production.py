@@ -430,15 +430,21 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
             if (event["id"] in c["baseline_history_ids"] or event.get("eventType") not in (1, "grabbed")
                     or event.get("seriesId") != c["series_id"] or event.get("episodeId") not in c["episode_ids"]):
                 continue
-            data = event.get("data")
-            if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
-                continue
-            torrent_hash(event.get("downloadId"))
             after = event_after(event, row["dispatched_at"])
             if after is None:
                 raise SafetyError("replacement_history_ambiguous")
-            if after is True:
-                raise SafetyError("replacement_already_grabbed")
+            if after is False:
+                continue
+            data = event.get("data")
+            client_name = data.get("downloadClientName") if isinstance(data, dict) else None
+            if not isinstance(client_name, str) or not client_name.strip():
+                raise SafetyError("replacement_client_unknown")
+            # Only a positively named different client may be excluded. Missing
+            # identity is uncertainty, not evidence of no replacement.
+            if digest(client_name) != c["client_name_digest"]:
+                continue
+            torrent_hash(event.get("downloadId"))
+            raise SafetyError("replacement_already_grabbed")
         status = apis[c["instance"]].call("/api/v3/system/status")
         if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
             raise SafetyError("unreviewed_sonarr_version")

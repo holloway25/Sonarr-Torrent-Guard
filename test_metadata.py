@@ -446,6 +446,59 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(row["stage"], "retry_requested")
         search.assert_called_once()
 
+    def test_final_history_missing_or_invalid_client_identity_blocks_search(self):
+        f = self.f
+        cases = [{}, {"data": None}, {"data": []}, {"data": {}},
+                 *({"data": {"downloadClientName": value}} for value in
+                   (None, True, 0, [], {}, "", "   "))]
+        queue_rows = f.s.routes["/api/v3/queue"]
+        for number, changes in enumerate(cases):
+            with self.subTest(case=number):
+                f.journal.close()
+                f.journal = Journal(f.journal.path.parent / ("case-" + str(number) + ".sqlite3"), allow_public_attempt=True)
+                f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                f.s.routes["/api/v3/queue"] = queue_rows
+                f.s.routes["/api/v3/history/since"] = [f.grab]
+                original = f.journal.transition
+                def transition(*args, **kwargs):
+                    row = original(*args, **kwargs)
+                    if args[2] == "retry_search_recorded":
+                        replacement = dict(f.grab, id=18, downloadId="b" * 40,
+                            date=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                        replacement.pop("data")
+                        replacement.update(changes)
+                        f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
+                    return row
+                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete", side_effect=self.removed), patch.object(
+                        f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+                    row = self.execute()
+                self.assertEqual(row["stage"], "retry_search_blocked")
+                self.assertEqual(row["stop_reason"], "replacement_client_unknown")
+                search.assert_not_called()
+                reopened = Journal(f.journal.path)
+                try:
+                    self.assertEqual(reopened.get(row["key"])["stop_reason"], "replacement_client_unknown")
+                finally:
+                    reopened.close()
+
+    def test_pre_intent_history_with_unknown_client_does_not_block_search(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                old = dict(f.grab, id=18, data=None)
+                f.s.routes["/api/v3/history/since"] = [f.grab, old]
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        search.assert_called_once()
+
     def test_unexpected_blocklisting_requires_review_not_another_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=lambda *a, **kw: self.f.results()), patch(

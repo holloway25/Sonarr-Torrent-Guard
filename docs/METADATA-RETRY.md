@@ -64,6 +64,10 @@ episode from the bound client (same hash or different hash) suppresses the entir
 extra search with `replacement_already_grabbed`. Baseline/pre-intent/other-client
 grabs do not qualify. Unavailable, malformed or ambiguous relevant history
 blocks the search rather than treating missing evidence as no replacement.
+For a new relevant grab, missing/non-object `data`, missing/non-string/blank
+`downloadClientName` blocks with `replacement_client_unknown`. Only a valid
+nonblank different client name may be excluded; unknown identity is not a
+different client. Pre-intent grabs remain excluded before that identity check.
 Revalidate the exact execution token, routine permission and live gates
 immediately before transport. No network/disk work follows those final local
 permission checks before the search call.

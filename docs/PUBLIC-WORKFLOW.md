@@ -92,7 +92,12 @@ appropriate client-side verification without adding broad filesystem access.
 dictionary. It never sends the described request. Every preview remains blocked
 by `live_sender_disabled` and `fresh_recheck_required`, plus any retry
 setting problems. A protected/kept/unidentified candidate gets no request preview.
-Multiple queue rows yield one preview, and no additional search is planned.
+Multiple queue rows yield one removal preview. File-policy failures plan no
+additional search: owning Sonarr's native failure handler handles retry. The
+separately gated metadata-timeout exception previews removal without blocklisting
+and an explicit affected-episode search only after confirmed removal and final
+safety checks; see [metadata retry review](METADATA-RETRY.md). Both previews are
+descriptions only, never dispatch permission.
 
 `safety.py` compares ownership and manifest fingerprints from fresh assessment,
 checks public eligibility, both retry switches and a ten-second maximum snapshot
