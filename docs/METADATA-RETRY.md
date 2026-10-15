@@ -74,6 +74,14 @@ content identity blocks with `replacement_history_identity_invalid`; only valid
 unrelated identities may be ignored. Baseline records and non-grab events are
 excluded first. New malformed grabs fail closed even if their missing identity
 prevents determining which content they concern.
+Validate history event types before any exclusion: accept only supported v4
+numeric types1–7 or their exact API names; missing, malformed, unsupported and
+`Unknown` (0/`unknown`) values block with `replacement_history_event_invalid`.
+Only known non-grab types can be ignored as non-grabs. This also validates event
+types of baseline rows; a baseline is not a waiver for malformed schema.
+Final queue rows likewise require positive integer series/episode IDs before
+excluding original or unrelated rows. Unknown content identity blocks with
+`replacement_queue_identity_invalid`; valid unrelated rows can still be ignored.
 Revalidate the exact execution token, routine permission and live gates
 immediately before transport. No network/disk work follows those final local
 permission checks before the search call.
@@ -125,4 +133,5 @@ Source references for the supported version:
 - [Queue removal](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs)
 - [Command submission](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Commands/CommandController.cs)
 - [Command resource](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Commands/CommandResource.cs)
+- [Supported history event types](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/History/EpisodeHistory.cs)
 - [Blocklist matching](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Blocklisting/BlocklistService.cs)

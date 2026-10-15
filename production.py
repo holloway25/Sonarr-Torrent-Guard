@@ -34,6 +34,10 @@ CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "c
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
                   "window_start", "baseline_history_ids", "baseline_blocklist_ids", "approval_digest"}
 ATTEMPT_CONTEXT_FIELDS = {"attempt_fingerprint", "download_added_on", "grab_ids"}
+HISTORY_EVENT_TYPES = {
+    1: "grabbed", 2: "seriesFolderImported", 3: "downloadFolderImported",
+    4: "downloadFailed", 5: "episodeFileDeleted", 6: "episodeFileRenamed", 7: "downloadIgnored",
+}
 
 
 def digest(value):
@@ -401,6 +405,16 @@ def metadata_policy(report):
     return {"blocklist": False, "search": "EpisodeSearch"}
 
 
+def metadata_history_type(event):
+    """Known v4 history types only; Unknown=0 is not a safe non-grab exclusion."""
+    value = event.get("eventType")
+    if integer(value) and value in HISTORY_EVENT_TYPES:
+        return HISTORY_EVENT_TYPES[value]
+    if isinstance(value, str) and value in HISTORY_EVENT_TYPES.values():
+        return value
+    raise SafetyError("replacement_history_event_invalid")
+
+
 def finish_metadata_retry(config, qb, apis, journal, row, validate):
     """Only the original coordinator can request a search; recovery stays read-only."""
     if row["stage"] != "retry_removed":
@@ -419,15 +433,19 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         if c["hash"] in [torrent_hash(t.get("hash")) for t in torrents]:
             raise SafetyError("target_reappeared")
         queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
-        if any(r.get("seriesId") == c["series_id"] and r.get("episodeId") in c["episode_ids"]
-               and r.get("id") != c["queue_id"] for r in queue):
-            raise SafetyError("replacement_already_queued")
+        for queued in queue:
+            if any(not integer(queued.get(field)) or queued[field] <= 0 for field in ("seriesId", "episodeId")):
+                raise SafetyError("replacement_queue_identity_invalid")
+            if (queued["seriesId"] == c["series_id"] and queued["episodeId"] in c["episode_ids"]
+                    and queued["id"] != c["queue_id"]):
+                raise SafetyError("replacement_already_queued")
         # Queue visibility can lag a successful grab. Refresh history AFTER the
         # search-intent commit too; any affected episode already grabbed makes
         # searching the whole set redundant. This is request evidence only,
         # not proof of original removal, successful download or import.
         for event in history_since(apis[c["instance"]], c["window_start"]):
-            if event["id"] in c["baseline_history_ids"] or event.get("eventType") not in (1, "grabbed"):
+            event_type = metadata_history_type(event)
+            if event["id"] in c["baseline_history_ids"] or event_type != "grabbed":
                 continue
             # Unknown content identity cannot establish that a new grab is
             # unrelated. Reject bools, coercible strings/floats and nonpositive IDs.

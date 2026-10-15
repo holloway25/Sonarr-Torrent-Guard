@@ -557,6 +557,99 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(row["stage"], "retry_requested")
         search.assert_called_once()
 
+    def assert_invalid_final_records_block(self, cases, route, reason):
+        f = self.f
+        original_queue = f.s.routes["/api/v3/queue"]
+        for number, record in enumerate(cases):
+            with self.subTest(case=number):
+                f.journal.close()
+                f.journal = Journal(f.journal.path.parent / ("schema-" + str(number) + ".sqlite3"),
+                                    allow_public_attempt=True)
+                f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                f.s.routes["/api/v3/queue"] = original_queue
+                f.s.routes["/api/v3/history/since"] = [f.grab]
+                original = f.journal.transition
+                def transition(*args, **kwargs):
+                    row = original(*args, **kwargs)
+                    if args[2] == "retry_search_recorded":
+                        entry = dict(record, date=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                        if route == "/api/v3/queue":
+                            f.s.routes[route] = {"totalRecords": 1, "records": [entry]}
+                        else:
+                            f.s.routes[route] = [entry]
+                    return row
+                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete", side_effect=self.removed), patch.object(
+                        f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+                    row = self.execute()
+                self.assertEqual(row["stage"], "retry_search_blocked")
+                self.assertEqual(row["stop_reason"], reason)
+                search.assert_not_called()
+                reopened = Journal(f.journal.path)
+                try:
+                    self.assertEqual(reopened.get(row["key"])["stop_reason"], reason)
+                finally:
+                    reopened.close()
+
+    def test_final_history_missing_malformed_unknown_event_type_blocks_search(self):
+        base = dict(self.f.grab, id=18, downloadId="b" * 40)
+        base.pop("eventType")
+        cases = [base, *[dict(base, eventType=value) for value in
+            (None, True, False, 1.0, "1", 0, "unknown", "Unknown", "futureType", 8, -1, [], {}, "")]]
+        self.assert_invalid_final_records_block(cases, "/api/v3/history/since", "replacement_history_event_invalid")
+
+    def test_known_non_grab_history_types_can_be_ignored(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                types = [2, 3, 4, 5, 6, 7, "seriesFolderImported", "downloadFolderImported",
+                         "downloadFailed", "episodeFileDeleted", "episodeFileRenamed", "downloadIgnored"]
+                f.s.routes["/api/v3/history/since"] = [dict(id=18 + n, eventType=value) for n, value in enumerate(types)]
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        search.assert_called_once()
+
+    def test_final_history_baseline_does_not_waive_event_type_validation(self):
+        malformed = dict(self.f.grab)
+        malformed.pop("eventType")
+        self.assert_invalid_final_records_block([malformed], "/api/v3/history/since", "replacement_history_event_invalid")
+
+    def test_final_queue_missing_or_invalid_identity_blocks_search(self):
+        base = {"id": 18, "seriesId": 2, "episodeId": 3}
+        cases = []
+        for field in ("seriesId", "episodeId"):
+            missing = dict(base)
+            missing.pop(field)
+            cases.append(missing)
+            for value in (None, True, False, "2", "3", 2.0, 3.0, 0, -1, [], {}, ""):
+                cases.append(dict(base, **{field: value}))
+        cases.append(dict(base, id=7, episodeId=None))  # Stale original row must also be validated.
+        self.assert_invalid_final_records_block(cases, "/api/v3/queue", "replacement_queue_identity_invalid")
+
+    def test_final_queue_valid_unrelated_content_can_be_ignored(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
+                    {"id": 18, "seriesId": 99, "episodeId": 3}, {"id": 19, "seriesId": 2, "episodeId": 99}]}
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        search.assert_called_once()
+
     def test_unexpected_blocklisting_requires_review_not_another_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=lambda *a, **kw: self.f.results()), patch(
