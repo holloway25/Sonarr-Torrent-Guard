@@ -427,8 +427,13 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         # searching the whole set redundant. This is request evidence only,
         # not proof of original removal, successful download or import.
         for event in history_since(apis[c["instance"]], c["window_start"]):
-            if (event["id"] in c["baseline_history_ids"] or event.get("eventType") not in (1, "grabbed")
-                    or event.get("seriesId") != c["series_id"] or event.get("episodeId") not in c["episode_ids"]):
+            if event["id"] in c["baseline_history_ids"] or event.get("eventType") not in (1, "grabbed"):
+                continue
+            # Unknown content identity cannot establish that a new grab is
+            # unrelated. Reject bools, coercible strings/floats and nonpositive IDs.
+            if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
+                raise SafetyError("replacement_history_identity_invalid")
+            if event["seriesId"] != c["series_id"] or event["episodeId"] not in c["episode_ids"]:
                 continue
             after = event_after(event, row["dispatched_at"])
             if after is None:

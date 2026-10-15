@@ -68,6 +68,12 @@ For a new relevant grab, missing/non-object `data`, missing/non-string/blank
 `downloadClientName` blocks with `replacement_client_unknown`. Only a valid
 nonblank different client name may be excluded; unknown identity is not a
 different client. Pre-intent grabs remain excluded before that identity check.
+Before classifying any new grab as unrelated, require positive integer
+`seriesId` and `episodeId` (not booleans, strings or floats). Missing or invalid
+content identity blocks with `replacement_history_identity_invalid`; only valid
+unrelated identities may be ignored. Baseline records and non-grab events are
+excluded first. New malformed grabs fail closed even if their missing identity
+prevents determining which content they concern.
 Revalidate the exact execution token, routine permission and live gates
 immediately before transport. No network/disk work follows those final local
 permission checks before the search call.
