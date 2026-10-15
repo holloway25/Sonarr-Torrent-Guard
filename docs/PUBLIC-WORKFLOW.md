@@ -14,6 +14,12 @@ adapters. Enable
 
 ## Proposed normal path
 
+The following failure/blocklist/native-retry path applies to **file-policy
+failures**. Metadata timeouts instead use the separately disabled review policy
+in [metadata retry review](METADATA-RETRY.md): remove without blocklisting, then
+one affected-episode search only after confirmed removal. It is not deployed by
+changing these documents, and never escalates to blocklisting after three attempts.
+
 1. Require successful Sonarr-side connectivity diagnostics for both owners; wait
    until the next ten-minute cycle during maintenance, without downloader-only
    cleanup. Read and validate both queues, explicit downloader binding, Sonarr grab
@@ -45,7 +51,7 @@ adapters. Enable
    changeCategory=false
    ```
 
-7. Let Sonarr's native failed-download handler enqueue the replacement. The guard
+7. For file-policy failures, let Sonarr's native failed-download handler enqueue the replacement. The guard
    must not also issue an episode/season/series search. Native handling searches
    the affected episode(s), or the season when the failed release represents a
    full season. The guard must never initiate a full-series search.

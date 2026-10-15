@@ -13,7 +13,8 @@ approving the reviewed code and configured public workflow. The file and parent
 directory must be owner-private, outside the checkout. It contains exactly:
 
 - `enabled`: true only for an explicitly approved trial.
-- `rule`: `public-sonarr-cleanup-v2` (includes the explicitly agreed metadata timeout).
+- `rule`: `public-sonarr-cleanup-v3` (metadata removal without blocklisting plus
+  separately gated Sonarr episode search; review candidate only).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
 - `issued_at`, `expires_at`: UTC epoch times, no longer than seven days apart.
   Increasing the code limit does not extend an existing grant. Any extension
@@ -45,7 +46,9 @@ Only the current pass's assessed attempts are handled. Replacements are checked
 on a later ten-minute run, never chased in an inner loop. All existing client,
 public-source, age, manifest, retry, version, endpoint, timestamp alignment,
 baseline, expiry and durable-intent guards remain. Public removal/data removal,
-blocklisting and native retries are requested through owning Sonarr only.
+blocklisting and retries are requested through owning Sonarr only. File failures
+use native retry; the separately disabled metadata policy uses the exact episode
+search described in [metadata retry review](METADATA-RETRY.md).
 
 Per-action execution tokens are generated under this delegated permission, bound
 to one assessment and capped by the grant expiry. They are not fabricated human
@@ -72,7 +75,7 @@ addition time remains held. Both manual sender modes use these same rules.
 
 ## Public metadata timeout
 
-The v2 rule may fail a confirmed public Sonarr-owned attempt still in `metaDL` or
+The v3 review rule may remove a confirmed public Sonarr-owned attempt still in `metaDL` or
 `forcedMetaDL` after 30 elapsed minutes since addition. qBittorrent's active-time
 counter is not used: it can stall during metadata retrieval. It requires zero
 progress, unknown total size (-1 or 0), and a successfully retrieved EMPTY file
@@ -86,8 +89,12 @@ older than the limit can qualify immediately, but cannot qualify while stopped.
 An empty list here is not classified as all-files-unselected. The metadata sentinel
 is separately fingerprinted; if metadata arrives before dispatch, the fresh
 check cancels this action (even if the now-visible files independently qualify)
-and a later pass reassesses the files. Owning Sonarr alone removes/blocklists and
-handles native retry. No DHT/PeX/tracker settings are changed. New rule/code/scope
+and a later pass reassesses the files. The review policy requests removal without
+blocklisting, confirms original-incarnation absence, and then asks owning Sonarr
+for one EpisodeSearch. It never escalates metadata timeouts to blocklisting.
+The metadata-retry release gate remains disabled pending review/deployment
+approval; the v3 grant cannot silently reuse a v2 grant. File-policy failures
+still use blocklisting and native retry. No DHT/PeX/tracker settings are changed. New rule/code/scope
 digests require reissuing explicit permission; an existing trial deadline must
 not be extended merely to deploy the fix.
 

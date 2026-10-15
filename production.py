@@ -27,6 +27,8 @@ from maintenance import require_connectivity
 SINGLE_TEST_RELEASE_ENABLED = False
 PUBLIC_ATTEMPT_RELEASE_ENABLED = False
 ROUTINE_RELEASE_ENABLED = False
+# Review candidate only: separately enable after review and deployment approval.
+METADATA_RETRY_RELEASE_ENABLED = False
 SUPPORTED_SONARR_VERSION = "4.0.20.3014"
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
@@ -39,8 +41,10 @@ def digest(value):
 
 
 def validate_context(value):
-    if not isinstance(value, dict) or set(value) not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS,
-            CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | {"routine_grant_digest"}):
+    optional = {"routine_grant_digest", "metadata_retry"}
+    if (not isinstance(value, dict) or not set(value) <= CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | optional
+            or set(value) - optional not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS)
+            or (set(value) & optional and not ATTEMPT_CONTEXT_FIELDS <= set(value))):
         raise SafetyError("invalid_operation_context")
     try:
         if torrent_hash(value["hash"]) != value["hash"]:
@@ -73,6 +77,12 @@ def validate_context(value):
                 raise ValueError()
         if "routine_grant_digest" in value and not valid_digest(value["routine_grant_digest"]):
             raise ValueError()
+        if "metadata_retry" in value:
+            policy = value["metadata_retry"]
+            if ("attempt_fingerprint" not in value or not isinstance(policy, dict)
+                    or set(policy) != {"blocklist", "search"}
+                    or policy["blocklist"] is not False or policy["search"] != "EpisodeSearch"):
+                raise ValueError()
     except (ValueError, TypeError, GuardError):
         raise SafetyError("invalid_operation_context") from None
     return json.loads(json.dumps(value))
@@ -325,14 +335,17 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
         raise SafetyError("delete_redirect_refused")
 
 
-def _send_queue_delete(api, queue_id):
+def _send_queue_delete(api, queue_id, blocklist=True):
     """Narrow transport; called only after the coordinator's gates and durable intent."""
     if (SINGLE_TEST_RELEASE_ENABLED is not True and PUBLIC_ATTEMPT_RELEASE_ENABLED is not True
             and ROUTINE_RELEASE_ENABLED is not True):
         raise SafetyError("live_execution_disabled")
     if not integer(queue_id) or queue_id <= 0:
         raise SafetyError("invalid_queue_id")
-    params = {"removeFromClient": "true", "blocklist": "true", "skipRedownload": "false", "changeCategory": "false"}
+    if not isinstance(blocklist, bool) or (not blocklist and METADATA_RETRY_RELEASE_ENABLED is not True):
+        raise SafetyError("live_execution_disabled")
+    params = {"removeFromClient": "true", "blocklist": "true" if blocklist else "false",
+              "skipRedownload": "false" if blocklist else "true", "changeCategory": "false"}
     url = api.config["url"].rstrip("/") + "/api/v3/queue/" + str(queue_id) + "?" + urllib.parse.urlencode(params)
     request = urllib.request.Request(url, headers={"X-Api-Key": api.config["api_key"]}, method="DELETE")
     opener = urllib.request.build_opener(RejectDeleteRedirect())
@@ -344,6 +357,90 @@ def _send_queue_delete(api, queue_id):
                     raise SafetyError("delete_response_uncertain")
     except Exception:
         raise SafetyError("delete_request_outcome_uncertain") from None
+
+
+def _send_episode_search(api, episode_ids):
+    """One Sonarr command, no redirect/retry; no release or indexer is selected here."""
+    if (METADATA_RETRY_RELEASE_ENABLED is not True or not any(flag is True for flag in (
+            SINGLE_TEST_RELEASE_ENABLED, PUBLIC_ATTEMPT_RELEASE_ENABLED, ROUTINE_RELEASE_ENABLED))):
+        raise SafetyError("live_execution_disabled")
+    if (not isinstance(episode_ids, list) or not episode_ids or len(episode_ids) > 10000
+            or any(not integer(i) or i <= 0 for i in episode_ids) or len(set(episode_ids)) != len(episode_ids)):
+        raise SafetyError("invalid_episode_search")
+    payload = json.dumps({"name": "EpisodeSearch", "episodeIds": episode_ids}).encode()
+    request = urllib.request.Request(api.config["url"].rstrip("/") + "/api/v3/command", data=payload,
+        headers={"X-Api-Key": api.config["api_key"], "Content-Type": "application/json"}, method="POST")
+    deadline = min(api.deadline or float("inf"), time.monotonic() + 15)
+    try:
+        with hard_deadline(deadline):
+            with urllib.request.build_opener(RejectDeleteRedirect()).open(
+                    request, timeout=min(15, deadline - time.monotonic())) as response:
+                raw = response.read(65537)
+                if not 200 <= response.status < 300 or len(raw) > 65536:
+                    raise ValueError()
+                result = json.loads(raw)
+                if (not isinstance(result, dict) or not integer(result.get("id")) or result["id"] <= 0
+                        or result.get("name") != "EpisodeSearch"):
+                    raise ValueError()
+                body = result.get("body")
+                ids = body.get("episodeIds") if isinstance(body, dict) else None
+                if (not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids)
+                        or sorted(ids) != sorted(episode_ids)):
+                    raise ValueError()
+                return result["id"]
+    except Exception:
+        raise SafetyError("episode_search_outcome_uncertain") from None
+
+
+def metadata_policy(report):
+    """Metadata retrieval is not malware evidence; no timeout-based blocklisting."""
+    if report.get("reasons") != ["metadata_timeout"]:
+        return None
+    if METADATA_RETRY_RELEASE_ENABLED is not True:
+        raise SafetyError("metadata_retry_not_released")
+    return {"blocklist": False, "search": "EpisodeSearch"}
+
+
+def finish_metadata_retry(config, qb, apis, journal, row, validate):
+    """Only the original coordinator can request a search; recovery stays read-only."""
+    if row["stage"] != "retry_removed":
+        return row
+    if row["current_observation"].get("replacement_observed") is True:
+        return journal.transition(row["key"], "retry_removed", "retry_superseded")
+    row = journal.transition(row["key"], "retry_removed", "retry_search_recorded")
+    c = row["context"]
+    try:
+        require_connectivity(config, apis[c["instance"]], c["instance"])
+        # The first absence observation is insufficient if another actor has
+        # re-added the hash or queued a replacement while intent was committed.
+        torrents = qb.call("/api/v2/torrents/info")
+        if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
+            raise SafetyError("dispatch_validation_failed")
+        if c["hash"] in [torrent_hash(t.get("hash")) for t in torrents]:
+            raise SafetyError("target_reappeared")
+        queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
+        if any(r.get("seriesId") == c["series_id"] and r.get("episodeId") in c["episode_ids"]
+               and r.get("id") != c["queue_id"] for r in queue):
+            raise SafetyError("replacement_already_queued")
+        status = apis[c["instance"]].call("/api/v3/system/status")
+        if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
+            raise SafetyError("unreviewed_sonarr_version")
+        if (binding_digest(config, c["instance"]) != c["binding_digest"] or
+                endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
+            raise SafetyError("identity_or_manifest_changed")
+        validate()
+        if METADATA_RETRY_RELEASE_ENABLED is not True:
+            raise SafetyError("live_execution_disabled")
+    except Exception as error:
+        reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "dispatch_validation_failed"
+        if reason not in DISPATCH_STOP_REASONS:
+            reason = "dispatch_validation_failed"
+        return journal.transition(row["key"], "retry_search_recorded", "retry_search_blocked", stop_reason=reason)
+    try:
+        command_id = _send_episode_search(apis[c["instance"]], c["episode_ids"])
+        return journal.record_search_accepted(row["key"], command_id)
+    except Exception:
+        return journal.transition(row["key"], "retry_search_recorded", "retry_search_uncertain")
 
 
 def execute_single_test(config, qb, apis, journal, report, approval):
@@ -411,7 +508,7 @@ def check_prior_attempts(journal, report, approval_digest=None, config=None):
             if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
                 raise SafetyError("approval_already_consumed")
             continue
-        if previous["stage"] not in ("cleanup_resolved", "complete"):
+        if previous["stage"] not in ("cleanup_resolved", "complete", "retry_requested", "retry_superseded"):
             if confirmed_successor(previous, report, config):
                 continue
             raise SafetyError("previous_attempt_unresolved")
@@ -428,6 +525,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
     if not _enabled(config, journal, mode, authority):
         raise SafetyError("live_execution_disabled")
     def validate():
+        if not _enabled(config, journal, mode, authority):
+            raise SafetyError("live_execution_disabled")
         validate_approval(approval, report)
         if authority is not None:
             authority.validate(config, report)
@@ -456,6 +555,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
         fresh = recheck_candidate(report, config, qb, apis)
         check_fresh(report, fresh)
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
+        policy = metadata_policy(fresh["assessment"])
+        if policy is not None:
+            context["metadata_retry"] = policy
         if authority is not None:
             context["routine_grant_digest"] = authority.identifier
         row = journal.prepare(report, mode=mode, context=context)
@@ -483,6 +585,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             validate()
             refreshed_context = capture_context(config, apis[report["instance"]],
                 final_snapshot["assessment"], digest(approval["nonce"]))
+            refreshed_policy = metadata_policy(final_snapshot["assessment"])
+            if refreshed_policy is not None:
+                refreshed_context["metadata_retry"] = refreshed_policy
             if authority is not None:
                 refreshed_context["routine_grant_digest"] = authority.identifier
             row = journal.refresh_baselines(row["key"], refreshed_context)
@@ -507,10 +612,14 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 reason = "dispatch_validation_failed"
             return journal.transition(row["key"], "dispatch_recorded", "dispatch_blocked", stop_reason=reason)
         try:
-            _send_queue_delete(apis[report["instance"]], context["queue_id"])
+            if context.get("metadata_retry", {}).get("blocklist") is False:
+                _send_queue_delete(apis[report["instance"]], context["queue_id"], blocklist=False)
+            else:
+                _send_queue_delete(apis[report["instance"]], context["queue_id"])
         except Exception:
             journal.transition(row["key"], "dispatch_recorded", "uncertain")
-        return reconcile(journal, row["key"], OutcomeVerifier(config, qb, apis, context, row["dispatched_at"]).observe)
+        row = reconcile(journal, row["key"], OutcomeVerifier(config, qb, apis, context, row["dispatched_at"]).observe)
+        return finish_metadata_retry(config, qb, apis, journal, row, validate)
 
 
 def main():

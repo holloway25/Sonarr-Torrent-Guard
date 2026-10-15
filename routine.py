@@ -21,6 +21,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
     "approval_already_consumed", "new_attempt_not_confirmed", "attempt_identity_required",
     "routine_authorization_invalid", "routine_code_not_authorized",
     "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
+    "metadata_retry_not_released",
 }
 
 
@@ -40,7 +41,9 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
             actions.append({"instance": report["instance"], "hash": report["hash"],
                 "key": row["key"], "stage": row["stage"], "confirmed": row["confirmed"],
                 "current_observation": row["current_observation"], "stop_reason": row["stop_reason"],
-                "routine_grant_digest": authority.identifier})
+                "routine_grant_digest": authority.identifier,
+                "metadata_retry": row["context"].get("metadata_retry"),
+                "search_command_id": row["search_command_id"]})
         except (GuardError, SafetyError) as error:
             # Only exact known codes may reach logs; exception text can contain secrets.
             reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"

@@ -47,4 +47,11 @@ def preview_failure(report, readiness):
         "params": {"removeFromClient": True, "blocklist": True,
                    "skipRedownload": False, "changeCategory": False},
     }
+    if report.get("reasons") == ["metadata_timeout"]:
+        plan["blockers"].append("metadata_retry_release_disabled")
+        plan["request_preview"]["params"].update(blocklist=False, skipRedownload=True)
+        plan["extra_search"] = True
+        plan["search_preview"] = {"method": "POST", "path": "/api/v3/command",
+                                  "body": {"name": "EpisodeSearch", "episodeIds": report["episode_ids"]},
+                                  "requires": "confirmed_removal_and_fresh_authorization"}
     return plan

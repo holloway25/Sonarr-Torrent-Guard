@@ -96,6 +96,15 @@ records a metadata failure, not a malware finding, and uses the same fresh
 checks and Sonarr-only cleanup. Metadata arriving before dispatch cancels the
 timeout proposal. See the unattended trial document for the full conditions.
 
+Review candidate: metadata timeouts use Sonarr removal **without blocklisting**,
+followed by one explicitly journaled episode search after confirmed removal.
+There is no three-attempt escalation. Sonarr selects the replacement using its
+normal rules; it may choose the same release again. The separate metadata-retry
+release gate is disabled pending review and deployment approval. Existing live
+deployments are not upgraded or reauthorized automatically. File-policy failures
+continue to use immediate blocklisting and native Sonarr retry. See
+[metadata retry review](docs/METADATA-RETRY.md) for request and recovery details.
+
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
 state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
 endpoints, titles, filenames and download paths. Schema version 1 has readiness,
@@ -179,7 +188,8 @@ approval file is created by the app. There is no single-test CLI live switch. It
 worker lock, captures baselines, rechecks immediately before intent/dispatch,
 commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
-It never directly deletes from qBittorrent or submits an extra search.
+It never directly deletes from qBittorrent. File-policy failures never submit an
+extra search; the separately gated metadata retry is the explicit exception.
 
 After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
 version, then revalidates the saved final snapshot's freshness and approval expiry

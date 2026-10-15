@@ -9,7 +9,7 @@ import time
 from guard import endpoint_key, METADATA_TIMEOUT_SECONDS
 from safety import SafetyError, valid_digest
 
-RULE = "public-sonarr-cleanup-v2"
+RULE = "public-sonarr-cleanup-v3"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
 SOURCE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
                 "authorization.py", "routine.py", "workflow.py", "reports.py")
@@ -35,6 +35,7 @@ def scope_digest(config):
     scope["work_limit"] = config.get("max_torrents_per_run", 100)
     scope["page_limit"] = config.get("max_pages", 20)
     scope["metadata_timeout_seconds"] = METADATA_TIMEOUT_SECONDS
+    scope["metadata_retry_strategy"] = "remove-then-episode-search-without-blocklist"
     return digest(scope)
 
 

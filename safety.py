@@ -12,7 +12,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
                          "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
                          "dispatch_clock_unavailable", "routine_authorization_expired_or_scope_changed",
-                         "routine_candidate_not_authorized"}
+                         "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible"}
 
@@ -121,6 +121,7 @@ class Journal:
                 "context": "TEXT NOT NULL DEFAULT '{}'",
                 "dispatched_at": "REAL",
                 "stop_reason": "TEXT",
+                "search_command_id": "INTEGER",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -136,12 +137,12 @@ class Journal:
 
     def get(self, key):
         row = self.db.execute("SELECT mode,stage,evidence,observation,confirmed,current_observation,"
-                              "observation_available,context,dispatched_at,stop_reason FROM actions WHERE key=?", (key,)).fetchone()
+                              "observation_available,context,dispatched_at,stop_reason,search_command_id FROM actions WHERE key=?", (key,)).fetchone()
         return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
                                         "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
                                         "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
                                         "observation_available": bool(row[6]), "context": json.loads(row[7]),
-                                        "dispatched_at": row[8], "stop_reason": row[9]}
+                                        "dispatched_at": row[8], "stop_reason": row[9], "search_command_id": row[10]}
 
     def prepare(self, report, mode="preview", context=None):
         if mode not in ("preview", "simulation") and not (
@@ -183,13 +184,15 @@ class Journal:
     def transition(self, key, expected, stage, observation=None, stop_reason=None):
         allowed = {
             "prepared": {"preview_verified", "cancelled", "dispatch_recorded"},
-            "dispatch_recorded": {"dispatch_blocked", "uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
-            "uncertain": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
-            "replacement_pending": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved"},
+            "dispatch_recorded": {"dispatch_blocked", "uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved", "retry_removed"},
+            "uncertain": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved", "retry_removed"},
+            "replacement_pending": {"uncertain", "replacement_pending", "manual_review", "complete", "cleanup_resolved", "retry_removed"},
+            "retry_removed": {"retry_search_recorded", "retry_superseded"},
+            "retry_search_recorded": {"retry_search_blocked", "retry_search_uncertain"},
         }
         if stage not in allowed.get(expected, set()):
             raise SafetyError("invalid_journal_transition")
-        if stage == "dispatch_blocked":
+        if stage in ("dispatch_blocked", "retry_search_blocked"):
             if stop_reason not in DISPATCH_STOP_REASONS:
                 raise SafetyError("invalid_dispatch_stop_reason")
         elif stage == "cancelled":
@@ -204,11 +207,26 @@ class Journal:
             row = self.get(key)
             if row is None or row["stage"] != expected:
                 raise SafetyError("journal_stage_changed")
+            if stage.startswith("retry_"):
+                if (row["mode"] not in ("single_test", "public_attempt") or
+                        row["context"].get("metadata_retry", {}).get("blocklist") is not False):
+                    raise SafetyError("invalid_retry_transition")
+                if stage in ("retry_search_recorded", "retry_superseded") and not (
+                        (row["mode"] == "single_test" and self.allow_single_test) or
+                        (row["mode"] == "public_attempt" and self.allow_public_attempt)):
+                    raise SafetyError("live_execution_disabled")
             if stage == "dispatch_recorded" and not (row["mode"] == "simulation" or
                     (row["mode"] == "single_test" and self.allow_single_test) or
                     (row["mode"] == "public_attempt" and self.allow_public_attempt)):
                 raise SafetyError("live_execution_disabled")
-            current = {} if observation is None else clean_observation(observation)
+            retained = observation is None and stage.startswith("retry_")
+            current = dict(row["current_observation"]) if retained else (
+                {} if observation is None else clean_observation(observation))
+            if stage == "retry_removed" and (current.get("torrent_absent") is not True
+                    or current.get("blocklisted") is True):
+                raise SafetyError("cleanup_not_verified")
+            if stage == "retry_superseded" and row["current_observation"].get("replacement_observed") is not True:
+                raise SafetyError("replacement_not_observed")
             last_known = dict(row["observation"])
             confirmed = dict(row["confirmed"])
             for field, val in current.items():
@@ -229,8 +247,25 @@ class Journal:
             self.db.execute("UPDATE actions SET stage=?,observation=?,confirmed=?,current_observation=?,"
                             "observation_available=?,updated=?,dispatched_at=?,stop_reason=? WHERE key=? AND stage=?",
                             (stage, json.dumps(last_known), json.dumps(confirmed), json.dumps(current),
-                             observation is not None, time.time(), dispatched_at,
-                             stop_reason if stage in ("dispatch_blocked", "cancelled") else row["stop_reason"], key, expected))
+                             row["observation_available"] if retained else observation is not None, time.time(), dispatched_at,
+                             stop_reason if stage in ("dispatch_blocked", "cancelled", "retry_search_blocked") else row["stop_reason"], key, expected))
+        return self.get(key)
+
+    def record_search_accepted(self, key, command_id):
+        """Persist a validated Sonarr receipt; acceptance is not import/completion."""
+        if isinstance(command_id, bool) or not isinstance(command_id, int) or command_id <= 0:
+            raise SafetyError("invalid_search_command_id")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.get(key)
+            if (row is None or row["stage"] != "retry_search_recorded" or
+                    row["context"].get("metadata_retry", {}).get("blocklist") is not False):
+                raise SafetyError("invalid_retry_transition")
+            if not ((row["mode"] == "single_test" and self.allow_single_test) or
+                    (row["mode"] == "public_attempt" and self.allow_public_attempt)):
+                raise SafetyError("live_execution_disabled")
+            self.db.execute("UPDATE actions SET stage='retry_requested',search_command_id=?,updated=? WHERE key=?",
+                            (command_id, time.time(), key))
         return self.get(key)
 
     def related(self, instance, hash_value):
@@ -293,7 +328,14 @@ def reconcile(journal, key, observe):
         return journal.transition(key, row["stage"], "uncertain")
     known = dict(row["observation"])
     known.update({k: v for k, v in observation.items() if v is not None})
-    if row["mode"] == "public_attempt" and all(
+    if row["context"].get("metadata_retry", {}).get("blocklist") is False:
+        if observation.get("blocklisted") is True:
+            stage = "manual_review"
+        elif observation.get("torrent_absent") is True:
+            stage = "retry_removed"
+        else:
+            stage = "uncertain"
+    elif row["mode"] == "public_attempt" and all(
             observation.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
         stage = "cleanup_resolved"
     elif all(observation.get(k) is True for k in OBSERVATION_FIELDS):
