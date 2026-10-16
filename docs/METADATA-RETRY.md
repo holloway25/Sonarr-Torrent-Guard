@@ -1,9 +1,10 @@
-# Metadata-only removal and retry: review candidate
+# Metadata-only removal and retry
 
-This is a disabled implementation for code review, not authorization to deploy
-or send requests. `METADATA_RETRY_RELEASE_ENABLED` remains false. Review and
-explicit deployment approval, plus a new code/scope-bound v3 routine grant, are
-required. Existing live checkouts/grants are not changed automatically.
+The reviewed policy gate `METADATA_RETRY_RELEASE_ENABLED` is enabled, but does
+not authorize requests on its own. Manual/test sender gates remain disabled;
+routine execution requires explicit live mode and a valid code/scope-bound v3
+grant. Deployment approval and the new grant are required; existing live
+checkouts/grants are not changed automatically. Ordinary commands stay dry-run.
 
 ## Policy
 
@@ -125,9 +126,9 @@ reclassified or unblocked. Journal capacity and no-purge rules remain in force.
 Routine action logs include policy, command receipt, grant reference and safe
 stop reason, without raw exception strings or deployment secrets.
 
-Before activation, review mocks for both transports, changed metadata, expiry
+Verification covers mocks for both transports, changed metadata, expiry
 after commits, outage/version drift, partial results, receipt validation and
-restart/no-replay behavior. This branch has not established live integration.
+restart/no-replay behavior. Unit tests do not establish live integration.
 Deploy only after user approval, stopping the worker first and preserving the
 already approved trial deadline when issuing the new grant.
 

@@ -27,8 +27,8 @@ from maintenance import require_connectivity
 SINGLE_TEST_RELEASE_ENABLED = False
 PUBLIC_ATTEMPT_RELEASE_ENABLED = False
 ROUTINE_RELEASE_ENABLED = False
-# Review candidate only: separately enable after review and deployment approval.
-METADATA_RETRY_RELEASE_ENABLED = False
+# Reviewed metadata policy; sender gates and explicit grants still required.
+METADATA_RETRY_RELEASE_ENABLED = True
 SUPPORTED_SONARR_VERSION = "4.0.20.3014"
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",

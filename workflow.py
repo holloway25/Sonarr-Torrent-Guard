@@ -48,7 +48,7 @@ def preview_failure(report, readiness):
                    "skipRedownload": False, "changeCategory": False},
     }
     if report.get("reasons") == ["metadata_timeout"]:
-        plan["blockers"].append("metadata_retry_release_disabled")
+        plan["blockers"].append("explicit_metadata_retry_authorization_required")
         plan["request_preview"]["params"].update(blocklist=False, skipRedownload=True)
         plan["extra_search"] = True
         plan["search_preview"] = {"method": "POST", "path": "/api/v3/command",

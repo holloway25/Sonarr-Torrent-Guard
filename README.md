@@ -5,7 +5,8 @@ proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
 are currently enabled by default. An explicitly granted, expiring routine CLI is
 available for review. A metadata-only removal and additional episode search is
-implemented behind a separate disabled release gate. No resume, extraction,
+implemented with a reviewed policy gate; actual sending still requires separate
+authorization and sender gates. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Setup
@@ -97,14 +98,14 @@ records a metadata failure, not a malware finding, and uses the same fresh
 checks and Sonarr-only cleanup. Metadata arriving before dispatch cancels the
 timeout proposal. See the unattended trial document for the full conditions.
 
-Review candidate: metadata timeouts use Sonarr removal **without blocklisting**,
+Metadata timeouts use Sonarr removal **without blocklisting**,
 followed by one explicitly journaled episode search after confirmed removal.
 There is no three-attempt escalation. Sonarr selects the replacement using its
 normal rules; it may choose the same release again. The separate metadata-retry
-release gate is disabled pending review and deployment approval. Existing live
+policy gate is enabled, but sender gates and an explicit valid grant are still required. Existing live
 deployments are not upgraded or reauthorized automatically. File-policy failures
 continue to use immediate blocklisting and native Sonarr retry. See
-[metadata retry review](docs/METADATA-RETRY.md) for request and recovery details.
+[metadata retry](docs/METADATA-RETRY.md) for request and recovery details.
 
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
 state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,

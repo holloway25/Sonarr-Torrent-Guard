@@ -15,8 +15,8 @@ adapters. Enable
 ## Proposed normal path
 
 The following failure/blocklist/native-retry path applies to **file-policy
-failures**. Metadata timeouts instead use the separately disabled review policy
-in [metadata retry review](METADATA-RETRY.md): remove without blocklisting, then
+failures**. Metadata timeouts instead use the separately authorized policy
+in [metadata retry](METADATA-RETRY.md): remove without blocklisting, then
 one affected-episode search only after confirmed removal. It is not deployed by
 changing these documents, and never escalates to blocklisting after three attempts.
 
@@ -96,7 +96,7 @@ Multiple queue rows yield one removal preview. File-policy failures plan no
 additional search: owning Sonarr's native failure handler handles retry. The
 separately gated metadata-timeout exception previews removal without blocklisting
 and an explicit affected-episode search only after confirmed removal and final
-safety checks; see [metadata retry review](METADATA-RETRY.md). Both previews are
+safety checks; see [metadata retry](METADATA-RETRY.md). Both previews are
 descriptions only, never dispatch permission.
 
 `safety.py` compares ownership and manifest fingerprints from fresh assessment,

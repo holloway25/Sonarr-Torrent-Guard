@@ -285,7 +285,7 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertIs(plan["request_preview"]["params"]["blocklist"], False)
         self.assertIs(plan["request_preview"]["params"]["skipRedownload"], True)
         self.assertEqual(plan["search_preview"]["body"], {"name": "EpisodeSearch", "episodeIds": [3]})
-        self.assertIn("metadata_retry_release_disabled", plan["blockers"])
+        self.assertIn("explicit_metadata_retry_authorization_required", plan["blockers"])
 
     def test_crash_after_removal_does_not_cause_recovery_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
