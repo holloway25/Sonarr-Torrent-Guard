@@ -650,6 +650,24 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(row["stage"], "retry_requested")
         search.assert_called_once()
 
+    def test_final_queue_unrelated_series_with_unmapped_episode_does_not_block_search(self):
+        f = self.f
+        original = f.journal.transition
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
+                    {"id": 18, "seriesId": 99, "episodeId": None}, {"id": 19, "seriesId": 98}]}
+            return row
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        self.assertEqual(row["search_command_id"], 41)
+        search.assert_called_once_with(f.s, [3])
+
     def test_unexpected_blocklisting_requires_review_not_another_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=lambda *a, **kw: self.f.results()), patch(

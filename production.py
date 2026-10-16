@@ -434,10 +434,15 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
             raise SafetyError("target_reappeared")
         queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
         for queued in queue:
-            if any(not integer(queued.get(field)) or queued[field] <= 0 for field in ("seriesId", "episodeId")):
+            if not integer(queued.get("seriesId")) or queued["seriesId"] <= 0:
                 raise SafetyError("replacement_queue_identity_invalid")
-            if (queued["seriesId"] == c["series_id"] and queued["episodeId"] in c["episode_ids"]
-                    and queued["id"] != c["queue_id"]):
+            # Sonarr permits unmapped episode IDs. A known different series is
+            # already unrelated; only potentially affected rows need episode IDs.
+            if queued["seriesId"] != c["series_id"]:
+                continue
+            if not integer(queued.get("episodeId")) or queued["episodeId"] <= 0:
+                raise SafetyError("replacement_queue_identity_invalid")
+            if queued["episodeId"] in c["episode_ids"] and queued["id"] != c["queue_id"]:
                 raise SafetyError("replacement_already_queued")
         # Queue visibility can lag a successful grab. Refresh history AFTER the
         # search-intent commit too; any affected episode already grabbed makes

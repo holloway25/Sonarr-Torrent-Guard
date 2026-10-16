@@ -79,9 +79,12 @@ numeric types1–7 or their exact API names; missing, malformed, unsupported and
 `Unknown` (0/`unknown`) values block with `replacement_history_event_invalid`.
 Only known non-grab types can be ignored as non-grabs. This also validates event
 types of baseline rows; a baseline is not a waiver for malformed schema.
-Final queue rows likewise require positive integer series/episode IDs before
-excluding original or unrelated rows. Unknown content identity blocks with
-`replacement_queue_identity_invalid`; valid unrelated rows can still be ignored.
+Final queue rows first require a positive integer series ID. A positively
+identified different series is excluded without requiring its episode ID:
+Sonarr allows unmapped queue items with null episode IDs. For the target series,
+require a positive integer episode ID before excluding original or unrelated
+episode rows. Missing/invalid series identity or an unknown episode within the
+target series blocks with `replacement_queue_identity_invalid`.
 Revalidate the exact execution token, routine permission and live gates
 immediately before transport. No network/disk work follows those final local
 permission checks before the search call.
