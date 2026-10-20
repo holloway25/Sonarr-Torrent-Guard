@@ -103,3 +103,10 @@ unresolved and metadata receipt preservation,30-day evidence/age requirements,
 rollback between copy/delete, bounded batches/capacity, archive-key conflicts,
 bounded history lookup, read-only legacy preview, disabled application and worker
 lock exclusion. All tests use isolated fixture databases, not production mutation.
+
+Batch rollback coverage also fails the SECOND deletion in a two-row batch and
+checks both complete active rows and an empty archive after reopening. This must
+reject per-row commits, not just commits between copy and delete. Legacy-preview
+coverage invokes the actual CLI entry point and a real CLI subprocess against a
+database without an archive table, comparing database bytes AND SQLite schema
+before/after; testing the read-only helper alone is not sufficient.

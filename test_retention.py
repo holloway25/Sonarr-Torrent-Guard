@@ -3,6 +3,8 @@ import copy
 import io
 import json
 import sqlite3
+import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -164,6 +166,31 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM actions_archive").fetchone()[0], 0)
         self.assertEqual(self.journal.get(row["key"]), row)
 
+    def test_second_row_delete_failure_rolls_back_entire_batch(self):
+        first = self.make_row(1)[2]
+        second = self.make_row(2)[2]
+        # Make transaction order deterministic: a first-row commit must be
+        # exposed by failure on the second row, not a failure before any work.
+        self.journal.db.execute("UPDATE actions SET updated=? WHERE key=?", (time.time() + 1, first["key"]))
+        self.journal.db.execute("UPDATE actions SET updated=? WHERE key=?", (time.time() + 2, second["key"]))
+        self.journal.db.execute("CREATE TRIGGER fail_second_delete BEFORE DELETE ON actions "
+                                "WHEN OLD.key='" + second["key"] + "' "
+                                "BEGIN SELECT RAISE(ABORT,'simulated second-row failure'); END")
+        self.journal.db.commit()
+        before = self.journal.db.execute("SELECT * FROM actions ORDER BY key").fetchall()
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.journal.archive_resolved(now=self.later, preview=False)
+        self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM actions_archive").fetchone()[0], 0)
+        self.assertEqual(self.journal.db.execute("SELECT * FROM actions ORDER BY key").fetchall(), before)
+        self.assertEqual(self.journal.get(first["key"]), first)
+        self.assertEqual(self.journal.get(second["key"]), second)
+        reopened = Journal(self.journal.path, read_only=True)
+        try:
+            self.assertEqual(reopened.db.execute("SELECT * FROM actions ORDER BY key").fetchall(), before)
+            self.assertEqual(reopened.db.execute("SELECT COUNT(*) FROM actions_archive").fetchone()[0], 0)
+        finally:
+            reopened.close()
+
     def test_archive_capacity_is_fail_closed_and_batch_is_bounded(self):
         self.make_row(1)
         self.make_row(2)
@@ -227,6 +254,27 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(retention.main(), 0)
         self.assertEqual(json.loads(output.getvalue())["mode"], "preview")
         self.assertEqual(self.journal.path.read_bytes(), before)
+
+    def test_actual_cli_preview_preserves_legacy_database_bytes_and_schema(self):
+        self.make_row()
+        self.journal.db.execute("DROP TABLE actions_archive")
+        self.journal.db.commit()
+        before_bytes = self.journal.path.read_bytes()
+        before_schema = self.journal.db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall()
+        output = io.StringIO()
+        # Exercise the actual CLI entry point, not Journal(..., read_only=True)
+        # directly; this must catch a writable connection chosen by the CLI.
+        with patch("sys.argv", ["retention.py", "--journal", str(self.journal.path)]), contextlib.redirect_stdout(output):
+            self.assertEqual(retention.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())["mode"], "preview")
+        self.assertEqual(self.journal.path.read_bytes(), before_bytes)
+        self.assertEqual(self.journal.db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall(), before_schema)
+        # Also exercise argument parsing and __main__ in a real process.
+        process = subprocess.run([sys.executable, retention.__file__, "--journal", str(self.journal.path)],
+                                 capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(process.stdout)["mode"], "preview")
+        self.assertEqual(self.journal.path.read_bytes(), before_bytes)
+        self.assertEqual(self.journal.db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY name").fetchall(), before_schema)
 
     def test_cli_apply_respects_worker_lock(self):
         import fcntl
