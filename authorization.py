@@ -12,7 +12,7 @@ from safety import SafetyError, valid_digest
 RULE = "public-sonarr-cleanup-v3"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
 SOURCE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
-                "authorization.py", "routine.py", "workflow.py", "reports.py")
+                "authorization.py", "routine.py", "workflow.py", "reports.py", "container_worker.py")
 
 
 def digest(value):

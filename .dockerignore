@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!.dockerignore
+!guard.py
+!production.py
+!safety.py
+!maintenance.py
+!public.py
+!authorization.py
+!routine.py
+!workflow.py
+!reports.py
+!retention.py
+!container_worker.py

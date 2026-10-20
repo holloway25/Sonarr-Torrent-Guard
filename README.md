@@ -9,6 +9,15 @@ implemented with a reviewed policy gate; actual sending still requires separate
 authorization and sender gates. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
+## Docker / Unraid review candidate
+
+A non-root Docker image and GitHub build/publish workflow are implemented.
+Runtime environment variables supply connections and credentials; nothing private
+is baked into the image. Persistent appdata keeps journal/config/logs across
+updates. The container defaults to dry-run; its live gate remains disabled and
+publishing never deploys it. See [container setup](docs/CONTAINER.md) before any
+Unraid staging or migration. Retention application remains separately disabled.
+
 ## Setup
 
 Linux and Python 3.9+ are required. Configure the operating system's local
@@ -123,7 +132,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention
+python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention test_container
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```

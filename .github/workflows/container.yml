@@ -1,0 +1,49 @@
+name: Container
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish tested commit image to GHCR (does not deploy)
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test source and privacy before building
+        run: |
+          python3 -m unittest test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention test_container
+          python3 tools/privacy_check.py --all
+      - name: Choose commit-specific image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Build image
+        run: docker build --pull --tag "$IMAGE" .
+      - name: Offline non-root read-only smoke check
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /config:uid=1000,gid=1000,mode=0700 --tmpfs /tmp --env-file deploy/container.env.example "$IMAGE" --check-config
+          docker run --rm --network none --read-only --entrypoint python3 "$IMAGE" -c 'import os; from zoneinfo import ZoneInfo; assert os.getuid() != 0; assert ZoneInfo("Australia/Melbourne"); from authorization import code_digest; assert len(code_digest()) == 64'
+          if docker run --rm --network none --read-only --tmpfs /config:uid=1000,gid=1000,mode=0700 --env-file deploy/container.env.example --env STGUARD_MODE=live "$IMAGE" --check-config; then
+            echo "Live container mode must remain disabled pending review"
+            exit 1
+          fi
+      - name: Publish only on explicit manual request
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker inspect --format='Published {{index .RepoDigests 0}}' "$IMAGE"
+          docker logout ghcr.io
