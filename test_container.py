@@ -336,6 +336,51 @@ class ContainerTests(unittest.TestCase):
         from authorization import SOURCE_FILES
         self.assertIn("container_worker.py", SOURCE_FILES)
 
+    def test_unraid_template_defaults_match_supported_environment(self):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(Path(__file__).parent / "deploy/unraid.xml").getroot()
+        entries = [item for item in root.findall("Config") if item.get("Type") == "Variable"]
+        env = {item.get("Target"): item.get("Default") for item in entries}
+        self.assertEqual(len(entries), len(env))
+        self.assertEqual(set(env), set(example_environment()))
+        self.assertEqual(env["STGUARD_MODE"], "dry-run")
+        self.assertEqual(env["TZ"], "Australia/Melbourne")
+        self.assertTrue(worker.runtime_config(env)["dry_run"])
+        for item in entries:
+            if any(x in item.get("Target") for x in ("API_KEY", "PASSWORD", "USERNAME")):
+                self.assertEqual(item.get("Mask"), "true")
+                self.assertEqual(item.get("Default"), "REPLACE_ME")
+
+    def test_unraid_template_limits_mounts_privilege_and_shutdown(self):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(Path(__file__).parent / "deploy/unraid.xml").getroot()
+        self.assertEqual(root.findtext("Network"), "bridge")
+        self.assertEqual(root.findtext("Privileged"), "false")
+        self.assertFalse(root.findtext("WebUI"))
+        paths = [item for item in root.findall("Config") if item.get("Type") == "Path"]
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].get("Target"), "/config")
+        self.assertTrue(paths[0].get("Default").endswith("/sonarr-torrent-guard-staging"))
+        self.assertFalse(any(item.get("Type") == "Port" for item in root.findall("Config")))
+        extra = root.findtext("ExtraParams").split()
+        for flag in ("--user=1000:1000", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                     "--stop-timeout=10", "--log-opt=max-size=10m", "--log-opt=max-file=3"):
+            self.assertIn(flag, extra)
+        self.assertNotIn("--privileged", extra)
+        self.assertRegex(root.findtext("Repository"), r"@sha256:[a-f0-9]{64}$")
+
+    def test_unraid_template_references_approved_transparent_icon(self):
+        import xml.etree.ElementTree as ET
+        root = Path(__file__).parent
+        template = ET.parse(root / "deploy/unraid.xml").getroot()
+        icon = "assets/sonarr-torrent-guard-darker.png"
+        self.assertTrue(template.findtext("Icon").endswith("/" + icon))
+        data = (root / icon).read_bytes()
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(data[12:16], b"IHDR")
+        self.assertEqual(data[25], 6)  # RGBA, preserving transparency.
+        self.assertEqual(data[16:20], data[20:24])  # Square icon.
+
 
 if __name__ == "__main__":
     unittest.main()

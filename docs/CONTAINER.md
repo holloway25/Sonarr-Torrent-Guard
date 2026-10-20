@@ -91,8 +91,9 @@ not210seconds. The scheduler exits without starting a final heartbeat/appdata
 fsync or another cycle. Repeated signals do not reset the shutdown waits.
 
 Configure Docker/Unraid's container stop timeout to at least10seconds, leaving
-margin for process exit before the host escalates. Verify actual array-stop
-behavior during dry-run staging before enabling live mode. This is a bound on
+margin for process exit before the host escalates. Test stopping/restarting the
+container while idle and during an active check in dry-run staging; no array
+stop is required. This is a bound on
 application waiting, not a guarantee against an uninterruptible kernel/storage
 stall or other containers delaying array shutdown. Do not change Unraid's array
 unmount/parity safety settings to compensate for an application shutdown fault.
@@ -128,10 +129,49 @@ Before cutover:
    worker disabled. Rollback must stop the new worker and preserve newer evidence
    before considering old source; never use an old journal to bypass holds.
 
-Publishing the image performs none of those live steps and does not automatically
-create an Unraid template. No media volume or download-side deletion is added.
+Publishing the image performs none of those live steps. No media volume or
+download-side deletion is added.
+
+## Prepared Unraid template
+
+`deploy/unraid.xml` is a version2 staging template based on Unraid's official
+starter. It pins the published reviewed runtime image by digest, references the
+approved darker PNG, uses bridge networking with no published ports and sets
+read-only root, non-root UID/GID1000:1000, dropped capabilities, no-new-privileges,
+a10second stop timeout and bounded Docker logs. API/password/username fields are
+masked in the form but remain visible to host administrators. The form is not a
+secret vault; never share/export its populated XML or command output.
+
+The committed template intentionally uses `REPLACE_ME` for registry/project/icon
+ownership and credentials; no deployment identity is stored in source. Prepare
+a private installation copy outside the repository using the actual registry
+namespace and approved icon URL. Confirm registry pull access on the target;
+publishing an image does not make a private GHCR package anonymously pullable.
+Do not change package visibility or put a registry token in the template.
+
+Before applying the template on Unraid:
+
+1. Choose a NEW dedicated staging directory at the appdata path shown in the
+   template. Inspect it first; do not overwrite existing appdata. Create it owned
+   by1000:1000 with0700 permissions (or explicitly choose a matching non-root
+   `--user`). Automatic root-owned creation will fail the worker's ownership check.
+2. Install the private XML as a user template using the host's supported template
+   management, then select it in Docker/Add Container. Leave auto-start off until
+   staging passes. There is no web UI link or port to configure yet.
+3. Fill connection fields privately, including exact approved indexer names and
+   pinned client IDs; keep mode `dry-run`. `[]` public indexers approves no sources.
+   Do not substitute example defaults for actual ownership/source verification.
+4. Start it and inspect connectivity, proposals and sanitized wait reasons.
+   It must send no removal/blocklist/search requests. Stop/restart it while idle
+   and active, check prompt exit rather than forced kill, and confirm config and
+   journal/cursor evidence survive. Do not disturb unrelated containers or array.
+5. Keep staging separate from the current worker's appdata. Live cutover still
+   requires the stopped-worker consistent backup/full state transfer and explicit
+   new authorization described above; never run two live workers.
 
 Official references:
+
+- [Unraid template starter](https://github.com/unraid/unraid-community-apps-starter/blob/main/templates/example-app.xml)
 
 - [GitHub image publishing](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
 - [Docker build practices](https://docs.docker.com/build/building/best-practices/)
