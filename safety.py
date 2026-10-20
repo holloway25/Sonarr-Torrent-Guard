@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -18,6 +19,11 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "replacement_queue_identity_invalid"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible"}
+ARCHIVE_ROW_LIMIT = 10000
+RELATED_RECORD_LIMIT = 1000
+ARCHIVE_MINIMUM_AGE = 30 * 24 * 60 * 60
+ACTION_FIELDS = ("mode", "stage", "evidence", "observation", "confirmed", "current_observation",
+                 "observation_available", "context", "dispatched_at", "stop_reason", "search_command_id")
 
 
 def clean_observation(observation):
@@ -83,10 +89,21 @@ class Journal:
     Rows are bounded without deleting unresolved evidence. Transactions use FULL
     synchronization. Preview and simulation rows cannot authorize production work.
     """
-    def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False):
+    def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False,
+                 allow_archive=False, read_only=False):
         self.path = Path(path)
+        self.read_only = read_only is True
         if self.path.is_symlink() or self.path.parent.stat().st_mode & 0o077:
             raise SafetyError("journal_requires_private_directory")
+        if self.read_only:
+            if (self.path.stat().st_mode & 0o077 or allow_single_test or allow_public_attempt or allow_archive):
+                raise SafetyError("journal_requires_private_directory")
+            self.limit = limit
+            self.allow_single_test = self.allow_public_attempt = self.allow_archive = False
+            self.db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            self.has_archive = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                               "AND name='actions_archive'").fetchone() is not None
+            return
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.fchmod(fd, 0o600)
         os.close(fd)
@@ -99,9 +116,11 @@ class Journal:
         self.limit = limit
         self.allow_single_test = allow_single_test is True
         self.allow_public_attempt = allow_public_attempt is True
+        self.allow_archive = allow_archive is True
         self.db = sqlite3.connect(self.path, timeout=5)
         try:
             self._initialize()
+            self.has_archive = True
         except BaseException:
             self.db.close()
             raise
@@ -134,13 +153,29 @@ class Journal:
                     old = clean_observation(json.loads(raw))
                     confirmed = {k: True for k, v in old.items() if v is True}
                     self.db.execute("UPDATE actions SET confirmed=? WHERE key=?", (json.dumps(confirmed), key))
+            self.db.execute("CREATE TABLE IF NOT EXISTS actions_archive ("
+                            "key TEXT PRIMARY KEY, instance TEXT NOT NULL, hash TEXT NOT NULL, "
+                            "mode TEXT NOT NULL, payload TEXT NOT NULL, archived_at REAL NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_owner_hash ON actions_archive(instance,hash)")
 
     def close(self):
         self.db.close()
 
     def get(self, key):
-        row = self.db.execute("SELECT mode,stage,evidence,observation,confirmed,current_observation,"
-                              "observation_available,context,dispatched_at,stop_reason,search_command_id FROM actions WHERE key=?", (key,)).fetchone()
+        row = self.db.execute("SELECT " + ",".join(ACTION_FIELDS) + " FROM actions WHERE key=?", (key,)).fetchone()
+        cold = self.db.execute("SELECT instance,hash,mode,payload FROM actions_archive WHERE key=?", (key,)).fetchone() if self.has_archive else None
+        if row is not None and cold is not None:
+            raise SafetyError("journal_duplicate_archive_key")
+        if cold is not None:
+            raw = json.loads(cold[3])
+            if (not isinstance(raw, dict) or raw.get("key") != key or
+                    any(field not in raw for field in ACTION_FIELDS) or
+                    raw.get("mode") != cold[2] or raw.get("stage") not in ("cleanup_resolved", "complete")):
+                raise SafetyError("invalid_archive_evidence")
+            identity = json.loads(raw["evidence"])
+            if identity.get("instance") != cold[0] or identity.get("hash") != cold[1]:
+                raise SafetyError("invalid_archive_evidence")
+            row = tuple(raw[field] for field in ACTION_FIELDS)
         return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
                                         "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
                                         "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
@@ -272,13 +307,83 @@ class Journal:
         return self.get(key)
 
     def related(self, instance, hash_value):
-        """Bounded journal scan; keep legacy production records in safety scope."""
+        """Bounded active scan plus indexed archive lookup; never forget old holds."""
         result = []
         for (key,) in self.db.execute("SELECT key FROM actions WHERE mode IN ('single_test','public_attempt')").fetchall():
             row = self.get(key)
             if row["evidence"]["instance"] == instance and row["evidence"]["hash"] == hash_value:
                 result.append(row)
+        keys = self.db.execute("SELECT key FROM actions_archive WHERE instance=? AND hash=? "
+                               "AND mode IN ('single_test','public_attempt') LIMIT ?",
+                               (instance, hash_value, RELATED_RECORD_LIMIT + 1)).fetchall() if self.has_archive else []
+        if len(result) + len(keys) > RELATED_RECORD_LIMIT:
+            raise SafetyError("journal_history_limit_reached")
+        result.extend(self.get(key) for (key,) in keys)
         return result
+
+    def archive_resolved(self, now=None, batch_limit=100, preview=True):
+        """Move old resolved production records atomically, preserving ALL columns.
+
+        Not a purge: get/related continue to consult the indexed archive. No
+        uncertain, preview, cancelled or metadata-retry receipt records qualify.
+        Explicit housekeeping permission is separate from any sender grant.
+        """
+        now = time.time() if now is None else now
+        if (isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now)
+                or now <= 0 or isinstance(batch_limit, bool) or not isinstance(batch_limit, int)
+                or not 1 <= batch_limit <= 100 or not isinstance(preview, bool)):
+            raise SafetyError("invalid_archive_request")
+        if not preview and not self.allow_archive:
+            raise SafetyError("journal_archive_not_authorized")
+        with self.db:
+            self.db.execute("BEGIN" if self.read_only else "BEGIN IMMEDIATE")
+            columns = [row[1] for row in self.db.execute("PRAGMA table_info(actions)")]
+            cursor = self.db.execute("SELECT * FROM actions WHERE mode IN ('single_test','public_attempt') "
+                                     "AND stage IN ('cleanup_resolved','complete') AND updated<=? "
+                                     "ORDER BY updated,key LIMIT ?", (now - ARCHIVE_MINIMUM_AGE, self.limit + 1))
+            raw_rows = [dict(zip(columns, values)) for values in cursor.fetchall()]
+            if len(raw_rows) > self.limit:
+                raise SafetyError("journal_capacity_reached")
+            candidates = []
+            for raw in raw_rows:
+                row = self.get(raw["key"])
+                # Validate production identity and leave any inconsistent result hot.
+                from production import validate_context
+                context = validate_context(row["context"])
+                identity = evidence(row["evidence"])
+                if (any(context.get(k) != identity.get(k) for k in ("instance", "hash")) or
+                        ("attempt_fingerprint" in identity and context.get("attempt_fingerprint") != identity["attempt_fingerprint"])):
+                    raise SafetyError("invalid_archive_evidence")
+                dispatched = row["dispatched_at"]
+                if (isinstance(dispatched, bool) or not isinstance(dispatched, (int, float)) or
+                        not math.isfinite(dispatched) or not 0 < dispatched <= raw["updated"] or
+                        not row["observation_available"] or "metadata_retry" in context):
+                    continue
+                required = OBSERVATION_FIELDS if row["stage"] == "complete" else ("torrent_absent", "failed", "blocklisted")
+                if (row["stage"] == "cleanup_resolved" and row["mode"] != "public_attempt") or not all(
+                        row["confirmed"].get(field) is True and row["current_observation"].get(field) is True
+                        for field in required):
+                    continue
+                candidates.append(raw)
+                if len(candidates) >= batch_limit:
+                    break
+            cold_count = self.db.execute("SELECT COUNT(*) FROM actions_archive").fetchone()[0] if self.has_archive else 0
+            if cold_count + len(candidates) > ARCHIVE_ROW_LIMIT:
+                raise SafetyError("journal_archive_capacity_reached")
+            if not preview:
+                for raw in candidates:
+                    identity = json.loads(raw["evidence"])
+                    self.db.execute("INSERT INTO actions_archive(key,instance,hash,mode,payload,archived_at) "
+                                    "VALUES(?,?,?,?,?,?)", (raw["key"], identity["instance"], identity["hash"],
+                                    raw["mode"], json.dumps(raw, sort_keys=True), now))
+                    if self.db.execute("DELETE FROM actions WHERE key=? AND updated=?",
+                                       (raw["key"], raw["updated"])).rowcount != 1:
+                        raise SafetyError("journal_stage_changed")
+            return {"mode": "preview" if preview else "archived", "eligible": len(candidates),
+                    "archived": 0 if preview else len(candidates),
+                    "active_rows": self.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0],
+                    "archive_rows": cold_count if preview else cold_count + len(candidates),
+                    "minimum_age_days": 30, "keys": [raw["key"] for raw in candidates]}
 
     def refresh_baselines(self, key, refreshed):
         """Only the armed, not-yet-sent coordinator may extend baseline IDs.

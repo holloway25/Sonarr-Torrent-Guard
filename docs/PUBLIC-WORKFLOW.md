@@ -286,7 +286,10 @@ Timer templates under `deploy/` run only the dry-run CLI at ten-minute intervals
 after completion; they are not installed/enabled. No long sleeps or catch-up
 bursts are used. The two-minute torrent age minimum remains. No automatic record
 purge is implemented: the private journal refuses new records at its bound rather
-than discarding unresolved evidence. Long-term retention needs separate review.
+than discarding unresolved evidence. Long-term retention needs separate review;
+the disabled [housekeeping candidate](JOURNAL-RETENTION.md) preserves resolved
+records in an indexed archive still consulted by safety checks. No worker invokes
+it automatically, and it never purges or exports unresolved evidence.
 
 The dispatch-intent commit is followed by a fresh version request. Only after that
 request completes are the final candidate snapshot's age and approval expiration

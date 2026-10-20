@@ -121,7 +121,11 @@ text is never logged. Cancellation is definitely unsent and has no dispatch
 timestamp. Existing legacy cancellations without a reason are left unchanged.
 
 Trial expiry stops new actions automatically, though an installed timer may keep
-recording waiting runs until disabled. Journal capacity remains 1000 rows and
+recording waiting runs until disabled. Active journal capacity remains 1000 rows and
 fails closed when full; no old or uncertain action is purged. This bounds the
 trial safely without introducing an unreviewed retention policy. Indefinite
 operation still needs reviewed archive/retention management and renewed authority.
+An explicit [retention candidate](JOURNAL-RETENTION.md) is now implemented with
+application disabled. It preserves archived records in duplicate/ownership safety
+checks and never archives unresolved records. It neither extends a trial nor
+enables housekeeping or live sending automatically.

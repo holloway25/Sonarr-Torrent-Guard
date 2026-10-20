@@ -123,7 +123,7 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata
+python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
@@ -154,9 +154,12 @@ The journal requires an owner-private directory and mode-600 database/sidecars.
 SQLite transactions use FULL synchronization. Evidence is limited to instance,
 hash and ownership/manifest fingerprints; no titles, paths, endpoints or secrets.
 Preview and simulation records are separate and cannot enable live mode. It
-retains at most 1000 rows and refuses new ones at capacity; it never silently
+retains at most 1000 active rows and refuses new ones at capacity; it never silently
 deletes unresolved evidence. Changed stored evidence requires review. Do not
 delete the journal to force a retry. Backups and exports must also stay outside Git.
+The [journal-retention candidate](docs/JOURNAL-RETENTION.md) adds a bounded indexed
+archive that remains visible to safety checks; archive application is disabled
+and is not automatically invoked by workers or constructors.
 
 ## Production preflight and disabled single-test sender
 
@@ -274,8 +277,10 @@ For these new attempt records, `cleanup_resolved` requires current positive
 original-incarnation absence, failure and blocklisting. It does not claim file
 deletion, a safe replacement or import; those remain separately reported. Legacy
 single-test records retain their original stages and one-action-per-hash rule.
-The 1000-row bound remains fail-closed; no records are automatically purged or
-uncertain evidence discarded. A safe retention/archive policy is still needed
+The 1000-active-row bound remains fail-closed; no records are automatically purged or
+uncertain evidence discarded. An explicit, disabled housekeeping candidate can
+move old confirmed records into a safety-aware indexed archive; see
+[journal retention](docs/JOURNAL-RETENTION.md). Activation requires review. Ongoing permission is still needed
 before unattended long-term activation.
 
 `deploy/` contains optional user-service and ten-minute timer templates for this

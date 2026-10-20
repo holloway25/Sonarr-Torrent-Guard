@@ -22,6 +22,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
     "routine_authorization_invalid", "routine_code_not_authorized",
     "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
     "metadata_retry_not_released",
+    "journal_history_limit_reached", "journal_archive_capacity_reached", "invalid_archive_evidence",
 }
 
 
