@@ -38,6 +38,35 @@ jobs:
             echo "Live container mode must remain disabled pending review"
             exit 1
           fi
+      - name: Offline active-cycle shutdown smoke check
+        run: |
+          docker run --detach --name guard-shutdown --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint python3 "$IMAGE" -c '
+          import signal, subprocess, sys
+          from pathlib import Path
+          import container_worker as worker
+          child = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print(\"ready\", flush=True); time.sleep(60)"], stdout=subprocess.PIPE, text=True)
+          assert child.stdout.readline().strip() == "ready"
+          original_wait = child.wait
+          def active_wait(*args, **kwargs):
+              print("waiting", flush=True)
+              return original_wait(*args, **kwargs)
+          child.wait = active_wait
+          worker.subprocess.Popen = lambda *args, **kwargs: child
+          signal.signal(signal.SIGTERM, worker.stop_worker)
+          result = worker.run_cycle("dry-run", Path("/config/connections.json"))
+          assert result == 143 and child.poll() == -signal.SIGKILL
+          child.stdout.close()
+          '
+          trap 'docker rm --force guard-shutdown >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 50); do
+            if docker logs guard-shutdown | grep -q waiting; then break; fi
+            sleep 0.1
+          done
+          docker logs guard-shutdown | grep -q waiting
+          started=$SECONDS
+          docker stop -t 8 guard-shutdown
+          test "$((SECONDS - started))" -lt 8
+          test "$(docker inspect --format='{{.State.ExitCode}}' guard-shutdown)" = 0
       - name: Publish only on explicit manual request
         if: github.event_name == 'workflow_dispatch' && inputs.publish
         env:

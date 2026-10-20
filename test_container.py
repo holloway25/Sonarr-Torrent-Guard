@@ -176,7 +176,7 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 0)
         self.assertIn("public.py", popen.call_args.args[0][1])
         self.assertNotIn("private-marker", str(popen.call_args))
-        process.wait.assert_called_once_with(timeout=210)
+        process.wait.assert_called_once_with(timeout=0.25)
 
     def test_second_worker_on_same_appdata_fails_closed(self):
         import fcntl
@@ -189,13 +189,14 @@ class ContainerTests(unittest.TestCase):
 
     def test_stuck_child_is_terminated_then_killed_with_bounded_waits(self):
         process = Mock()
-        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 210),
-                                    subprocess.TimeoutExpired("worker", 10), -9]
-        with patch("subprocess.Popen", return_value=process):
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 0.25),
+                                    subprocess.TimeoutExpired("worker", 2), -9]
+        with patch("subprocess.Popen", return_value=process), patch.object(
+                worker.time, "monotonic", side_effect=[0, 0, 210]):
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 124)
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
-        self.assertEqual(process.wait.call_args_list, [call(timeout=210), call(timeout=10), call(timeout=10)])
+        self.assertEqual(process.wait.call_args_list, [call(timeout=0.25), call(timeout=2), call(timeout=2)])
         self.assertIsNone(worker.CHILD)
 
     def test_stop_before_launch_creates_no_child(self):
@@ -227,7 +228,7 @@ class ContainerTests(unittest.TestCase):
 
     def test_launch_race_with_term_ignoring_child_uses_bounded_kill_wait(self):
         process = Mock()
-        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 10), -9]
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 2), -9]
         def launch(*args, **kwargs):
             worker.stop_worker()
             return process
@@ -235,7 +236,68 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 143)
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
-        self.assertEqual(process.wait.call_args_list, [call(timeout=10), call(timeout=10)])
+        self.assertEqual(process.wait.call_args_list, [call(timeout=2), call(timeout=2)])
+
+    def test_real_signal_while_waiting_kills_term_ignoring_child_promptly(self):
+        original_popen = subprocess.Popen
+        child = original_popen([sys.executable, "-c", "import signal,time; "
+                               "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                               "print('ready', flush=True); time.sleep(60)"],
+                               stdout=subprocess.PIPE, text=True)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        waiting = threading.Event()
+        original_wait = child.wait
+        def active_wait(*args, **kwargs):
+            waiting.set()
+            return original_wait(*args, **kwargs)
+        def request_stop():
+            if waiting.wait(timeout=3):
+                os.kill(os.getpid(), signal.SIGTERM)
+        stopper = threading.Thread(target=request_stop)
+        # A broken implementation must fail promptly, not hang this test for210s.
+        watchdog = threading.Timer(6, lambda: child.kill() if child.poll() is None else None)
+        previous = signal.signal(signal.SIGTERM, worker.stop_worker)
+        try:
+            stopper.start(); watchdog.start()
+            started = time.monotonic()
+            with patch("subprocess.Popen", return_value=child), patch.object(child, "wait", side_effect=active_wait):
+                result = worker.run_cycle("dry-run", self.path / "connections.json")
+            self.assertEqual(result, 143)
+            self.assertLess(time.monotonic() - started, 5.5)
+            self.assertEqual(child.poll(), -signal.SIGKILL)
+            self.assertIsNone(worker.CHILD)
+        finally:
+            watchdog.cancel(); watchdog.join()
+            stopper.join(timeout=4)
+            signal.signal(signal.SIGTERM, previous)
+            if child.poll() is None:
+                child.kill()
+            original_wait(timeout=2)
+            child.stdout.close()
+
+    def test_polling_keeps_original_deadline_and_uses_remaining_budget(self):
+        process = Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 0.25),
+                                   subprocess.TimeoutExpired("worker", 0.125), 0]
+        with patch("subprocess.Popen", return_value=process), patch.object(
+                worker.time, "monotonic", side_effect=[0, 0, 209.875, 210]):
+            self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 124)
+        self.assertEqual(process.wait.call_args_list, [call(timeout=0.25), call(timeout=0.125), call(timeout=2)])
+        process.terminate.assert_called_once()
+        process.kill.assert_not_called()
+
+    def test_stopping_skips_final_heartbeat_write_and_next_cycle(self):
+        def cycle(*args):
+            worker.STOP.set()
+            return 143
+        with patch.dict(os.environ, self.env, clear=True), patch("sys.argv", ["container_worker.py"]), patch(
+                "signal.signal"), patch.object(worker, "run_cycle", side_effect=cycle) as run, patch.object(
+                worker, "atomic_json", wraps=worker.atomic_json) as write:
+            self.assertEqual(worker.main(), 0)
+        self.assertEqual(run.call_count, 1)
+        status_writes = [c for c in write.call_args_list if c.args[0].name == "container-status.json"]
+        self.assertEqual(len(status_writes), 1)
+        self.assertEqual(status_writes[0].args[1]["stage"], "running")
 
     def test_stop_signal_interrupts_child_and_scheduler_wait(self):
         process = Mock(); process.poll.return_value = None

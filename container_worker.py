@@ -19,6 +19,9 @@ CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
 INTERVAL_SECONDS = 600
 CYCLE_TIMEOUT = 210
+CYCLE_POLL_SECONDS = 0.25
+TERMINATE_TIMEOUT = 2
+KILL_TIMEOUT = 2
 CONTAINER_LIVE_RELEASE_ENABLED = False  # Review and migration approval required.
 STOP = threading.Event()
 CHILD = None
@@ -162,13 +165,13 @@ def terminate_child(child):
     except ProcessLookupError:
         pass
     try:
-        child.wait(timeout=10)
+        child.wait(timeout=TERMINATE_TIMEOUT)
     except subprocess.TimeoutExpired:
         try:
             child.kill()
         except ProcessLookupError:
             pass
-        child.wait(timeout=10)
+        child.wait(timeout=KILL_TIMEOUT)
 
 
 def run_cycle(mode, path):
@@ -188,14 +191,19 @@ def run_cycle(mode, path):
     try:
         # A signal can arrive inside Popen before CHILD becomes visible to the
         # handler. Close that window before waiting or permitting another cycle.
-        if STOP.is_set():
-            terminate_child(CHILD)
-            return 143
-        try:
-            return CHILD.wait(timeout=CYCLE_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            terminate_child(CHILD)
-            return 124
+        deadline = time.monotonic() + CYCLE_TIMEOUT
+        while True:
+            if STOP.is_set():
+                terminate_child(CHILD)
+                return 143
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_child(CHILD)
+                return 124
+            try:
+                return CHILD.wait(timeout=min(CYCLE_POLL_SECONDS, remaining))
+            except subprocess.TimeoutExpired:
+                pass  # Recheck stop requests without resetting the cycle budget.
     finally:
         CHILD = None
 
@@ -228,6 +236,9 @@ def main():
             while not STOP.is_set():
                 atomic_json(CONFIG_DIR / "container-status.json", {"updated_at": time.time(), "mode": mode, "stage": "running"})
                 code = run_cycle(mode, path)
+                if STOP.is_set():
+                    # Do not start another appdata fsync while the array stops.
+                    break
                 atomic_json(CONFIG_DIR / "container-status.json", {"updated_at": time.time(), "mode": mode, "stage": "waiting", "exit_code": code})
                 print(json.dumps({"event": "container_cycle", "mode": mode, "exit_code": code}), flush=True)
                 if args.once or STOP.wait(INTERVAL_SECONDS):

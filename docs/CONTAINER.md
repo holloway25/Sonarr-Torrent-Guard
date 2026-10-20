@@ -82,10 +82,20 @@ A lifetime lock prevents another container using the SAME appdata; it cannot
 detect independent workers using different copies elsewhere.
 
 The existing three-minute API deadline remains, with an outer210-second child
-timeout. SIGTERM/SIGINT interrupt the child and scheduler wait. Hung children are
-terminated, then killed if necessary, with bounded ten-second waits for each
-shutdown step. Stop requests are checked before launch and immediately after
-the child becomes visible, including signals arriving inside process creation.
+timeout measured against one monotonic deadline. Active child waits poll at most
+every0.25seconds; SIGTERM/SIGINT do NOT wait for that cycle deadline. Stop requests
+are checked before launch, immediately after creation and throughout active waits.
+Shutdown sends TERM with a2second grace, then KILL with a2second bounded reap.
+The worker-controlled waiting budget is at most4.25seconds after a stop request,
+not210seconds. The scheduler exits without starting a final heartbeat/appdata
+fsync or another cycle. Repeated signals do not reset the shutdown waits.
+
+Configure Docker/Unraid's container stop timeout to at least10seconds, leaving
+margin for process exit before the host escalates. Verify actual array-stop
+behavior during dry-run staging before enabling live mode. This is a bound on
+application waiting, not a guarantee against an uninterruptible kernel/storage
+stall or other containers delaying array shutdown. Do not change Unraid's array
+unmount/parity safety settings to compensate for an application shutdown fault.
 Durable intent/no-replay evidence survives
 in appdata; restarting does not renew grants or blindly repeat uncertain actions.
 
