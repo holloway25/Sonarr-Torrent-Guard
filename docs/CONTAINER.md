@@ -52,9 +52,18 @@ by the operator; they are not claimed to be hidden from root.
 
 Both owners and public/private lists are explicit; unknown sources stay protected.
 The binding endpoint is QBIT_URL, maintaining the exact endpoint contract. Config
-stays `dry_run: true`. Environment mode uses labels Sonarr-HD and Sonarr-UHD; file
-mode preserves existing labels and settings. Invalid input does not overwrite a
-valid config. The generated private runtime file contains credentials: do not
+stays `dry_run: true`. New appdata uses labels Sonarr-HD and Sonarr-UHD. When a
+config already exists, environment mode matches normalized Sonarr/downloader
+endpoints, category and pinned client ID and preserves its exact existing labels
+(including HD/UHD). Credential rotation does not rename owners. Changed or
+ambiguous bindings, extra/missing owners, or a journal without its connection
+config require an explicit identity migration; startup refuses to guess and does
+not replace the config. File mode preserves existing labels and settings.
+Both modes check active and archived journal owner identities and recorded live
+bindings read-only before scheduling. Mismatched or unreadable evidence blocks
+startup, never resets holds. Retain the original config with the entire appdata;
+do not edit labels or delete evidence to work around a refusal.
+Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.
 
@@ -74,7 +83,10 @@ detect independent workers using different copies elsewhere.
 
 The existing three-minute API deadline remains, with an outer210-second child
 timeout. SIGTERM/SIGINT interrupt the child and scheduler wait. Hung children are
-terminated, then killed if necessary. Durable intent/no-replay evidence survives
+terminated, then killed if necessary, with bounded ten-second waits for each
+shutdown step. Stop requests are checked before launch and immediately after
+the child becomes visible, including signals arriving inside process creation.
+Durable intent/no-replay evidence survives
 in appdata; restarting does not renew grants or blindly repeat uncertain actions.
 
 Health means a recent scheduler heartbeat, NOT healthy API connectivity, valid

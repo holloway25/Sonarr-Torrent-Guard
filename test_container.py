@@ -2,13 +2,15 @@ import contextlib
 import io
 import json
 import os
+import signal
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import container_worker as worker
 
@@ -58,6 +60,84 @@ class ContainerTests(unittest.TestCase):
         before = path.read_bytes()
         self.assertEqual(worker.configure({"STGUARD_CONFIG_SOURCE": "file"}), path)
         self.assertEqual(path.read_bytes(), before)
+
+    def legacy_hold(self):
+        import production
+        from safety import Journal
+        from test_production import ProductionTests
+        fixture = ProductionTests()
+        fixture.setUp()
+        def cleanup():
+            fixture.tearDown()
+            fixture.doCleanups()
+        self.addCleanup(cleanup)
+        config = worker.runtime_config(self.env)
+        config["sonarr"] = {quality: config["sonarr"]["Sonarr-" + quality] for quality in ("HD", "UHD")}
+        worker.atomic_json(self.path / "connections.json", config)
+        context = dict(fixture.context, binding_digest=production.binding_digest(config, "HD"))
+        journal = Journal(self.path / "action-journal.sqlite3", allow_single_test=True)
+        row = journal.prepare(fixture.report, mode="single_test", context=context)
+        journal.transition(row["key"], "prepared", "dispatch_recorded")
+        journal.transition(row["key"], "dispatch_recorded", "manual_review")
+        journal.close()
+        return config, fixture.report
+
+    def test_environment_preserves_legacy_labels_and_unresolved_hold_after_restart(self):
+        import production
+        from safety import Journal, SafetyError
+        config, report = self.legacy_hold()
+        journal_path = self.path / "action-journal.sqlite3"
+        before = journal_path.read_bytes()
+        for _ in range(2):
+            current = json.loads(worker.configure(dict(self.env, STGUARD_QBIT_PASSWORD="rotated-placeholder")).read_text())
+            self.assertEqual(set(current["sonarr"]), {"HD", "UHD"})
+            self.assertEqual(current["sonarr"], config["sonarr"])
+            journal = Journal(journal_path, read_only=True)
+            try:
+                with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
+                    production.check_prior_attempts(journal, report, config=current)
+            finally:
+                journal.close()
+        self.assertEqual(journal_path.read_bytes(), before)
+
+    def test_binding_changes_and_orphaned_appdata_require_explicit_migration(self):
+        self.legacy_hold()
+        path = self.path / "connections.json"
+        before = path.read_bytes()
+        for changes in ({"STGUARD_SONARR_HD_URL": "https://different.example.invalid"},
+                        {"STGUARD_SONARR_HD_CLIENT_ID": "99"},
+                        {"STGUARD_SONARR_HD_CATEGORY": "different"},
+                        {"STGUARD_QBIT_URL": "https://different.example.invalid"}):
+            with self.subTest(changes=list(changes)), self.assertRaisesRegex(Exception, "identity_migration_required"):
+                worker.configure(dict(self.env, **changes))
+            self.assertEqual(path.read_bytes(), before)
+        path.unlink()
+        with self.assertRaisesRegex(Exception, "identity_migration_required"):
+            worker.configure(self.env)
+        self.assertFalse(path.exists())
+
+    def test_file_mode_cannot_hide_old_labels_or_change_recorded_binding(self):
+        self.legacy_hold()
+        path = self.path / "connections.json"
+        for candidate in (worker.runtime_config(self.env),
+                          dict(json.loads(path.read_text()), qbittorrent={"url": "https://different.example.invalid",
+                               "username": "REPLACE_ME", "password": "REPLACE_ME"})):
+            # Keep config structurally valid so the journal comparison is tested.
+            for item in candidate["sonarr"].values():
+                item["download_client_binding"]["endpoint"] = candidate["qbittorrent"]["url"]
+            worker.atomic_json(path, candidate)
+            with self.assertRaisesRegex(Exception, "identity_migration_required"):
+                worker.configure({"STGUARD_CONFIG_SOURCE": "file"})
+
+    def test_orphaned_journal_requires_original_config_even_when_empty(self):
+        from safety import Journal
+        journal = Journal(self.path / "action-journal.sqlite3")
+        journal.close()
+        before = (self.path / "action-journal.sqlite3").read_bytes()
+        with self.assertRaisesRegex(Exception, "identity_migration_required"):
+            worker.configure(self.env)
+        self.assertFalse((self.path / "connections.json").exists())
+        self.assertEqual((self.path / "action-journal.sqlite3").read_bytes(), before)
 
     def test_check_config_sends_no_requests_and_does_not_print_credentials(self):
         output = io.StringIO()
@@ -115,7 +195,47 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 124)
         process.terminate.assert_called_once()
         process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_args_list, [call(timeout=210), call(timeout=10), call(timeout=10)])
         self.assertIsNone(worker.CHILD)
+
+    def test_stop_before_launch_creates_no_child(self):
+        worker.STOP.set()
+        with patch("subprocess.Popen") as popen:
+            self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 143)
+        popen.assert_not_called()
+
+    def test_real_signal_during_launch_terminates_and_reaps_new_child(self):
+        original_popen = subprocess.Popen
+        children = []
+        def launch(*args, **kwargs):
+            child = original_popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            children.append(child)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return child
+        previous = signal.signal(signal.SIGTERM, worker.stop_worker)
+        try:
+            with patch("subprocess.Popen", side_effect=launch):
+                self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 143)
+            self.assertIsNotNone(children[0].poll())
+            self.assertIsNone(worker.CHILD)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=10)
+
+    def test_launch_race_with_term_ignoring_child_uses_bounded_kill_wait(self):
+        process = Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired("worker", 10), -9]
+        def launch(*args, **kwargs):
+            worker.stop_worker()
+            return process
+        with patch("subprocess.Popen", side_effect=launch):
+            self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 143)
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_args_list, [call(timeout=10), call(timeout=10)])
 
     def test_stop_signal_interrupts_child_and_scheduler_wait(self):
         process = Mock(); process.poll.return_value = None

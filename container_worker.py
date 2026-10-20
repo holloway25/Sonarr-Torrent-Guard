@@ -81,7 +81,28 @@ def configure(env):
         temporary = CONFIG_DIR / ".connections-validation.json"
         try:
             atomic_json(temporary, candidate)
-            load_config(temporary)
+            candidate = load_config(temporary)
+            if path.exists():
+                if path.is_symlink():
+                    raise GuardError("container_private_appdata_required")
+                previous = load_config(path)
+                from production import binding_digest
+                # Labels are durable journal identities, not display names. Match
+                # actual bindings, never HD/UHD ordering or the generated labels.
+                preserved = {}
+                for label in previous["sonarr"]:
+                    matches = [name for name in candidate["sonarr"]
+                               if binding_digest(candidate, name) == binding_digest(previous, label)]
+                    if len(matches) != 1 or matches[0] in preserved.values():
+                        raise GuardError("container_identity_migration_required")
+                    preserved[label] = matches[0]
+                if len(preserved) != len(candidate["sonarr"]):
+                    raise GuardError("container_identity_migration_required")
+                candidate["sonarr"] = {label: candidate["sonarr"][name] for label, name in preserved.items()}
+            elif (CONFIG_DIR / "action-journal.sqlite3").exists():
+                # Do not guess the identities of orphaned migrated appdata.
+                raise GuardError("container_identity_migration_required")
+            validate_journal_identity(candidate)
             atomic_json(path, candidate)
         finally:
             if temporary.exists() and not temporary.is_symlink():
@@ -90,8 +111,30 @@ def configure(env):
         raise GuardError("container_configuration_invalid")
     if path.is_symlink() or path.stat().st_mode & 0o077:
         raise GuardError("container_private_appdata_required")
-    load_config(path)
+    validate_journal_identity(load_config(path))
     return path
+
+
+def validate_journal_identity(config):
+    from production import binding_digest
+    from safety import Journal
+    path = CONFIG_DIR / "action-journal.sqlite3"
+    if not path.exists() and not path.is_symlink():
+        return
+    journal = Journal(path, read_only=True)
+    try:
+        keys = journal.db.execute("SELECT key FROM actions").fetchall()
+        if journal.has_archive:
+            keys += journal.db.execute("SELECT key FROM actions_archive").fetchall()
+        for (key,) in keys:
+            row = journal.get(key)
+            label = row["evidence"].get("instance")
+            context = row["context"]
+            if label not in config["sonarr"] or (row["mode"] in ("single_test", "public_attempt") and (
+                    context.get("instance") != label or context.get("binding_digest") != binding_digest(config, label))):
+                raise GuardError("container_identity_migration_required")
+    finally:
+        journal.close()
 
 
 def healthcheck():
@@ -107,7 +150,25 @@ def healthcheck():
 def stop_worker(*unused):
     STOP.set()
     if CHILD is not None and CHILD.poll() is None:
-        CHILD.terminate()
+        try:
+            CHILD.terminate()
+        except ProcessLookupError:
+            pass  # Child exited between poll and terminate; run_cycle reaps it.
+
+
+def terminate_child(child):
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        child.wait(timeout=10)
 
 
 def run_cycle(mode, path):
@@ -121,17 +182,20 @@ def run_cycle(mode, path):
     # or a child environment dump. No shell command construction.
     env = {key: value for key, value in os.environ.items() if key in
            ("PATH", "HOME", "TZ", "LANG", "LC_ALL", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")}
+    if STOP.is_set():
+        return 143
     CHILD = subprocess.Popen(command, env=env)
     try:
-        return CHILD.wait(timeout=CYCLE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        CHILD.terminate()
+        # A signal can arrive inside Popen before CHILD becomes visible to the
+        # handler. Close that window before waiting or permitting another cycle.
+        if STOP.is_set():
+            terminate_child(CHILD)
+            return 143
         try:
-            CHILD.wait(timeout=10)
+            return CHILD.wait(timeout=CYCLE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            CHILD.kill()
-            CHILD.wait()
-        return 124
+            terminate_child(CHILD)
+            return 124
     finally:
         CHILD = None
 
