@@ -103,11 +103,21 @@ class ReleaseEvidenceTests(unittest.TestCase):
             verify_archive(path, digest, self.run, self.repo, 1001, self.digest)
         self.assertEqual(list(self.path.iterdir()), [path])
 
-    def test_duplicate_json_keys_and_large_records_are_refused(self):
-        for content in ('{"digest":"one","digest":"two"}', " " * 16385):
+    def test_duplicate_json_keys_are_refused_for_otherwise_valid_record(self):
+        original = json.dumps(self.record)
+        for key, value in self.record.items():
+            content = "{" + json.dumps(key) + ":" + json.dumps(value) + "," + original[1:]
+            # Without duplicate-key rejection this exact fixture is fully valid.
+            self.assertEqual(json.loads(content), self.record)
+            self.validate(record=json.loads(content))
             path, digest = self.archive(contents=content)
-            with self.assertRaises(EvidenceError):
+            with self.subTest(key=key), self.assertRaises(EvidenceError):
                 verify_archive(path, digest, self.run, self.repo, 1001, self.digest)
+
+    def test_large_publication_records_are_refused(self):
+        path, digest = self.archive(contents=" " * 16385)
+        with self.assertRaises(EvidenceError):
+            verify_archive(path, digest, self.run, self.repo, 1001, self.digest)
 
     def test_actual_record_cli_creates_only_expected_metadata(self):
         tool = Path(__file__).resolve().parents[1] / "release_evidence.py"

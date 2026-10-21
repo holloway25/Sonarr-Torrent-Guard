@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -84,6 +86,54 @@ class DependencyReleaseTests(unittest.TestCase):
             self.assertIn(repr(name), script)
         self.assertNotIn("import guard", script)
         self.assertNotIn("connections.json", script)
+
+    def test_generated_image_script_hashes_actual_fixture_contents(self):
+        # Redirect only the container's /app root; execute the generated script
+        # unchanged in a fresh process, without needing Docker or a host /app.
+        runner = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+root = Path(sys.argv[1])
+def fixture_path(value):
+    if value != '/app':
+        raise AssertionError('unexpected_image_path')
+    return root
+with patch('pathlib.Path', side_effect=fixture_path):
+    exec(compile(sys.argv[2], '<generated-image-script>', 'exec'))
+"""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            fixtures = {name: ("raise RuntimeError('payload must not execute: " + name + "')\n").encode()
+                        for name in policy.IMAGE_FILES}
+            for name, content in fixtures.items():
+                (root / name).write_bytes(content)
+
+            def fingerprint():
+                return subprocess.run([sys.executable, "-c", runner, str(root), policy.image_script()],
+                                      capture_output=True, text=True, timeout=10)
+
+            baseline = fingerprint()
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            expected = hashlib.sha256(json.dumps(
+                {name: hashlib.sha256(content).hexdigest() for name, content in fixtures.items()},
+                sort_keys=True).encode()).hexdigest()
+            self.assertEqual(baseline.stdout.strip(), expected)
+            self.assertEqual(fingerprint().stdout, baseline.stdout)
+            for name, content in fixtures.items():
+                with self.subTest(changed=name):
+                    (root / name).write_bytes(content + b"changed fixture bytes\n")
+                    changed = fingerprint()
+                    self.assertEqual(changed.returncode, 0, changed.stderr)
+                    self.assertRegex(changed.stdout.strip(), r"\A[a-f0-9]{64}\Z")
+                    self.assertNotEqual(changed.stdout, baseline.stdout)
+                    (root / name).write_bytes(content)
+                with self.subTest(missing=name):
+                    (root / name).unlink()
+                    missing = fingerprint()
+                    self.assertNotEqual(missing.returncode, 0)
+                    self.assertEqual(missing.stdout, "")
+                    (root / name).write_bytes(content)
 
     def test_build_order_blocks_old_repeated_and_incomplete_evidence(self):
         policy.newer_build("101", "1", "100", "1")
