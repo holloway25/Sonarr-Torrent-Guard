@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from guard import GuardError, load_config
+from guard import GuardError, load_config, source_policy_key
 
 CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
@@ -34,6 +34,14 @@ def runtime_config(env):
             raise GuardError("container_configuration_invalid")
         return value
     qb_url = required("STGUARD_QBIT_URL")
+    source_mode = env.get("STGUARD_SOURCE_POLICY")
+    if source_mode is None:
+        # Old templates keep their allowlist behavior; new installs need only
+        # private exceptions. An explicit setting makes migration deliberate.
+        source_mode = ("public_allowlist" if any("STGUARD_SONARR_" + quality + "_PUBLIC_INDEXERS" in env
+                                               for quality in ("HD", "UHD")) else "private_exclusions")
+    if source_mode not in ("public_allowlist", "private_exclusions"):
+        raise GuardError("invalid_source_policy")
     result = {"dry_run": True, "minimum_age_seconds": 120, "max_torrents_per_run": 100,
               "max_pages": 20, "qbittorrent": {"url": qb_url,
                   "username": required("STGUARD_QBIT_USERNAME"), "password": required("STGUARD_QBIT_PASSWORD")},
@@ -43,7 +51,9 @@ def runtime_config(env):
         client_id = required(prefix + "CLIENT_ID")
         if not client_id.isascii() or not client_id.isdecimal() or int(client_id) <= 0:
             raise GuardError("container_configuration_invalid")
-        lists = {kind: json.loads(required(prefix + kind.upper() + "_INDEXERS")) for kind in ("public", "private")}
+        lists = {"mode": source_mode, "private": json.loads(required(prefix + "PRIVATE_INDEXERS"))}
+        if source_mode == "public_allowlist":
+            lists["public"] = json.loads(required(prefix + "PUBLIC_INDEXERS"))
         result["sonarr"]["Sonarr-" + quality] = {
             "url": required(prefix + "URL"), "api_key": required(prefix + "API_KEY"),
             "category": required(prefix + "CATEGORY"), "indexers": lists,
@@ -98,6 +108,10 @@ def configure(env):
                                if binding_digest(candidate, name) == binding_digest(previous, label)]
                     if len(matches) != 1 or matches[0] in preserved.values():
                         raise GuardError("container_identity_migration_required")
+                    prior_mode = source_policy_key(previous["sonarr"][label]["indexers"])["mode"]
+                    next_mode = source_policy_key(candidate["sonarr"][matches[0]]["indexers"])["mode"]
+                    if prior_mode != next_mode and env.get("STGUARD_SOURCE_POLICY") != next_mode:
+                        raise GuardError("container_source_policy_migration_required")
                     preserved[label] = matches[0]
                 if len(preserved) != len(candidate["sonarr"]):
                     raise GuardError("container_identity_migration_required")

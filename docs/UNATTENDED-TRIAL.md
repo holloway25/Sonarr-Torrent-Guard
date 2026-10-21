@@ -25,12 +25,18 @@ directory must be owner-private, outside the checkout. It contains exactly:
 There is no automatically issued or installed grant. Missing, disabled, expired,
 future-dated, malformed, publicly readable or wrong-code grants fail closed.
 The scope binds all Sonarr/downloader endpoints, pinned clients, categories,
-public/private source lists, work/page limits and minimum age without storing raw
+source-policy mode and public/private lists, work/page limits and minimum age without storing raw
 deployment details in the grant. Secret rotations alone do not expand scope.
 Source changes require a new reviewed grant. Grant contents are immutable within
 an active run; scope and expiry are revalidated at every dispatch phase, including
 after journal commits. Permission is loaded once per run: remove/disable the file
 to prevent the next run; stop the service as well to interrupt an in-flight run.
+
+New containers use identified sources as public except configured private
+exceptions; legacy allowlist behavior is retained until explicit migration.
+Missing/malformed/ambiguous source identities remain protected. Routine candidate
+authorization uses the same classification as assessment, not a stale public
+list membership check. See [source policy](SOURCE-POLICY.md).
 
 ## One pass
 

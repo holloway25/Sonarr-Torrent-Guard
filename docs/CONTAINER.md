@@ -44,6 +44,7 @@ by the operator; they are not claimed to be hidden from root.
 | --- | --- |
 | `STGUARD_MODE` | Defaults to `dry-run`; `live` is currently refused |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
+| `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
 | `STGUARD_QBIT_URL` | Downloader URL, preferably HTTPS, without embedded credentials |
 | `STGUARD_QBIT_USERNAME`, `STGUARD_QBIT_PASSWORD` | Runtime login |
@@ -51,10 +52,19 @@ by the operator; they are not claimed to be hidden from root.
 | `STGUARD_SONARR_HD_API_KEY`, `STGUARD_SONARR_UHD_API_KEY` | Separate API keys |
 | `STGUARD_SONARR_HD_CATEGORY`, `STGUARD_SONARR_UHD_CATEGORY` | Exact distinct categories |
 | `STGUARD_SONARR_HD_CLIENT_ID`, `STGUARD_SONARR_UHD_CLIENT_ID` | Pinned downloader IDs per owner |
-| `STGUARD_SONARR_HD_PUBLIC_INDEXERS`, `STGUARD_SONARR_UHD_PUBLIC_INDEXERS` | JSON arrays of exact approved public names |
 | `STGUARD_SONARR_HD_PRIVATE_INDEXERS`, `STGUARD_SONARR_UHD_PRIVATE_INDEXERS` | JSON arrays of protected private names |
 
-Both owners and public/private lists are explicit; unknown sources stay protected.
+Both owners and private-exception lists are explicit. New templates omit public
+lists: an identified Sonarr indexer is public by policy unless listed as private.
+Missing/malformed/ambiguous history remains protected; "unlisted" does not mean
+"unidentified". Private matching ignores case and surrounding whitespace. Include
+each separately named private/freeleech alias. This does not inspect tracker flags.
+See [source policy](SOURCE-POLICY.md) before migrating an existing configuration.
+Legacy environment templates with public-list variables and no explicit policy
+retain allowlist mode. File configurations without a mode also retain allowlists.
+Changing a persisted mode requires explicitly selecting the new environment
+policy (or deliberately editing a file in file-source mode), and a new reviewed
+code/scope grant before live use. Old approvals cannot authorize the broader mode.
 The binding endpoint is QBIT_URL, maintaining the exact endpoint contract. Config
 stays `dry_run: true`. New appdata uses labels Sonarr-HD and Sonarr-UHD. When a
 config already exists, environment mode matches normalized Sonarr/downloader
@@ -159,21 +169,23 @@ Do not change package visibility or put a registry token in the template.
 
 Before applying the template on Unraid:
 
-1. Choose a NEW dedicated staging directory at the appdata path shown in the
+1. Choose the dedicated permanent appdata directory shown in the
    template. Inspect it first; do not overwrite existing appdata. Create it owned
    by1000:1000 with0700 permissions (or explicitly choose a matching non-root
    `--user`). Automatic root-owned creation will fail the worker's ownership check.
 2. Install the private XML as a user template using the host's supported template
    management, then select it in Docker/Add Container. Leave auto-start off until
-   staging passes. There is no web UI link or port to configure yet.
-3. Fill connection fields privately, including exact approved indexer names and
-   pinned client IDs; keep mode `dry-run`. `[]` public indexers approves no sources.
+   initial validation passes. There is no web UI link or port to configure yet.
+3. Fill connection fields privately, including private-indexer exceptions and
+   pinned client IDs; keep mode `dry-run`. An empty private list excludes no
+   identified indexers; verify all private aliases before enabling live actions.
    Do not substitute example defaults for actual ownership/source verification.
 4. Start it and inspect connectivity, proposals and sanitized wait reasons.
    It must send no removal/blocklist/search requests. Stop/restart it while idle
    and active, check prompt exit rather than forced kill, and confirm config and
    journal/cursor evidence survive. Do not disturb unrelated containers or array.
-5. Keep staging separate from the current worker's appdata. Live cutover still
+5. Keep the new appdata separate from the current worker's appdata until cutover.
+   Continue using this permanent container name after validation. Live cutover still
    requires the stopped-worker consistent backup/full state transfer and explicit
    new authorization described above; never run two live workers.
 

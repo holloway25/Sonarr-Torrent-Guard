@@ -78,7 +78,10 @@ are accepted. Failed runs do not imply any live action occurred.
 In `guard.py`, the only POST is qBittorrent authentication; assessment uses GET.
 The new maintenance-aware cycle also uses a non-saving Sonarr diagnostic POST,
 described below. TLS certificates
-are verified. Explicit public and private source lists protect unknown sources.
+are verified. New container configurations treat identified indexers as public
+unless listed as private; missing or ambiguous source identity stays protected.
+Legacy files retain public allowlists until explicitly migrated. See
+[source policy](docs/SOURCE-POLICY.md) for private aliases and migration safeguards.
 
 ## Public policy
 
@@ -86,7 +89,9 @@ Ownership requires the correct Sonarr queue hash, category, configured download
 client bound to the actual monitored endpoint, known series/episode and matching
 grab-history provenance. Names alone
 are insufficient. Multiple episode rows produce one proposal per torrent.
-Private sources are protected before file assessment.
+Private exceptions are protected before file assessment. Source classification
+uses the configured policy, not a tracker privacy-flag lookup. Maintain the private
+exceptions for both owners, including separate freeleech aliases.
 
 | Manifest / selection | Decision |
 | --- | --- |
@@ -106,7 +111,7 @@ The separate agreed metadata-timeout rule applies only to confirmed public
 Sonarr attempts still actively retrieving metadata (`metaDL`/`forcedMetaDL`)
 30 minutes after addition, with zero progress, unknown size and an empty file
 list. It does not depend on qBittorrent's potentially stalled active-time counter.
-Paused/stopped, private, unknown and inconsistent cases remain protected. This
+Paused/stopped, private, unidentified/ambiguous and inconsistent cases remain protected. This
 records a metadata failure, not a malware finding, and uses the same fresh
 checks and Sonarr-only cleanup. Metadata arriving before dispatch cancels the
 timeout proposal. See the unattended trial document for the full conditions.

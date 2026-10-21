@@ -10,9 +10,10 @@ checkouts/grants are not changed automatically. Ordinary commands stay dry-run.
 
 Keep the existing 30-minute eligibility test: elapsed time since qBittorrent
 addition, current metaDL/forcedMetaDL, zero progress, unknown size and a
-successfully read empty file list. Ownership, exact client/endpoints, known public
-source, age, retry readiness, supported Sonarr version and fresh fingerprints
-remain mandatory. Private/unknown, manual/unowned, paused/stopped or inconsistent
+successfully read empty file list. Ownership, exact client/endpoints, identified
+source eligibility under the configured [source policy](SOURCE-POLICY.md), age,
+retry readiness, supported Sonarr version and fresh fingerprints
+remain mandatory. Private/unidentified, manual/unowned, paused/stopped or inconsistent
 downloads remain protected. Metadata arrival before dispatch cancels the action.
 
 Metadata unavailability is not proof of malware. Request owning Sonarr remove

@@ -36,10 +36,12 @@ class ContainerTests(unittest.TestCase):
         patcher.start(); self.addCleanup(patcher.stop)
         self.env = example_environment()
 
-    def test_environment_builds_both_owners_with_explicit_source_lists(self):
+    def test_environment_builds_both_owners_with_private_exclusions_only(self):
         config = worker.runtime_config(self.env)
         self.assertTrue(config["dry_run"])
         self.assertEqual(set(config["sonarr"]), {"Sonarr-HD", "Sonarr-UHD"})
+        self.assertEqual(config["sonarr"]["Sonarr-HD"]["indexers"]["mode"], "private_exclusions")
+        self.assertNotIn("public", config["sonarr"]["Sonarr-HD"]["indexers"])
         self.assertEqual(config["sonarr"]["Sonarr-HD"]["download_client_binding"]["endpoint"], self.env["STGUARD_QBIT_URL"])
         path = worker.configure(self.env)
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -49,7 +51,8 @@ class ContainerTests(unittest.TestCase):
         path = worker.configure(self.env)
         before = path.read_bytes()
         for changes in ({"STGUARD_QBIT_PASSWORD": ""}, {"STGUARD_SONARR_HD_CLIENT_ID": "true"},
-                        {"STGUARD_SONARR_HD_PUBLIC_INDEXERS": "not-json"},
+                        {"STGUARD_SONARR_HD_PRIVATE_INDEXERS": "not-json"},
+                        {"STGUARD_SOURCE_POLICY": "typo"},
                         {"STGUARD_SONARR_UHD_CATEGORY": "tv-hd"}):
             with self.subTest(changes=list(changes)), self.assertRaises(Exception):
                 worker.configure(dict(self.env, **changes))
@@ -60,6 +63,29 @@ class ContainerTests(unittest.TestCase):
         before = path.read_bytes()
         self.assertEqual(worker.configure({"STGUARD_CONFIG_SOURCE": "file"}), path)
         self.assertEqual(path.read_bytes(), before)
+
+    def test_legacy_environment_keeps_allowlists_without_explicit_new_policy(self):
+        env = dict(self.env)
+        env.pop("STGUARD_SOURCE_POLICY")
+        for quality in ("HD", "UHD"):
+            env["STGUARD_SONARR_" + quality + "_PUBLIC_INDEXERS"] = '["Public Source"]'
+        config = worker.runtime_config(env)
+        self.assertEqual(config["sonarr"]["Sonarr-HD"]["indexers"]["mode"], "public_allowlist")
+        self.assertEqual(config["sonarr"]["Sonarr-HD"]["indexers"]["public"], ["Public Source"])
+
+    def test_existing_allowlist_requires_explicit_policy_migration(self):
+        path = worker.configure(self.env)
+        prior = json.loads(path.read_text())
+        for instance in prior["sonarr"].values():
+            instance["indexers"].update(mode="public_allowlist", public=["Public Source"])
+        worker.atomic_json(path, prior)
+        before = path.read_bytes()
+        env = dict(self.env); env.pop("STGUARD_SOURCE_POLICY")
+        with self.assertRaisesRegex(Exception, "container_source_policy_migration_required"):
+            worker.configure(env)
+        self.assertEqual(path.read_bytes(), before)
+        changed = json.loads(worker.configure(self.env).read_text())
+        self.assertEqual(changed["sonarr"]["Sonarr-HD"]["indexers"]["mode"], "private_exclusions")
 
     def legacy_hold(self):
         import production
@@ -307,7 +333,7 @@ class ContainerTests(unittest.TestCase):
         self.assertTrue(worker.STOP.is_set())
 
     def test_startup_error_does_not_disclose_environment_values(self):
-        env = dict(self.env, STGUARD_SONARR_HD_PUBLIC_INDEXERS="private-marker")
+        env = dict(self.env, STGUARD_SONARR_HD_PRIVATE_INDEXERS="private-marker")
         output = io.StringIO()
         with patch.dict(os.environ, env, clear=True), patch("sys.argv", ["container_worker.py", "--check-config"]), \
                 contextlib.redirect_stderr(output):

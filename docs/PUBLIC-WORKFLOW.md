@@ -8,6 +8,11 @@ Private-source downloads, the private archive helper, Docker deployment and the
 web UI remain separate future work. Existing seeding/removal policies stay intact.
 
 Fresh read-only assessment and a private SQLite journal are now implemented.
+Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):
+new containers treat identified sources as public except private exclusions;
+legacy allowlists remain supported. Private matches and missing, malformed or
+ambiguous source identity are protected before manifest assessment. A policy
+change requires new reviewed code/scope authorization, not a journal reset.
 Dispatch/recovery behaviour is tested using simulations and mocked production
 adapters. Enable
 `--check-safeguards` to exercise rechecks and preview journaling against the APIs.
@@ -29,7 +34,7 @@ changing these documents, and never escalates to blocklisting after three attemp
    Separately, the agreed public metadata-timeout rule can fail active
    `metaDL`/`forcedMetaDL` attempts after 30 elapsed minutes since addition, requiring
    zero progress, unknown size and a successfully read empty manifest. It is a
-   metadata failure, not a malware verdict; private/unknown sources remain
+   metadata failure, not a malware verdict; private/unidentified sources remain
    protected. Contradictory/missing information skips. Metadata arriving before
    dispatch changes the fingerprint and cancels the timeout action.
 3. Inspect Sonarr retry settings. Both `autoRedownloadFailed` and

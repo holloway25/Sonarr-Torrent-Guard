@@ -299,6 +299,37 @@ def records(api, route, params=None, max_pages=20):
     raise GuardError("pagination_limit_reached")
 
 
+def source_policy_key(policy):
+    """Validate and canonicalize the explicit per-owner source policy."""
+    if not isinstance(policy, dict):
+        raise GuardError("invalid_source_lists")
+    mode = policy.get("mode", "public_allowlist")
+    if mode not in ("public_allowlist", "private_exclusions"):
+        raise GuardError("invalid_source_policy")
+    result = {"mode": mode}
+    for kind in ("public", "private"):
+        values = policy.get(kind, [] if kind == "public" and mode == "private_exclusions" else None)
+        if not isinstance(values, list) or any(not isinstance(x, str) or not x.strip() for x in values):
+            raise GuardError("invalid_source_lists")
+        result[kind] = sorted(values)
+    if mode == "public_allowlist" and set(result["public"]) & set(result["private"]):
+        raise GuardError("overlapping_source_lists")
+    return result
+
+
+def classify_source(policy, source):
+    policy = source_policy_key(policy)
+    if not isinstance(source, str) or not source.strip():
+        return "unknown"
+    if policy["mode"] == "private_exclusions":
+        if source.strip().casefold() in {name.strip().casefold() for name in policy["private"]}:
+            return "private"
+        return "public"
+    if source in policy["private"]:
+        return "private"
+    return "public" if source in policy["public"] else "unknown"
+
+
 def source_for(api, hash_value, rows, max_pages, added=None):
     history = records(api, "/api/v3/history", {
         # Preserve Sonarr's original spelling for its case-sensitive DB filter.
@@ -332,7 +363,8 @@ def source_for(api, hash_value, rows, max_pages, added=None):
         grab_times.append(stamp.timestamp())
         for r in matching:
             data = r.get("data")
-            if not isinstance(data, dict) or not isinstance(data.get("indexer"), str):
+            if (not isinstance(data, dict) or not isinstance(data.get("indexer"), str)
+                    or not data["indexer"].strip()):
                 raise GuardError("missing_indexer_identity")
             sources.add(data["indexer"])
     if len(sources) != 1 or not next(iter(sources)):
@@ -432,10 +464,10 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
             source, grab_ids, grab_time_floor = source_for(api, h, rows, max_pages, added)
-            policy = instance["indexers"]
-            if source in policy["private"]:
+            classification = classify_source(instance["indexers"], source)
+            if classification == "private":
                 raise GuardError("private_source_protected")
-            if source not in policy["public"]:
+            if classification != "public":
                 raise GuardError("unclassified_source_protected")
             state = t.get("state", "")
             safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
@@ -472,6 +504,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             report["attempt_fingerprint"] = hashlib.sha256(
                 json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
             ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
+                         "source_policy": source_policy_key(instance["indexers"]),
                          "client_id": report["download_client_id"],
                          "sonarr_endpoint": endpoint_key(instance["url"]),
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
@@ -540,12 +573,7 @@ def load_config(path):
             if item["category"] in categories:
                 raise GuardError("duplicate_instance_category")
             categories.add(item["category"])
-            lists = item["indexers"]
-            for kind in ("public", "private"):
-                if not isinstance(lists[kind], list) or any(not isinstance(x, str) or not x for x in lists[kind]):
-                    raise GuardError("invalid_source_lists")
-            if set(lists["public"]) & set(lists["private"]):
-                raise GuardError("overlapping_source_lists")
+            source_policy_key(item["indexers"])
             binding = item.get("download_client_binding")
             if (not isinstance(binding, dict) or not integer(binding.get("id"))
                     or binding["id"] <= 0):

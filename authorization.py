@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import time
 
-from guard import endpoint_key, METADATA_TIMEOUT_SECONDS
+from guard import endpoint_key, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source
 from safety import SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v3"
@@ -30,7 +30,7 @@ def scope_digest(config):
         scope["instances"][name] = {"url": endpoint_key(item["url"]), "category": item["category"],
             "client_id": item["download_client_binding"]["id"],
             "client_endpoint": endpoint_key(item["download_client_binding"]["endpoint"]),
-            "public": sorted(item["indexers"]["public"]), "private": sorted(item["indexers"]["private"])}
+            **source_policy_key(item["indexers"])}
     scope["minimum_age"] = config.get("minimum_age_seconds", 120)
     scope["work_limit"] = config.get("max_torrents_per_run", 100)
     scope["page_limit"] = config.get("max_pages", 20)
@@ -65,7 +65,7 @@ class RoutineAuthorization:
             raise SafetyError("routine_authorization_expired_or_scope_changed")
         if report is not None and (report.get("instance") not in config["sonarr"]
                 or report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True
-                or report.get("indexer") not in config["sonarr"][report["instance"]]["indexers"]["public"]):
+                or classify_source(config["sonarr"][report["instance"]]["indexers"], report.get("indexer")) != "public"):
             raise SafetyError("routine_candidate_not_authorized")
 
     @classmethod
