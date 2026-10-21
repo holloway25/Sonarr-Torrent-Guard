@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Test source and privacy before building
         run: |
-          python3 -m unittest test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention test_container
+          python3 -m unittest discover -s tools/tests -t .
           python3 tools/privacy_check.py --all
       - name: Choose commit-specific image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"

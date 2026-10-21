@@ -11,7 +11,7 @@ import production
 import public
 from guard import run, load_batch_state, save_batch_state
 from safety import Journal, SafetyError, reconcile
-import test_production as fixtures
+from tools.tests import test_production as fixtures
 
 
 class PublicTests(unittest.TestCase):
@@ -447,7 +447,7 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_timer_template_has_ten_minute_interval_and_dry_run_only_target(self):
         from pathlib import Path
-        folder = Path(__file__).parent / "deploy"
+        folder = Path(__file__).resolve().parents[2] / "deploy"
         timer = (folder / "sonarr-torrent-guard.timer").read_text()
         service = (folder / "sonarr-torrent-guard.service").read_text()
         self.assertIn("OnUnitInactiveSec=10min", timer)

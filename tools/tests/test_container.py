@@ -17,7 +17,7 @@ import container_worker as worker
 
 def example_environment():
     result = {}
-    for line in (Path(__file__).parent / "deploy/container.env.example").read_text().splitlines():
+    for line in (Path(__file__).resolve().parents[2] / "deploy/container.env.example").read_text().splitlines():
         if line and not line.startswith("#"):
             key, value = line.split("=", 1)
             result[key] = value
@@ -64,7 +64,7 @@ class ContainerTests(unittest.TestCase):
     def legacy_hold(self):
         import production
         from safety import Journal
-        from test_production import ProductionTests
+        from tools.tests.test_production import ProductionTests
         fixture = ProductionTests()
         fixture.setUp()
         def cleanup():
@@ -323,7 +323,7 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(worker.healthcheck(), 1)
 
     def test_explicit_docker_source_allowlist_excludes_private_runtime_files(self):
-        root = Path(__file__).parent
+        root = Path(__file__).resolve().parents[2]
         docker = (root / "Dockerfile").read_text()
         self.assertNotIn("COPY .", docker)
         self.assertIn("USER 1000:1000", docker)
@@ -337,7 +337,7 @@ class ContainerTests(unittest.TestCase):
         self.assertIn("container_worker.py", SOURCE_FILES)
 
     def test_image_distributes_gplv3_license_and_matching_source_metadata(self):
-        root = Path(__file__).parent
+        root = Path(__file__).resolve().parents[2]
         license_text = (root / "LICENSE").read_text()
         self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
         self.assertIn("Version 3, 29 June 2007", license_text)
@@ -350,9 +350,18 @@ class ContainerTests(unittest.TestCase):
         self.assertIn("org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}", workflow)
         self.assertIn("org.opencontainers.image.revision=${GITHUB_SHA}", workflow)
 
+    def test_all_regression_modules_live_under_tools_and_ci_uses_discovery(self):
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(list(root.glob("test_*.py")), [])
+        self.assertGreaterEqual(len(list((root / "tools/tests").glob("test_*.py"))), 9)
+        self.assertTrue((root / "tools/tests/__init__.py").is_file())
+        for name in ("checks.yml", "container.yml"):
+            workflow = (root / ".github/workflows" / name).read_text()
+            self.assertIn("-m unittest discover -s tools/tests -t .", workflow)
+
     def test_unraid_template_defaults_match_supported_environment(self):
         import xml.etree.ElementTree as ET
-        root = ET.parse(Path(__file__).parent / "deploy/unraid.xml").getroot()
+        root = ET.parse(Path(__file__).resolve().parents[2] / "deploy/unraid.xml").getroot()
         entries = [item for item in root.findall("Config") if item.get("Type") == "Variable"]
         env = {item.get("Target"): item.get("Default") for item in entries}
         self.assertEqual(len(entries), len(env))
@@ -367,7 +376,7 @@ class ContainerTests(unittest.TestCase):
 
     def test_unraid_template_limits_mounts_privilege_and_shutdown(self):
         import xml.etree.ElementTree as ET
-        root = ET.parse(Path(__file__).parent / "deploy/unraid.xml").getroot()
+        root = ET.parse(Path(__file__).resolve().parents[2] / "deploy/unraid.xml").getroot()
         self.assertEqual(root.findtext("Network"), "bridge")
         self.assertEqual(root.findtext("Privileged"), "false")
         self.assertFalse(root.findtext("WebUI"))
@@ -385,7 +394,7 @@ class ContainerTests(unittest.TestCase):
 
     def test_unraid_template_references_approved_transparent_icon(self):
         import xml.etree.ElementTree as ET
-        root = Path(__file__).parent
+        root = Path(__file__).resolve().parents[2]
         template = ET.parse(root / "deploy/unraid.xml").getroot()
         icon = "assets/sonarr-torrent-guard-darker.png"
         self.assertTrue(template.findtext("Icon").endswith("/" + icon))

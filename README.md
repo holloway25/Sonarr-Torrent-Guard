@@ -136,12 +136,15 @@ verification and recovery requirements before live implementation.
 ## Verification and privacy
 
 ```sh
-python3 -m unittest -v test_guard test_safety test_production test_public test_timing test_routine test_metadata test_retention test_container
+python3 -m unittest discover -s tools/tests -t . -v
 python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
 
 The optional hook checks staged content; CI checks tracked content and runs tests.
+All automated tests and their shared mock fixtures live under `tools/tests/`,
+separate from the application source. Run the commands above from the repository
+root; a single module can also be run with `python3 -m unittest tools.tests.test_guard`.
 The privacy checker is a guardrail, not proof that all identifying data is absent.
 Manually inspect staged content and author name/email before any commit. Use a
 privacy-safe Git author identity. Never track local handoff notes, configuration,

@@ -13,7 +13,7 @@ import production
 import retention
 import safety
 from safety import Journal, SafetyError
-import test_production as fixtures
+from tools.tests import test_production as fixtures
 
 
 class RetentionTests(unittest.TestCase):

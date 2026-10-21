@@ -8,7 +8,7 @@ from unittest.mock import patch
 import production
 from production import wait_for_event_boundary as actual_wait, event_boundary_reached as actual_reached
 from safety import Journal, SafetyError
-import test_production as fixtures
+from tools.tests import test_production as fixtures
 
 
 class TimingTests(unittest.TestCase):

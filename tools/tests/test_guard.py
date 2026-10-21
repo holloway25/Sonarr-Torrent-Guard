@@ -1,3 +1,5 @@
+"""Guard regression tests and shared fake API fixtures."""
+
 import copy
 import unittest
 from unittest.mock import patch
@@ -505,12 +507,12 @@ class TransportTests(unittest.TestCase):
         from pathlib import Path
         with tempfile.TemporaryDirectory() as folder:
             p = Path(folder)/"settings.json"
-            sample = json.loads((Path(__file__).parent/"config.example.json").read_text())
+            sample = json.loads((Path(__file__).resolve().parents[2]/"config.example.json").read_text())
             p.write_text(json.dumps(sample))
             os.chmod(p, 0o600)
             with open(Path(folder)/"guard.lock", "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                r = subprocess.run([sys.executable, str(Path(__file__).parent/"guard.py"),
+                r = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[2]/"guard.py"),
                                     "--config", str(p)], capture_output=True, text=True, timeout=5)
                 self.assertEqual(r.returncode, 1)
                 self.assertIn("another_run_is_active", r.stderr)

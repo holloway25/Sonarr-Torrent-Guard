@@ -11,7 +11,7 @@ from guard import run
 import production
 import routine
 from safety import SafetyError
-import test_production as fixtures
+from tools.tests import test_production as fixtures
 
 
 class RoutineTests(unittest.TestCase):
@@ -190,7 +190,7 @@ class RoutineTests(unittest.TestCase):
         send.assert_called_once()
 
     def test_trial_timer_has_explicit_live_worker_and_ten_minute_interval(self):
-        folder = Path(__file__).parent / "deploy"
+        folder = Path(__file__).resolve().parents[2] / "deploy"
         self.assertIn("OnUnitInactiveSec=10min", (folder / "sonarr-torrent-guard-live.timer").read_text())
         self.assertIn("routine.py --live", (folder / "sonarr-torrent-guard-live.service").read_text())
 

@@ -9,8 +9,8 @@ import production
 from safety import Journal, SafetyError, check_fresh, reconcile
 from workflow import preview_failure
 from reports import human_report, json_events
-import test_guard as guard_fixtures
-import test_production as production_fixtures
+from tools.tests import test_guard as guard_fixtures
+from tools.tests import test_production as production_fixtures
 
 
 class MetadataTests(unittest.TestCase):

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import production
 from guard import run
 from safety import Journal, SafetyError
-from test_guard import FakeApi, manifest
+from tools.tests.test_guard import FakeApi, manifest
 
 
 class ProductionTests(unittest.TestCase):

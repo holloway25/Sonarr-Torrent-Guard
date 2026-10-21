@@ -1,3 +1,5 @@
+"""Safety journal and mocked recovery regression tests."""
+
 import copy
 import json
 from pathlib import Path
