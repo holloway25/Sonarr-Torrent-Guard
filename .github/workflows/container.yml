@@ -45,6 +45,8 @@ jobs:
           echo "BUILD_DOCKERFILE=$RUNNER_TEMP/dependency.Dockerfile" >> "$GITHUB_ENV"
       - name: Build image
         run: docker build --pull --no-cache --file "${BUILD_DOCKERFILE:-Dockerfile}" --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.base.name=python:3.12-slim-bookworm" --label "org.opencontainers.image.base.digest=${BASE_DIGEST:-repository-pin}" --label "io.stguard.build.run-id=$GITHUB_RUN_ID" --label "io.stguard.build.attempt=$GITHUB_RUN_ATTEMPT" --tag "$IMAGE" .
+      - name: Run regression suite using the image Python and system libraries
+        run: docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" --workdir /src --entrypoint python3 "$IMAGE" -m unittest discover -s tools/tests -t .
       - name: Offline non-root read-only smoke check
         run: |
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /config:uid=1000,gid=1000,mode=0700 --tmpfs /tmp --env-file deploy/container.env.example "$IMAGE" --check-config

@@ -105,6 +105,13 @@ class DependencyReleaseTests(unittest.TestCase):
                       "tools/dependency_release.py newer", 'test "$NEW_CODE" = "$OLD_CODE"'):
             self.assertLess(text.index(check), text.index('docker tag "$IMAGE@$DIGEST"'))
 
+    def test_full_suite_runs_under_built_image_before_candidate_publication(self):
+        text = (self.root / ".github/workflows/container.yml").read_text()
+        command = '--entrypoint python3 "$IMAGE" -m unittest discover -s tools/tests -t .'
+        self.assertIn(command, text)
+        self.assertLess(text.index(command), text.index('docker push "$IMAGE"'))
+        self.assertIn('source=$GITHUB_WORKSPACE,target=/src,readonly', text)
+
 
 if __name__ == "__main__":
     unittest.main()

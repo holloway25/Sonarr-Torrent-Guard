@@ -25,6 +25,8 @@ still need maintenance.
   does not change host packages or the distro/Python version line.
 - All normal tests, privacy checks, offline non-root smoke checks and the bounded
   active-cycle shutdown test must pass before a scheduled candidate is published.
+  The full regression suite also runs using the built image's Python/system
+  libraries, with only read-only source and temporary test files mounted in CI.
   Scheduled jobs may be delayed by GitHub; inactive public repositories can have
   schedules disabled by GitHub. Check Actions for failures or missing runs.
 
