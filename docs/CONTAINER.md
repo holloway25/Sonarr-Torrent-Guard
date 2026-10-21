@@ -2,7 +2,7 @@
 
 GitHub's Container workflow tests source/privacy, builds a digest-pinned official
 Python-base image and runs offline non-root/read-only smoke checks. Build context
-and COPY use exact source allowlists. No config, grant, API key, login, journal,
+and COPY use exact source allowlists, plus the GPLv3 licence text. No config, grant, API key, login, journal,
 logs, handoff, Git checkout, examples or tests are copied into the image. No
 credentials are build arguments. GitHub's short-lived registry token is used only
 for explicitly requested publication, never passed into the image build.
@@ -16,6 +16,10 @@ deployment is added. Pin the resulting image digest for an approved deployment:
 rebuilding can update OS certificate/timezone packages even for the same source.
 New GHCR packages default to private; package access/visibility is an operator
 decision. Never paste registry/API credentials into issues or build logs.
+New builds carry `GPL-3.0-only` licence metadata and `/app/LICENSE`; the workflow
+also records the source repository and exact revision as OCI labels, so users can
+locate the matching source and licence. The base image and OS packages retain
+their own respective licence terms. Visibility changes do not deploy anything.
 
 ## Unraid settings
 

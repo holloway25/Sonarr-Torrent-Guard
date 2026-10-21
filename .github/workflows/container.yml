@@ -29,7 +29,7 @@ jobs:
       - name: Choose commit-specific image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"
       - name: Build image
-        run: docker build --pull --tag "$IMAGE" .
+        run: docker build --pull --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --tag "$IMAGE" .
       - name: Offline non-root read-only smoke check
         run: |
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /config:uid=1000,gid=1000,mode=0700 --tmpfs /tmp --env-file deploy/container.env.example "$IMAGE" --check-config

@@ -1,5 +1,9 @@
 # Sonarr Torrent Guard
 
+Licensed under the [GNU General Public License version 3 only](LICENSE)
+(`GPL-3.0-only`). Copyright (C) 2026 Sonarr Torrent Guard contributors.
+Distributed without warranty; see the licence for its full terms.
+
 A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests

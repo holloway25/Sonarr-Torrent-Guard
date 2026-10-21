@@ -336,6 +336,20 @@ class ContainerTests(unittest.TestCase):
         from authorization import SOURCE_FILES
         self.assertIn("container_worker.py", SOURCE_FILES)
 
+    def test_image_distributes_gplv3_license_and_matching_source_metadata(self):
+        root = Path(__file__).parent
+        license_text = (root / "LICENSE").read_text()
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 29 June 2007", license_text)
+        self.assertGreater(len(license_text), 30000)
+        docker = (root / "Dockerfile").read_text()
+        self.assertIn("COPY LICENSE /app/LICENSE", docker)
+        self.assertIn('org.opencontainers.image.licenses="GPL-3.0-only"', docker)
+        self.assertIn("!LICENSE", (root / ".dockerignore").read_text().splitlines())
+        workflow = (root / ".github/workflows/container.yml").read_text()
+        self.assertIn("org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}", workflow)
+        self.assertIn("org.opencontainers.image.revision=${GITHUB_SHA}", workflow)
+
     def test_unraid_template_defaults_match_supported_environment(self):
         import xml.etree.ElementTree as ET
         root = ET.parse(Path(__file__).parent / "deploy/unraid.xml").getroot()
