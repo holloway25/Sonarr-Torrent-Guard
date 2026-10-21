@@ -379,11 +379,12 @@ class ContainerTests(unittest.TestCase):
         root = ET.parse(Path(__file__).resolve().parents[2] / "deploy/unraid.xml").getroot()
         self.assertEqual(root.findtext("Network"), "bridge")
         self.assertEqual(root.findtext("Privileged"), "false")
+        self.assertEqual(root.findtext("Name"), "sonarr-torrent-guard")
         self.assertFalse(root.findtext("WebUI"))
         paths = [item for item in root.findall("Config") if item.get("Type") == "Path"]
         self.assertEqual(len(paths), 1)
         self.assertEqual(paths[0].get("Target"), "/config")
-        self.assertTrue(paths[0].get("Default").endswith("/sonarr-torrent-guard-staging"))
+        self.assertTrue(paths[0].get("Default").endswith("/sonarr-torrent-guard"))
         self.assertFalse(any(item.get("Type") == "Port" for item in root.findall("Config")))
         extra = root.findtext("ExtraParams").split()
         for flag in ("--user=1000:1000", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",

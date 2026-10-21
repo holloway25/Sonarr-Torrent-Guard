@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Container version="2">
-  <Name>sonarr-torrent-guard-staging</Name>
+  <Name>sonarr-torrent-guard</Name>
   <Repository>ghcr.io/REPLACE_ME/sonarr-torrent-guard@sha256:b848638bbef7963729ae829403c040c71ec7efe205c2f26c00a9ced540b669bf</Repository>
   <Registry>https://github.com/REPLACE_ME/Sonarr-Torrent-Guard/pkgs/container/sonarr-torrent-guard</Registry>
   <Project>https://github.com/REPLACE_ME/Sonarr-Torrent-Guard</Project>
@@ -9,11 +9,11 @@
   <Privileged>false</Privileged>
   <Icon>https://raw.githubusercontent.com/REPLACE_ME/Sonarr-Torrent-Guard/main/assets/sonarr-torrent-guard-darker.png</Icon>
   <WebUI/>
-  <Overview>Dry-run Sonarr Torrent Guard staging. Checks both Sonarr owners and qBittorrent without removing, blocklisting or searching. No web UI yet. Supply private connection settings below; do not share an edited template. Live migration is separate and gated.</Overview>
+  <Overview>Sonarr Torrent Guard. Starts in dry-run to test both Sonarr owners and qBittorrent without removing, blocklisting or searching. This same container name and appdata are intended for ongoing use after separately approved live configuration. No web UI yet. Supply private connection settings below; do not share an edited template.</Overview>
   <Category>Tools:System</Category>
   <ExtraParams>--user=1000:1000 --read-only --cap-drop=ALL --security-opt=no-new-privileges --stop-timeout=10 --log-driver=json-file --log-opt=max-size=10m --log-opt=max-file=3</ExtraParams>
-  <Config Name="Private staging appdata" Target="/config" Default="/mnt/user/appdata/sonarr-torrent-guard-staging" Mode="rw" Description="Create this dedicated directory owned by UID/GID 1000:1000, mode 0700, before first start. Never map a whole appdata share or media/download directory. Staging only; do not overwrite or copy a live journal while its worker is running." Type="Path" Display="always" Required="true" Mask="false"/>
-  <Config Name="Mode" Target="STGUARD_MODE" Default="dry-run" Description="Keep dry-run for staging; the reviewed container live gate is disabled." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Private appdata" Target="/config" Default="/mnt/user/appdata/sonarr-torrent-guard" Mode="rw" Description="Create this dedicated directory owned by UID/GID 1000:1000, mode 0700, before first start. Never map a whole appdata share or media/download directory. Preserve this appdata for ongoing use; do not overwrite or copy a live journal while its worker is running." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Mode" Target="STGUARD_MODE" Default="dry-run" Description="Use dry-run for initial verification; the reviewed container live gate remains disabled until separately approved activation." Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="Configuration source" Target="STGUARD_CONFIG_SOURCE" Default="env" Description="env uses these private settings. file preserves an existing private connections.json. Never rename owners or reset journals to bypass holds." Type="Variable" Display="advanced" Required="true" Mask="false"/>
   <Config Name="Timezone" Target="TZ" Default="Australia/Melbourne" Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="qBittorrent HTTPS address" Target="STGUARD_QBIT_URL" Default="https://downloader.example.invalid" Type="Variable" Display="always" Required="true" Mask="false"/>

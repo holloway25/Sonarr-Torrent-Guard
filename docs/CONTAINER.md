@@ -138,8 +138,12 @@ download-side deletion is added.
 
 ## Prepared Unraid template
 
-`deploy/unraid.xml` is a version2 staging template based on Unraid's official
-starter. It pins the published reviewed runtime image by digest, references the
+`deploy/unraid.xml` is a version2 template based on Unraid's official starter.
+Its permanent name is `sonarr-torrent-guard`, with dedicated appdata of the same
+name: initial dry-run verification is a mode, not a disposable staging container.
+The same name/appdata can remain in use after the separately approved live cutover;
+removing a staging suffix does not enable live actions or issue permission.
+It pins the published reviewed runtime image by digest, references the
 approved darker PNG, uses bridge networking with no published ports and sets
 read-only root, non-root UID/GID1000:1000, dropped capabilities, no-new-privileges,
 a10second stop timeout and bounded Docker logs. API/password/username fields are
