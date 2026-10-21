@@ -2,10 +2,13 @@
 
 A gated single-test sender and read-only production verifier exist for review.
 Manual sender release gates are false; the separate unattended entry point needs
-an explicit expiring routine grant. Unit-tested requests do not establish production
-mutation behaviour, and no live test is currently authorized.
-Private-source downloads, the private archive helper, Docker deployment and the
-web UI remain separate future work. Existing seeding/removal policies stay intact.
+an explicit code/scope-bound trial or separately approved ongoing grant. See
+[unattended authorization](UNATTENDED-TRIAL.md). Unit-tested requests do not establish
+production mutation behaviour or implicitly authorize live operation.
+Private-source downloads remain protected; the private archive helper and web UI
+remain future work. Docker packaging is implemented, with separately approved
+deployment described in [container setup](CONTAINER.md). Existing seeding/removal
+policies stay intact.
 
 Fresh read-only assessment and a private SQLite journal are now implemented.
 Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):

@@ -109,7 +109,8 @@ class RoutineTests(unittest.TestCase):
 
     def test_ongoing_authority_cannot_be_changed_in_memory(self):
         authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
-        authority.value["enabled"] = False
+        # Still structurally valid and enabled: only the integrity check rejects it.
+        authority.value["grant_id"] = "a" * 64
         with self.assertRaises(SafetyError):
             authority.validate(self.f.config)
 

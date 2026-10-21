@@ -2,7 +2,8 @@ FROM python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 TZ=Australia/Melbourne
 WORKDIR /app
 LABEL org.opencontainers.image.licenses="GPL-3.0-only"
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata ca-certificates \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 guard && useradd --uid 1000 --gid 1000 --no-create-home guard \
     && mkdir /config && chown 1000:1000 /config && chmod 700 /config

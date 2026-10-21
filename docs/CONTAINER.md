@@ -9,13 +9,15 @@ for explicitly requested publication, never passed into the image build.
 
 ## Build and publication
 
-Pushes and PRs build/smoke-test without publishing or deploying. Manual Container
-workflow dispatch with `publish: true` publishes to GHCR in the repository-derived
-namespace, tagged `sha-<full-source-commit>`. This publishes a candidate, not a
+Pushes and PRs build/smoke-test without publishing or deploying. Daily maintenance
+builds and manual Container dispatch with `publish: true` publish tested candidates
+to GHCR in the repository-derived namespace, tagged
+`sha-<full-source-commit>-run-<run-id>-<attempt>`. This publishes a candidate, not a
 release: it does not change `latest`. After review passes, manually dispatch
 **Promote reviewed image** on `main` with the exact approved digest, its successful
 Container publication run ID, and `review_approved: true`. It checks the source
-revision against that successful run and tags the existing image as `latest`
+revision and exact digest in that run's immutable publication artifact before
+tagging the existing image as `latest`
 without rebuilding it. Neither pushes nor a scheduled job can promote a release.
 Only an operator's explicit review confirmation permits promotion; passing CI
 alone is not a substitute for that review.
@@ -23,8 +25,9 @@ alone is not a substitute for that review.
 The template uses `:latest`, so a host's existing image updater can pull reviewed
 releases. The immutable candidate digest remains available for audit/rollback.
 No host connection, host schedule or deployment is performed by these workflows.
-Dependency/base-image updates still need a new candidate build, tests and review
-before promotion. Rebuilding can update OS certificate/timezone packages even
+Dependabot proposes base-image/build-action updates; a daily fresh build refreshes
+available Debian packages. See [dependency maintenance](DEPENDENCY-MAINTENANCE.md).
+Updates still need tests and review before promotion. Rebuilding can update packages even
 for the same source. Application-code/scope changes still require fresh live
 authorization; a release tag does not bypass runtime permission checks.
 New GHCR packages default to private; package access/visibility is an operator

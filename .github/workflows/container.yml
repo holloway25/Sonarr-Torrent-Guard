@@ -9,6 +9,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Daily candidate refresh, 09:17/10:17 Melbourne time (AEST/AEDT).
+    - cron: '17 23 * * *'
 permissions:
   contents: read
 jobs:
@@ -26,10 +29,10 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -t .
           python3 tools/privacy_check.py --all
-      - name: Choose commit-specific image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Choose unique candidate image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - name: Build image
-        run: docker build --pull --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --tag "$IMAGE" .
+        run: docker build --pull --no-cache --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --tag "$IMAGE" .
       - name: Offline non-root read-only smoke check
         run: |
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /config:uid=1000,gid=1000,mode=0700 --tmpfs /tmp --env-file deploy/container.env.example "$IMAGE" --check-config
@@ -58,7 +61,7 @@ jobs:
           child.stdout.close()
           '
           trap 'docker rm --force guard-shutdown >/dev/null 2>&1 || true' EXIT
-          for attempt in $(seq 1 50); do
+          for _attempt in $(seq 1 50); do
             if docker logs guard-shutdown | grep -q waiting; then break; fi
             sleep 0.1
           done
@@ -67,12 +70,24 @@ jobs:
           docker stop -t 8 guard-shutdown
           test "$((SECONDS - started))" -lt 8
           test "$(docker inspect --format='{{.State.ExitCode}}' guard-shutdown)" = 0
-      - name: Publish only on explicit manual request
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+      - name: Publish tested maintenance or explicitly requested candidate
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker push "$IMAGE"
-          docker inspect --format='Published {{index .RepoDigests 0}}' "$IMAGE"
-          docker logout ghcr.io
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker push "$IMAGE" | tee "$RUNNER_TEMP/candidate-push.txt"
+          DIGEST=$(sed -nE 's/.*: digest: (sha256:[a-f0-9]{64}) size: [0-9]+$/\1/p' "$RUNNER_TEMP/candidate-push.txt")
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          python3 tools/release_evidence.py record --digest "$DIGEST" --output "$RUNNER_TEMP/publication.json"
+          printf 'Review candidate: %s\nDigest: %s\nRun: %s (attempt %s)\n' "$IMAGE" "$DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
+      - name: Store exact publication evidence for review and promotion
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publication.json
+          if-no-files-found: error
+          retention-days: 90
