@@ -457,7 +457,25 @@ class ContainerTests(unittest.TestCase):
                      "--stop-timeout=10", "--log-opt=max-size=10m", "--log-opt=max-file=3"):
             self.assertIn(flag, extra)
         self.assertNotIn("--privileged", extra)
-        self.assertRegex(root.findtext("Repository"), r"@sha256:[a-f0-9]{64}$")
+        self.assertTrue(root.findtext("Repository").endswith("/sonarr-torrent-guard:latest"))
+
+    def test_latest_promotion_is_manual_reviewed_and_never_rebuilds_candidate(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/promote-image.yml").read_text()
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotIn("  push:", workflow)
+        self.assertNotIn("  pull_request:", workflow)
+        self.assertNotIn("  schedule:", workflow)
+        self.assertIn("inputs.review_approved == true", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("default: false", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn(".conclusion", workflow)
+        self.assertIn(".github/workflows/container.yml", workflow)
+        self.assertIn("test \"$ACTUAL_REVISION\" = \"$REVISION\"", workflow)
+        self.assertIn('docker tag "$IMAGE@$CANDIDATE_DIGEST" "$IMAGE:latest"', workflow)
+        self.assertIn('latest: digest: $CANDIDATE_DIGEST ', workflow)
+        self.assertNotIn("docker build", workflow)
 
     def test_unraid_template_references_approved_transparent_icon(self):
         import xml.etree.ElementTree as ET

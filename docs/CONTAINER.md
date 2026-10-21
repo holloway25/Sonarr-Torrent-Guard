@@ -11,9 +11,22 @@ for explicitly requested publication, never passed into the image build.
 
 Pushes and PRs build/smoke-test without publishing or deploying. Manual Container
 workflow dispatch with `publish: true` publishes to GHCR in the repository-derived
-namespace, tagged `sha-<full-source-commit>`. No latest tag, self-update or Unraid
-deployment is added. Pin the resulting image digest for an approved deployment:
-rebuilding can update OS certificate/timezone packages even for the same source.
+namespace, tagged `sha-<full-source-commit>`. This publishes a candidate, not a
+release: it does not change `latest`. After review passes, manually dispatch
+**Promote reviewed image** on `main` with the exact approved digest, its successful
+Container publication run ID, and `review_approved: true`. It checks the source
+revision against that successful run and tags the existing image as `latest`
+without rebuilding it. Neither pushes nor a scheduled job can promote a release.
+Only an operator's explicit review confirmation permits promotion; passing CI
+alone is not a substitute for that review.
+
+The template uses `:latest`, so a host's existing image updater can pull reviewed
+releases. The immutable candidate digest remains available for audit/rollback.
+No host connection, host schedule or deployment is performed by these workflows.
+Dependency/base-image updates still need a new candidate build, tests and review
+before promotion. Rebuilding can update OS certificate/timezone packages even
+for the same source. Application-code/scope changes still require fresh live
+authorization; a release tag does not bypass runtime permission checks.
 New GHCR packages default to private; package access/visibility is an operator
 decision. Never paste registry/API credentials into issues or build logs.
 New builds carry `GPL-3.0-only` licence metadata and `/app/LICENSE`; the workflow
@@ -157,7 +170,7 @@ Its permanent name is `sonarr-torrent-guard`, with dedicated appdata of the same
 name: initial dry-run verification is a mode, not a disposable staging container.
 The same name/appdata can remain in use after the separately approved live cutover;
 removing a staging suffix does not enable live actions or issue permission.
-It pins the published reviewed runtime image by digest, references the
+It follows the reviewed `latest` release tag, references the
 approved darker PNG, uses bridge networking with no published ports and sets
 read-only root, non-root UID/GID1000:1000, dropped capabilities, no-new-privileges,
 a10second stop timeout and bounded Docker logs. API/password/username fields are
