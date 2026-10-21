@@ -88,7 +88,7 @@ def read_json(path):
     return json.loads(Path(path).read_text(), object_pairs_hook=no_duplicate_keys)
 
 
-def verify_archive(path, archive_digest, run, repository, run_id, digest):
+def verify_archive(path, archive_digest, run, repository, run_id, digest=None):
     require(digest_valid(archive_digest))
     path = Path(path)
     require(path.stat().st_size <= 1024 * 1024)
@@ -97,7 +97,9 @@ def verify_archive(path, archive_digest, run, repository, run_id, digest):
         require(archive.namelist() == ["publication.json"])
         require(archive.getinfo("publication.json").file_size <= 16384)
         record = json.loads(archive.read("publication.json"), object_pairs_hook=no_duplicate_keys)
-    return validate_record(record, run, repository, run_id, digest)
+    require(isinstance(record, dict))
+    expected = record.get("digest") if digest is None else digest
+    return validate_record(record, run, repository, run_id, expected)
 
 
 def main():
@@ -106,7 +108,7 @@ def main():
     record = sub.add_parser("record")
     record.add_argument("--digest", required=True)
     record.add_argument("--output", type=Path, required=True)
-    for operation in ("select", "verify"):
+    for operation in ("select", "verify", "candidate"):
         command = sub.add_parser(operation)
         command.add_argument("--run", type=Path, required=True)
         command.add_argument("--repository", required=True)
@@ -116,7 +118,8 @@ def main():
         else:
             command.add_argument("--archive", type=Path, required=True)
             command.add_argument("--archive-digest", required=True)
-            command.add_argument("--digest", required=True)
+            if operation == "verify":
+                command.add_argument("--digest", required=True)
     args = parser.parse_args()
     try:
         if args.operation == "record":
@@ -136,8 +139,9 @@ def main():
             if args.operation == "select":
                 print(json.dumps(select_artifact(read_json(args.artifacts), run, args.repository, args.run_id)))
             else:
-                verify_archive(args.archive, args.archive_digest, run, args.repository, args.run_id, args.digest)
-                print("Exact published run/digest evidence verified")
+                record = verify_archive(args.archive, args.archive_digest, run, args.repository, args.run_id,
+                                        args.digest if args.operation == "verify" else None)
+                print(json.dumps(record) if args.operation == "candidate" else "Exact published run/digest evidence verified")
         return 0
     except Exception:
         # API, JSON and archive content are untrusted diagnostic data.

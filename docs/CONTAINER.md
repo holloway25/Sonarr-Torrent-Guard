@@ -1,11 +1,13 @@
 # Docker / Unraid: dry-run by default, explicitly authorized live operation
 
-GitHub's Container workflow tests source/privacy, builds a digest-pinned official
-Python-base image and runs offline non-root/read-only smoke checks. Build context
+GitHub's Container workflow tests source/privacy, builds an official Python-base
+image and runs offline non-root/read-only smoke checks. Normal builds use the
+reviewed base pin; maintenance resolves a fresh digest in the same compatible
+Python/distro family. Build context
 and COPY use exact source allowlists, plus the GPLv3 licence text. No config, grant, API key, login, journal,
 logs, handoff, Git checkout, examples or tests are copied into the image. No
 credentials are build arguments. GitHub's short-lived registry token is used only
-for explicitly requested publication, never passed into the image build.
+for authorized publication, never passed into the image build.
 
 ## Build and publication
 
@@ -13,21 +15,25 @@ Pushes and PRs build/smoke-test without publishing or deploying. Daily maintenan
 builds and manual Container dispatch with `publish: true` publish tested candidates
 to GHCR in the repository-derived namespace, tagged
 `sha-<full-source-commit>-run-<run-id>-<attempt>`. This publishes a candidate, not a
-release: it does not change `latest`. After review passes, manually dispatch
+release: candidate publication itself does not change `latest`. A separate
+automatic release workflow compares its exact publication evidence, copied
+application/licence bytes and build instructions with the current release. Only
+compatible dependency-only changes may advance `latest` automatically.
+Application/build-policy changes stay held. After review passes, manually dispatch
 **Promote reviewed image** on `main` with the exact approved digest, its successful
 Container publication run ID, and `review_approved: true`. It checks the source
 revision and exact digest in that run's immutable publication artifact before
 tagging the existing image as `latest`
-without rebuilding it. Neither pushes nor a scheduled job can promote a release.
-Only an operator's explicit review confirmation permits promotion; passing CI
-alone is not a substitute for that review.
+without rebuilding it. Passing CI alone cannot release changed application code;
+that path still requires an operator's explicit review confirmation.
 
 The template uses `:latest`, so a host's existing image updater can pull reviewed
 releases. The immutable candidate digest remains available for audit/rollback.
 No host connection, host schedule or deployment is performed by these workflows.
 Dependabot proposes base-image/build-action updates; a daily fresh build refreshes
 available Debian packages. See [dependency maintenance](DEPENDENCY-MAINTENANCE.md).
-Updates still need tests and review before promotion. Rebuilding can update packages even
+Dependency-only updates are released after tests and unchanged-application checks;
+application changes still require review. Rebuilding can update packages even
 for the same source. Application-code/scope changes still require fresh live
 authorization; a release tag does not bypass runtime permission checks.
 New GHCR packages default to private; package access/visibility is an operator

@@ -131,7 +131,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
             result = subprocess.run(args + [candidate], capture_output=True, text=True)
             self.assertEqual(result.returncode, expected, result.stdout)
 
-    def test_maintenance_is_candidate_only_and_dependency_updates_are_proposals(self):
+    def test_build_publishes_candidates_only_and_dependency_updates_are_proposals(self):
         root = Path(__file__).resolve().parents[2]
         dependabot = (root / ".github/dependabot.yml").read_text()
         for value in ("package-ecosystem: docker", "package-ecosystem: github-actions", "interval: daily"):
@@ -146,6 +146,19 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertNotIn(":latest", workflow)
         self.assertNotIn("auto-merge", dependabot)
         self.assertIn("apt-get upgrade -y", (root / "Dockerfile").read_text())
+
+    def test_actual_candidate_cli_selects_only_verified_publication_digest(self):
+        tool = Path(__file__).resolve().parents[1] / "release_evidence.py"
+        path, digest = self.archive()
+        run = self.path / "run.json"
+        run.write_text(json.dumps(self.run))
+        args = [sys.executable, str(tool), "candidate", "--run", str(run), "--repository", self.repo,
+                "--run-id", "1001", "--archive", str(path), "--archive-digest"]
+        result = subprocess.run(args + [digest], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout), self.record)
+        result = subprocess.run(args + ["sha256:" + "f" * 64], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

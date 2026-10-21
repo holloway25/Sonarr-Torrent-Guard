@@ -1,0 +1,96 @@
+name: Release tested dependency refresh
+on:
+  workflow_run:
+    workflows: [Container]
+    types: [completed]
+permissions:
+  contents: read
+concurrency:
+  group: reviewed-image-promotion
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    env:
+      CANDIDATE_RUN_ID: ${{ github.event.workflow_run.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact publication and unchanged released application
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]]
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > "$RUNNER_TEMP/run.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/artifacts.json"
+          RUN_ATTEMPT=$(jq -r '.run_attempt' "$RUNNER_TEMP/run.json")
+          PUBLICATION_NAME="publication-$CANDIDATE_RUN_ID-$RUN_ATTEMPT"
+          COUNT=$(jq --arg name "$PUBLICATION_NAME" '[.[] | .artifacts[] | select(.name == $name)] | length' "$RUNNER_TEMP/artifacts.json")
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No published candidate in this run; latest unchanged" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ARTIFACT=$(python3 tools/release_evidence.py select --run "$RUNNER_TEMP/run.json" --artifacts "$RUNNER_TEMP/artifacts.json" --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN_ID")
+          ARTIFACT_ID=$(jq -r '.id' <<< "$ARTIFACT")
+          ARCHIVE_DIGEST=$(jq -r '.digest' <<< "$ARTIFACT")
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUNNER_TEMP/publication.zip"
+          RECORD=$(python3 tools/release_evidence.py candidate --run "$RUNNER_TEMP/run.json" --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN_ID" --archive "$RUNNER_TEMP/publication.zip" --archive-digest "$ARCHIVE_DIGEST")
+          DIGEST=$(jq -r '.digest' <<< "$RECORD")
+          REVISION=$(jq -r '.revision' <<< "$RECORD")
+          ATTEMPT=$(jq -r '.run_attempt' <<< "$RECORD")
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker pull "$IMAGE:latest"
+          BASELINE_REF=$(docker image inspect --format='{{index .RepoDigests 0}}' "$IMAGE:latest")
+          [[ "$BASELINE_REF" == "$IMAGE"@sha256:* ]]
+          LABELS=$(docker image inspect --format='{{json .Config.Labels}}' "$BASELINE_REF")
+          BASELINE_REVISION=$(jq -r '.["org.opencontainers.image.revision"]' <<< "$LABELS")
+          if python3 tools/dependency_release.py compare --candidate "$REVISION" --baseline "$BASELINE_REVISION"; then
+            echo "Released application unchanged; approved dependency-only build policy verified"
+          else
+            RESULT=$?
+            if [ "$RESULT" -eq 2 ]; then
+              echo "Application/build change held for manual review; latest unchanged" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit "$RESULT"
+          fi
+          BASELINE_RUN=$(jq -r '.["io.stguard.build.run-id"] // ""' <<< "$LABELS")
+          BASELINE_ATTEMPT=$(jq -r '.["io.stguard.build.attempt"] // ""' <<< "$LABELS")
+          if python3 tools/dependency_release.py newer --candidate-run "$CANDIDATE_RUN_ID" --candidate-attempt "$ATTEMPT" --baseline-run "$BASELINE_RUN" --baseline-attempt "$BASELINE_ATTEMPT"; then
+            echo "Candidate is newer than the current release"
+          else
+            RESULT=$?
+            if [ "$RESULT" -eq 2 ]; then
+              echo "Older/repeated or unorderable build held; latest unchanged" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            exit "$RESULT"
+          fi
+          docker pull "$IMAGE@$DIGEST"
+          LABELS=$(docker image inspect --format='{{json .Config.Labels}}' "$IMAGE@$DIGEST")
+          test "$(jq -r '.["org.opencontainers.image.revision"]' <<< "$LABELS")" = "$REVISION"
+          test "$(jq -r '.["io.stguard.build.run-id"]' <<< "$LABELS")" = "$CANDIDATE_RUN_ID"
+          test "$(jq -r '.["io.stguard.build.attempt"]' <<< "$LABELS")" = "$ATTEMPT"
+          test "$(jq -r '.["org.opencontainers.image.base.name"]' <<< "$LABELS")" = python:3.12-slim-bookworm
+          BASE_DIGEST=$(jq -r '.["org.opencontainers.image.base.digest"]' <<< "$LABELS")
+          [[ "$BASE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          HASH_SCRIPT=$(python3 tools/dependency_release.py image-script)
+          OLD_CODE=$(docker run --rm --network none --read-only --entrypoint python3 "$BASELINE_REF" -c "$HASH_SCRIPT")
+          NEW_CODE=$(docker run --rm --network none --read-only --entrypoint python3 "$IMAGE@$DIGEST" -c "$HASH_SCRIPT")
+          [[ "$OLD_CODE" =~ ^[a-f0-9]{64}$ ]]
+          test "$NEW_CODE" = "$OLD_CODE"
+          docker tag "$IMAGE@$DIGEST" "$IMAGE:latest"
+          docker push "$IMAGE:latest" | tee "$RUNNER_TEMP/dependency-release.txt"
+          grep -F "latest: digest: $DIGEST " "$RUNNER_TEMP/dependency-release.txt"
+          printf 'Automatic dependency-only release: %s\nApplication files unchanged; existing grant remains code-bound.\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

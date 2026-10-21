@@ -31,8 +31,20 @@ jobs:
           python3 tools/privacy_check.py --all
       - name: Choose unique candidate image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+      - name: Refresh compatible Python and Debian base for maintenance
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        run: |
+          set -euo pipefail
+          docker pull python:3.12-slim-bookworm
+          BASE_REF=$(docker image inspect --format='{{index .RepoDigests 0}}' python:3.12-slim-bookworm)
+          BASE_DIGEST="${BASE_REF##*@}"
+          [[ "$BASE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker run --rm --network none --read-only --entrypoint python3 "python@$BASE_DIGEST" -c 'import sys; from pathlib import Path; assert sys.version_info[:2] == (3, 12); assert "VERSION_CODENAME=bookworm" in Path("/etc/os-release").read_text()'
+          python3 tools/dependency_release.py render --digest "$BASE_DIGEST" --output "$RUNNER_TEMP/dependency.Dockerfile"
+          echo "BASE_DIGEST=$BASE_DIGEST" >> "$GITHUB_ENV"
+          echo "BUILD_DOCKERFILE=$RUNNER_TEMP/dependency.Dockerfile" >> "$GITHUB_ENV"
       - name: Build image
-        run: docker build --pull --no-cache --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --tag "$IMAGE" .
+        run: docker build --pull --no-cache --file "${BUILD_DOCKERFILE:-Dockerfile}" --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.base.name=python:3.12-slim-bookworm" --label "org.opencontainers.image.base.digest=${BASE_DIGEST:-repository-pin}" --label "io.stguard.build.run-id=$GITHUB_RUN_ID" --label "io.stguard.build.attempt=$GITHUB_RUN_ATTEMPT" --tag "$IMAGE" .
       - name: Offline non-root read-only smoke check
         run: |
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /config:uid=1000,gid=1000,mode=0700 --tmpfs /tmp --env-file deploy/container.env.example "$IMAGE" --check-config
