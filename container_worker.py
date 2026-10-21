@@ -22,7 +22,7 @@ CYCLE_TIMEOUT = 210
 CYCLE_POLL_SECONDS = 0.25
 TERMINATE_TIMEOUT = 2
 KILL_TIMEOUT = 2
-CONTAINER_LIVE_RELEASE_ENABLED = False  # Review and migration approval required.
+CONTAINER_LIVE_RELEASE_ENABLED = True  # Explicit mode AND reviewed code/scope grant remain mandatory.
 STOP = threading.Event()
 CHILD = None
 
@@ -242,6 +242,9 @@ def main():
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             path = configure(os.environ)
+            if mode == "live":
+                from authorization import RoutineAuthorization
+                RoutineAuthorization.load(CONFIG_DIR / "routine-authorization.json", load_config(path))
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0

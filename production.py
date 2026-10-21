@@ -508,7 +508,7 @@ def execute_public_attempt(config, qb, apis, journal, report, approval):
 
 
 def execute_routine_attempt(config, qb, apis, journal, report, authority):
-    """Delegated permission is explicit and expiring, not a fabricated human test approval."""
+    """Explicit delegated permission still produces an expiring per-action token."""
     from authorization import RoutineAuthorization
     import secrets
     if not isinstance(authority, RoutineAuthorization):
@@ -518,7 +518,7 @@ def execute_routine_attempt(config, qb, apis, journal, report, authority):
     # cannot authorize another target or outlive the grant; no user is prompted.
     approval = {k: report[k] for k in ("instance", "hash", "ownership_fingerprint", "manifest_fingerprint")}
     approval.update(operation="sonarr_fail_remove_retry", nonce=secrets.token_hex(32),
-                    expires_at=min(time.time() + 120, authority.value["expires_at"]))
+                    expires_at=authority.execution_expiry())
     return _execute(config, qb, apis, journal, report, approval, "public_attempt", authority=authority)
 
 

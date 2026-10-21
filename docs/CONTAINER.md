@@ -1,4 +1,4 @@
-# Docker / Unraid: dry-run review candidate
+# Docker / Unraid: dry-run by default, explicitly authorized live operation
 
 GitHub's Container workflow tests source/privacy, builds a digest-pinned official
 Python-base image and runs offline non-root/read-only smoke checks. Build context
@@ -42,7 +42,7 @@ by the operator; they are not claimed to be hidden from root.
 
 | Variables | Meaning |
 | --- | --- |
-| `STGUARD_MODE` | Defaults to `dry-run`; `live` is currently refused |
+| `STGUARD_MODE` | Defaults to `dry-run`; `live` additionally requires a private valid code/scope-bound grant |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
 | `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
@@ -121,17 +121,21 @@ Docker log rotation on the host too. No automatic journal archival is enabled.
 
 ## Live migration is separate
 
-`CONTAINER_LIVE_RELEASE_ENABLED=false`; setting live mode alone cannot activate
-it even if a grant is present. The image never issues or renews grants. Existing
-seven-day maximum/expiry rules remain; moving to Unraid is NOT indefinite live
-authorization. Container worker source is included in the approval code digest.
+`CONTAINER_LIVE_RELEASE_ENABLED=true` releases only the reviewed container entry
+point, not permission to send. Setting live mode alone cannot activate it: startup
+requires a private valid code/scope-bound grant, including for `--check-config`.
+The routine worker reloads/revalidates permission every cycle and before dispatch.
+The image never issues or renews grants. Existing trial grants retain their
+seven-day limit; ongoing operation requires a separately approved explicit ongoing
+grant, not migration of an expired trial. Container worker source is included in
+the approval code digest. See [authorization](UNATTENDED-TRIAL.md).
 
 Before cutover:
 
 1. Review packaging and the exact source/image digest; validate dry-run on Unraid
    using a separate staging appdata directory and real runtime credentials.
-2. Agree live permission and expiry; enable the reviewed container gate only
-   after approval. Keep retention application separately gated.
+2. Agree trial expiry or explicit ongoing permission for the reviewed image.
+   Keep retention application separately gated.
 3. STOP and disable the LXC live service/timer before ANY container live action.
 4. Take a private consistent backup while stopped and transfer the ENTIRE journal,
    archive, cursor and identity evidence, not just credentials/hashes. Never copy

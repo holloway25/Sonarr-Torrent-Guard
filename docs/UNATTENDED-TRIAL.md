@@ -1,10 +1,11 @@
-# Explicit unattended public trial
+# Explicit unattended public authorization
 
 `routine.py` is the actual unattended entry point. Unlike `public.py`, it may
 send qualifying actions under a separate explicit routine grant; it does not ask
 the user for a new approval per torrent or reuse a controlled-test approval.
-This is a bounded trial, not indefinite live permission. Unit defaults and the
-ordinary guard/public commands remain non-live.
+Seven-day trials and separately approved ongoing operation are supported. Trial
+permission never becomes ongoing implicitly. Unit defaults and the ordinary
+guard/public commands remain non-live.
 
 ## Required grant
 
@@ -12,7 +13,7 @@ The operator must issue an external `routine-authorization.json` only after
 approving the reviewed code and configured public workflow. The file and parent
 directory must be owner-private, outside the checkout. It contains exactly:
 
-- `enabled`: true only for an explicitly approved trial.
+- `enabled`: true only for explicitly approved operation.
 - `rule`: `public-sonarr-cleanup-v3` (metadata removal without blocklisting plus
   separately authorized Sonarr episode search).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
@@ -21,6 +22,13 @@ directory must be owner-private, outside the checkout. It contains exactly:
   requires explicit operator approval and a newly issued grant; no automatic renewal.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
 - `code_digest`: `authorization.code_digest()` for the reviewed application files.
+
+An ongoing grant additionally requires `authorization_mode: "ongoing"` and
+`expires_at: null`. Its finite, non-future `issued_at`, all other fields and all
+code/scope checks are still required. Null expiry without this explicit mode,
+unknown modes, mixed trial/ongoing formats and extra fields fail closed. Ongoing
+permission has no scheduled expiry; it does not authorize different code,
+endpoints, source policy or workflow. Updates require a new reviewed grant.
 
 There is no automatically issued or installed grant. Missing, disabled, expired,
 future-dated, malformed, publicly readable or wrong-code grants fail closed.
@@ -57,7 +65,8 @@ use native retry; the separately authorized metadata policy uses the exact episo
 search described in [metadata retry](METADATA-RETRY.md).
 
 Per-action execution tokens are generated under this delegated permission, bound
-to one assessment and capped by the grant expiry. They are not fabricated human
+to one assessment, capped at 120 seconds and by the trial expiry when applicable.
+Ongoing grants never create non-expiring per-action tokens. They are not fabricated human
 test approvals. Each action context records the routine-grant digest so the
 authority can be correlated with the protected external grant and operational
 reports. Save the issued grant with operational records outside the repository.
@@ -129,8 +138,9 @@ timestamp. Existing legacy cancellations without a reason are left unchanged.
 Trial expiry stops new actions automatically, though an installed timer may keep
 recording waiting runs until disabled. Active journal capacity remains 1000 rows and
 fails closed when full; no old or uncertain action is purged. This bounds the
-trial safely without introducing an unreviewed retention policy. Indefinite
-operation still needs reviewed archive/retention management and renewed authority.
+trial safely without introducing an unreviewed retention policy. Ongoing
+operation keeps the same capacity hold; it does not enable automatic archival.
+Inspect capacity and explicitly approve retention application when needed.
 An explicit [retention candidate](JOURNAL-RETENTION.md) is now implemented with
 application disabled. It preserves archived records in duplicate/ownership safety
 checks and never archives unresolved records. It neither extends a trial nor

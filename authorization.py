@@ -1,4 +1,4 @@
-"""Explicit, expiring routine permission; never inferred from test approvals."""
+"""Explicit routine permission; ongoing authority must be separately selected."""
 
 import hashlib
 import json
@@ -42,7 +42,10 @@ def scope_digest(config):
 class RoutineAuthorization:
     def __init__(self, value, config):
         fields = {"enabled", "rule", "grant_id", "issued_at", "expires_at", "scope_digest", "code_digest"}
-        if not isinstance(value, dict) or set(value) != fields:
+        if (not isinstance(value, dict)
+                or set(value) not in (fields, fields | {"authorization_mode"})
+                or ("authorization_mode" in value and value["authorization_mode"] != "ongoing")
+                or (value.get("authorization_mode") == "ongoing" and value["expires_at"] is not None)):
             raise SafetyError("routine_authorization_invalid")
         self.value = json.loads(json.dumps(value))
         self.identifier = digest(self.value)
@@ -53,13 +56,20 @@ class RoutineAuthorization:
     def validate(self, config, report=None):
         v = self.value
         now = time.time()
-        times = (v["issued_at"], v["expires_at"])
+        ongoing = v.get("authorization_mode") == "ongoing"
+        times = (v["issued_at"],) if ongoing else (v["issued_at"], v["expires_at"])
+        time_invalid = any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t)
+                           for t in times)
+        if not time_invalid:
+            if ongoing:
+                time_invalid = v["issued_at"] > now or v["expires_at"] is not None
+            else:
+                time_invalid = (not v["issued_at"] <= now < v["expires_at"] or
+                    not 0 < v["expires_at"] - v["issued_at"] <= MAX_TRIAL_SECONDS)
         if (digest(v) != self.identifier or v["enabled"] is not True or v["rule"] != RULE
                 or not valid_digest(v["grant_id"]) or not valid_digest(v["code_digest"])
                 or not valid_digest(v["scope_digest"])
-                or any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) for t in times)
-                or not v["issued_at"] <= now < v["expires_at"]
-                or not 0 < v["expires_at"] - v["issued_at"] <= MAX_TRIAL_SECONDS
+                or time_invalid
                 or v["scope_digest"] != scope_digest(config)
                 or config.get("minimum_age_seconds", 120) < 120):
             raise SafetyError("routine_authorization_expired_or_scope_changed")
@@ -67,6 +77,11 @@ class RoutineAuthorization:
                 or report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True
                 or classify_source(config["sonarr"][report["instance"]]["indexers"], report.get("indexer")) != "public"):
             raise SafetyError("routine_candidate_not_authorized")
+
+    def execution_expiry(self):
+        """Even an ongoing grant delegates at most 120 seconds to one action."""
+        expiry = time.time() + 120
+        return expiry if self.value.get("authorization_mode") == "ongoing" else min(expiry, self.value["expires_at"])
 
     @classmethod
     def load(cls, path, config):

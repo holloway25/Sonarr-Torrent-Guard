@@ -175,8 +175,8 @@ class ContainerTests(unittest.TestCase):
         self.assertNotIn("private-marker", output.getvalue())
         self.assertIs(json.loads(output.getvalue())["actions_sent"], False)
 
-    def test_live_and_invalid_modes_fail_before_configuration_or_api_work(self):
-        for mode in ("live", "LIVE", "false", "unknown"):
+    def test_invalid_modes_fail_before_configuration_or_api_work(self):
+        for mode in ("LIVE", "false", "unknown"):
             output = io.StringIO()
             with self.subTest(mode=mode), patch.dict(os.environ, {"STGUARD_MODE": mode}, clear=True), patch(
                     "sys.argv", ["container_worker.py", "--once"]), patch.object(worker, "configure") as configure, \
@@ -185,6 +185,46 @@ class ContainerTests(unittest.TestCase):
                 self.assertEqual(worker.main(), 1)
             configure.assert_not_called()
             self.assertNotIn(mode, output.getvalue())
+
+    def test_live_mode_without_grant_cannot_start_a_cycle(self):
+        env = dict(self.env, STGUARD_MODE="live")
+        with patch.dict(os.environ, env, clear=True), patch("sys.argv", ["container_worker.py", "--once"]), \
+                patch.object(worker, "run_cycle") as cycle, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(worker.main(), 1)
+        cycle.assert_not_called()
+
+    def test_live_mode_requires_exact_private_grant_even_for_config_check(self):
+        import secrets
+        from authorization import RULE, RoutineAuthorization, code_digest, scope_digest
+        from safety import SafetyError
+        env = dict(self.env, STGUARD_MODE="live")
+        config = worker.runtime_config(env)
+        grant = {"enabled": True, "rule": RULE, "grant_id": secrets.token_hex(32),
+                 "issued_at": time.time() - 1, "expires_at": None, "authorization_mode": "ongoing",
+                 "scope_digest": scope_digest(config), "code_digest": code_digest()}
+        path = self.path / "routine-authorization.json"
+        for changes, expected in (({}, 0), ({"enabled": False}, 1), ({"code_digest": "e" * 64}, 1),
+                                  ({"scope_digest": "f" * 64}, 1)):
+            worker.atomic_json(path, dict(grant, **changes))
+            with self.subTest(changes=changes), patch.dict(os.environ, env, clear=True), patch(
+                    "sys.argv", ["container_worker.py", "--check-config"]), patch.object(
+                    worker, "run_cycle") as cycle, contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(worker.main(), expected)
+            cycle.assert_not_called()
+        worker.atomic_json(path, grant)
+        path.chmod(0o644)
+        with self.assertRaises(SafetyError):
+            RoutineAuthorization.load(path, config)
+
+    def test_live_scheduler_invokes_granted_routine_with_no_embedded_secrets(self):
+        process = Mock(); process.wait.return_value = 0
+        with patch("subprocess.Popen", return_value=process) as popen:
+            self.assertEqual(worker.run_cycle("live", self.path / "connections.json"), 0)
+        args = popen.call_args.args[0]
+        self.assertTrue(args[1].endswith("routine.py"))
+        self.assertIn("--live", args)
+        self.assertEqual(args[args.index("--authorization") + 1], str(self.path / "routine-authorization.json"))
 
     def test_dry_run_is_default_and_loop_waits_ten_minutes_after_cycle(self):
         env = dict(self.env); env.pop("STGUARD_MODE")

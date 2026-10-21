@@ -1,4 +1,4 @@
-"""A time-limited unattended public worker; explicit routine permission required."""
+"""An unattended public worker; explicit code/scope-bound permission required."""
 
 import argparse
 import copy
@@ -53,7 +53,9 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
         if on_action is not None:
             on_action(actions[-1])
     return {"mode": "routine", "live_authorized": True, "status": "completed", "retry_after_seconds": 600,
-            "grant_expires_at": authority.value["expires_at"], "assessment": proposal["assessment"],
+            "grant_expires_at": authority.value["expires_at"],
+            "grant_authorization_mode": authority.value.get("authorization_mode", "trial"),
+            "assessment": proposal["assessment"],
             "recovery": proposal["recovery"], "actions": actions}
 
 

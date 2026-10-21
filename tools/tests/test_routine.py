@@ -87,6 +87,49 @@ class RoutineTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 self.authority.validate(self.f.config, dict(self.f.report, **changes))
 
+    def ongoing_grant(self):
+        return dict(self.grant, authorization_mode="ongoing", expires_at=None)
+
+    def test_ongoing_authority_is_explicit_and_does_not_extend_legacy_trial(self):
+        authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
+        with patch("time.time", return_value=self.grant["issued_at"] + MAX_TRIAL_SECONDS * 10):
+            authority.validate(self.f.config, self.f.report)
+        for changes in ({"authorization_mode": "trial"}, {"authorization_mode": True},
+                        {"authorization_mode": None}, {"expires_at": time.time() + 3600}):
+            with self.subTest(changes=changes), self.assertRaises(SafetyError):
+                RoutineAuthorization(dict(self.ongoing_grant(), **changes), self.f.config)
+        with self.assertRaises(SafetyError):
+            RoutineAuthorization(dict(self.grant, expires_at=None), self.f.config)
+
+    def test_ongoing_grant_still_checks_time_code_scope_and_enabled(self):
+        for changes in ({"issued_at": time.time() + 60}, {"issued_at": True}, {"issued_at": float("nan")},
+                        {"enabled": False}, {"scope_digest": "e" * 64}, {"code_digest": "f" * 64}):
+            with self.subTest(changes=changes), self.assertRaises(SafetyError):
+                RoutineAuthorization(dict(self.ongoing_grant(), **changes), self.f.config)
+
+    def test_ongoing_authority_cannot_be_changed_in_memory(self):
+        authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
+        authority.value["enabled"] = False
+        with self.assertRaises(SafetyError):
+            authority.validate(self.f.config)
+
+    def test_ongoing_grant_only_delegates_short_lived_target_token(self):
+        authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
+        stamp = time.time()
+        with patch("time.time", return_value=stamp), patch("production._execute") as execute:
+            production.execute_routine_attempt(self.f.config, self.f.qb, self.f.apis,
+                                              self.f.journal, self.f.report, authority)
+        self.assertEqual(execute.call_args.args[5]["expires_at"], stamp + 120)
+        self.assertEqual(execute.call_args.args[5]["hash"], self.f.report["hash"])
+
+    def test_ongoing_authority_can_complete_same_existing_safety_workflow(self):
+        self.authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=lambda *a: self.f.results()) as send:
+            row = self.execute()
+        self.assertEqual(row["stage"], "cleanup_resolved")
+        send.assert_called_once()
+
     def test_permission_withdrawn_during_final_checks_blocks_sender(self):
         calls = []
         def connection(*args):

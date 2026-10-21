@@ -7,20 +7,21 @@ Distributed without warranty; see the licence for its full terms.
 A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
-are currently enabled by default. An explicitly granted, expiring routine CLI is
-available for review. A metadata-only removal and additional episode search is
+are currently enabled by default. The routine CLI requires explicit code/scope-bound
+trial or ongoing permission. A metadata-only removal and additional episode search is
 implemented with a reviewed policy gate; actual sending still requires separate
 authorization and sender gates. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
-## Docker / Unraid review candidate
+## Docker / Unraid
 
 A non-root Docker image and GitHub build/publish workflow are implemented.
 Runtime environment variables supply connections and credentials; nothing private
 is baked into the image. Persistent appdata keeps journal/config/logs across
-updates. The container defaults to dry-run; its live gate remains disabled and
-publishing never deploys it. See [container setup](docs/CONTAINER.md) before any
-Unraid staging or migration. Retention application remains separately disabled.
+updates. The container defaults to dry-run; live mode additionally requires a
+private valid grant, and publishing never deploys it. See
+[container setup](docs/CONTAINER.md) before activation or migration.
+Retention application remains separately disabled.
 
 ## Setup
 
@@ -309,10 +310,11 @@ dry-run CLI. They are not installed or enabled. The timer waits ten minutes afte
 each completed cycle, avoids catch-up bursts and cannot enable either sender.
 Paths are templates; review them for the chosen installation before any use.
 
-## Unattended trial entry point
+## Unattended entry point
 
 `routine.py --live` uses a separate explicit, owner-private authorization grant
-bound to the reviewed application and configured scope, for at most seven days.
+bound to the reviewed application and configured scope. Trial grants last at most
+seven days; ongoing operation requires a separately approved explicit ongoing grant.
 There is no installed/enabled grant by default. It uses the same coordinator and
 Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
 action and grant digest; old uncertain evidence is preserved, while a strictly
@@ -328,13 +330,16 @@ maintenance, expiry, reporting and capacity boundaries.
 - Review the disabled sender and production verifier, then explicitly approve a
   controlled single-torrent integration test separately. Define independent data
   deletion confirmation. Guard/public commands remain dry-run; the routine worker
-  requires explicit live mode and a valid, unexpired grant.
+  requires explicit live mode and a valid code/scope-bound grant (an unexpired
+  trial or separately approved ongoing permission).
 - Longer term: define private split-RAR selection, share access, safe extraction, atomic
   publication, positive import confirmation and exact helper-file cleanup.
-- Package for containers once runtime and storage design are confirmed; add a
-  read-only web UI using report events after the public workflow is settled.
+- Validate the existing container image and Unraid template in a separately
+  approved deployment; packaging is implemented, but packaging checks do not
+  establish live integration behaviour. Add a read-only web UI using report
+  events after the public workflow is settled.
 
 Design reference: [qBittorrent checker](https://github.com/sergiobaiao/qbittorrent-checker).
 This is an independent implementation; no upstream script or exclusion list is
-bundled. Any future source reuse requires licensing review. A project license has
-not yet been selected.
+bundled. Any future source reuse requires licensing review. This project is
+licensed under GPL-3.0-only; see [LICENSE](LICENSE).
