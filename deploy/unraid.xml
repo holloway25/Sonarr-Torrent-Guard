@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Container version="2">
   <Name>sonarr-torrent-guard</Name>
-  <Repository>ghcr.io/REPLACE_ME/sonarr-torrent-guard@sha256:e786a27b3a39c4f31a374e84a82c049ee60e6bb6afa53cca0f9a2959b16d06dc</Repository>
+  <Repository>ghcr.io/REPLACE_ME/sonarr-torrent-guard@sha256:6888760996125e609fc877eea457adada099c3baa9fe2e49472ddd57e1dd848b</Repository>
   <Registry>https://github.com/REPLACE_ME/Sonarr-Torrent-Guard/pkgs/container/sonarr-torrent-guard</Registry>
   <Project>https://github.com/REPLACE_ME/Sonarr-Torrent-Guard</Project>
   <Network>bridge</Network>
