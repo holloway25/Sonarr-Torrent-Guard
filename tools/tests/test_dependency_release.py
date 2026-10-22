@@ -191,18 +191,21 @@ with patch('pathlib.Path', side_effect=fixture_path):
         script = textwrap.dedent(match.group(1))
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            fake_date = root / "date"
-            fake_date.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_NOW"\n')
-            fake_date.chmod(0o700)
             output = root / "output"
 
-            def due(event, stamp):
+            def run(event, stamp, clock='date() { printf "%s\\n" "$TEST_NOW"; }\n'):
                 output.write_text("")
                 env = dict(os.environ, GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output),
-                           TEST_NOW=str(stamp), PATH=str(root) + os.pathsep + os.environ["PATH"])
-                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
-                                        text=True, timeout=5)
+                           TEST_NOW=str(stamp))
+                # A shell clock fixture needs no executable files on /tmp,
+                # which is intentionally noexec in the hardened CI container.
+                return subprocess.run(["bash", "-c", clock + script], env=env, capture_output=True,
+                                      text=True, timeout=5)
+
+            def due(event, stamp):
+                result = run(event, stamp)
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
                 value = output.read_text().strip()
                 self.assertIn(value, ("run_build=true", "run_build=false"))
                 return value == "run_build=true"
@@ -225,6 +228,9 @@ with patch('pathlib.Path', side_effect=fixture_path):
                 for stamp in (86400, 172800):
                     with self.subTest(event=event, stamp=stamp):
                         self.assertTrue(due(event, stamp))
+            failed_clock = run("schedule", 0, 'date() { return 1; }\n')
+            self.assertNotEqual(failed_clock.returncode, 0)
+            self.assertEqual(output.read_text(), "")
 
     def test_automatic_workflow_is_main_only_after_success_and_serialized_with_manual_release(self):
         text = (self.root / ".github/workflows/release-dependencies.yml").read_text()

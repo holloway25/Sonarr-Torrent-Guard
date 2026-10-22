@@ -27,11 +27,14 @@ jobs:
         run: |
           set -euo pipefail
           # Epoch-day parity stays 48-hourly across month/year boundaries.
-          if [ "$GITHUB_EVENT_NAME" != schedule ] || [ "$(( ($(date -u +%s) / 86400) % 2 ))" -eq 0 ]; then
-            echo "run_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_build=false" >> "$GITHUB_OUTPUT"
+          run_build=true
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            epoch_seconds=$(date -u +%s)
+            if [ "$(( (epoch_seconds / 86400) % 2 ))" -ne 0 ]; then
+              run_build=false
+            fi
           fi
+          echo "run_build=$run_build" >> "$GITHUB_OUTPUT"
   build:
     needs: cadence
     if: needs.cadence.outputs.run_build == 'true'
