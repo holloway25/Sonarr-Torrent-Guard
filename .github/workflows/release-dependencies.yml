@@ -82,7 +82,7 @@ jobs:
           test "$(jq -r '.["org.opencontainers.image.revision"]' <<< "$LABELS")" = "$REVISION"
           test "$(jq -r '.["io.stguard.build.run-id"]' <<< "$LABELS")" = "$CANDIDATE_RUN_ID"
           test "$(jq -r '.["io.stguard.build.attempt"]' <<< "$LABELS")" = "$ATTEMPT"
-          test "$(jq -r '.["org.opencontainers.image.base.name"]' <<< "$LABELS")" = python:3.15-slim-bookworm
+          test "$(jq -r '.["org.opencontainers.image.base.name"]' <<< "$LABELS")" = python:3.15-slim-trixie
           BASE_DIGEST=$(jq -r '.["org.opencontainers.image.base.digest"]' <<< "$LABELS")
           [[ "$BASE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           HASH_SCRIPT=$(python3 tools/dependency_release.py image-script)

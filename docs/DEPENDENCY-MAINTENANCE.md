@@ -1,6 +1,6 @@
 # Dependency maintenance and reviewed releases
 
-The image targets the official Python 3.15 slim Debian Bookworm base. Normal builds
+The image targets the official Python 3.15 slim Debian 13 Trixie base. Normal builds
 use the repository's reviewable pin; maintenance builds resolve the current digest
 of that same compatible tag and record it in image labels. The application uses
 Python's standard library: there are no
@@ -22,7 +22,7 @@ still need maintenance.
   build only on even-numbered UTC days since the Unix epoch: every 48 hours,
   including across month/year boundaries. Off-days skip the build and publish
   jobs; push/PR tests and explicitly requested manual builds are not delayed.
-  A due build pulls the current official Python 3.15 Bookworm base and renders
+  A due build pulls the current official Python 3.15 Trixie base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.
   Fresh `--pull --no-cache` builds upgrade available Debian packages
   within the configured distro and install current timezone/CA packages. This
@@ -36,7 +36,7 @@ still need maintenance.
 
 ## What updates and what stays pinned
 
-- Compatible Python 3.15 patch releases and Debian Bookworm package updates are
+- Compatible Python 3.15 patch releases and Debian Trixie package updates are
   included in maintenance builds, including timezone data and trusted CA certificates.
   There are no third-party pip packages in this application.
 - Python's major/minor version and the Debian distribution stay fixed. The
@@ -54,13 +54,22 @@ still need maintenance.
 - Application-code changes still need review. The two-day schedule changes only
   GitHub maintenance, not any host's polling schedule or runtime settings.
 
-The Python 3.12 to 3.15 upgrade is a deliberate, review-gated migration, not a
-routine dependency refresh. The pinned base was verified as Python 3.15.1; CI
-checks the actual interpreter family, runs the full suite inside the new image
-and exercises configuration/startup and bounded shutdown. Automatic release
-rejects a previous 3.12-family baseline: the first 3.15 image needs explicit
-reviewed promotion before two-day 3.15 patch maintenance can advance `latest`.
+Python-family and Debian-release upgrades are deliberate, review-gated migrations,
+not routine dependency refreshes. The pinned Trixie base was verified as Python
+3.15.1. CI checks the actual interpreter and OS family, trusted CA loading, runs
+the full suite inside the new image and exercises configuration/startup and
+bounded shutdown. Automatic release rejects previous Python-family or Bookworm
+baselines: the first Trixie image needs explicit reviewed promotion before
+two-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
+logs, journals and permissions are retained; changing the base is not authority
+to migrate or reset runtime state. Application changes bundled with a migration
+still require approved code-bound live authorization before deployment.
 This source configuration alone does not deploy or change an existing container.
+
+Trixie is Debian's current stable release, with full support through August 2028
+and LTS through June 2030; see [Debian's release information](https://www.debian.org/releases/trixie/).
+The image contains user-space packages, not a separate kernel or full OS install;
+this change does not upgrade the container host's operating system.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse
 when the same source is rebuilt with different packages. The run summary reports

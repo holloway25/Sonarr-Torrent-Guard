@@ -51,27 +51,36 @@ class DependencyReleaseTests(unittest.TestCase):
                 policy.compare(candidate, self.inputs)
 
     def test_python_family_or_distro_changes_require_review(self):
-        for family in (b"python:3.12-slim-bookworm", b"python:3.14-slim-bookworm",
-                       b"python:3.16-slim-bookworm", b"python:3.15-slim-trixie", b"other:3.15-slim-bookworm"):
+        for family in (b"python:3.12-slim-trixie", b"python:3.14-slim-trixie",
+                       b"python:3.16-slim-trixie", b"python:3.15-slim-bookworm", b"other:3.15-slim-trixie"):
             candidate = dict(self.inputs, Dockerfile=self.inputs["Dockerfile"].replace(policy.BASE.encode(), family))
             with self.subTest(family=family), self.assertRaises(policy.DependencyReviewRequired):
                 policy.compare(candidate, self.inputs)
 
     def test_previous_python_family_requires_reviewed_migration(self):
         old = dict(self.inputs, Dockerfile=self.inputs["Dockerfile"].replace(
-            policy.BASE.encode(), b"python:3.12-slim-bookworm", 1))
+            policy.BASE.encode(), b"python:3.12-slim-trixie", 1))
         with self.assertRaisesRegex(policy.DependencyReviewRequired, "base_family_change_requires_review"):
             policy.compare(self.inputs, old)
 
+    def test_previous_distro_requires_reviewed_migration_in_both_directions(self):
+        old = dict(self.inputs, Dockerfile=self.inputs["Dockerfile"].replace(
+            policy.BASE.encode(), b"python:3.15-slim-bookworm", 1))
+        for candidate, baseline in ((self.inputs, old), (old, self.inputs)):
+            with self.assertRaisesRegex(policy.DependencyReviewRequired, "base_family_change_requires_review"):
+                policy.compare(candidate, baseline)
+
     def test_workflows_and_pinned_recipe_target_approved_python_family(self):
-        self.assertEqual(policy.BASE, "python:3.15-slim-bookworm")
+        self.assertEqual(policy.BASE, "python:3.15-slim-trixie")
         self.assertRegex(self.inputs["Dockerfile"].decode(),
-                         r"\AFROM python:3\.15-slim-bookworm@sha256:[a-f0-9]{64}\n")
+                         r"\AFROM python:3\.15-slim-trixie@sha256:[a-f0-9]{64}\n")
         checks = (self.root / ".github/workflows/checks.yml").read_text()
         self.assertIn("python-version: '3.15'", checks)
         container = (self.root / ".github/workflows/container.yml").read_text()
         self.assertIn("docker pull " + policy.BASE, container)
         self.assertEqual(container.count("assert sys.version_info[:2] == (3, 15)"), 2)
+        self.assertEqual(container.count('assert "VERSION_CODENAME=trixie"'), 2)
+        self.assertIn('ssl.create_default_context().cert_store_stats()["x509_ca"] > 0', container)
         release = (self.root / ".github/workflows/release-dependencies.yml").read_text()
         self.assertIn("= " + policy.BASE, release)
 
