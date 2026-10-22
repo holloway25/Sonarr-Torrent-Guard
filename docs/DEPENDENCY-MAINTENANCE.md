@@ -11,7 +11,7 @@ still need maintenance.
 
 - Dependabot checks the Docker base every Monday at 09:10 Melbourne time. It opens
   update PRs; major/minor Python upgrades are excluded from routine updates.
-  Base-family/distro changes still need review. Two-day maintenance independently
+  Base-family/distro changes still need review. Three-day maintenance independently
   resolves the compatible Python tag, so security patch delivery does not wait
   for those bookkeeping PRs to be merged.
 - Dependabot checks GitHub Actions every Monday at 09:20 Melbourne time. It opens
@@ -19,12 +19,12 @@ still need maintenance.
   publishing a release or receiving registry credentials.
 - GitHub checks the maintenance cadence daily at 23:17 UTC (09:17 AEST /
   10:17 AEDT the following day, Melbourne). A lightweight gate permits an image
-  build only on even-numbered UTC days since the Unix epoch: every 48 hours,
+  build only when the UTC day count since the Unix epoch is divisible by three: every 72 hours,
   including across month/year boundaries. Off-days skip the build and publish
   jobs; push/PR tests and explicitly requested manual builds are not delayed.
   A due build pulls the current official Python 3.15 Trixie base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.
-  Fresh `--pull --no-cache` builds upgrade available Debian packages
+  Fresh builds with pull and no-cache enabled upgrade available Debian packages
   within the configured distro and install current timezone/CA packages. This
   does not change host packages or the distro/Python version line.
 - All normal tests, privacy checks, offline non-root smoke checks and the bounded
@@ -51,7 +51,7 @@ still need maintenance.
   The host-facing `latest` tag deliberately moves after the release checks pass,
   allowing an independently configured host updater to receive updates. Pinning
   the host to one digest instead would prevent those automatic updates.
-- Application-code changes still need review. The two-day schedule changes only
+- Application-code changes still need review. The three-day schedule changes only
   GitHub maintenance, not any host's polling schedule or runtime settings.
 
 Python-family and Debian-release upgrades are deliberate, review-gated migrations,
@@ -60,7 +60,7 @@ not routine dependency refreshes. The pinned Trixie base was verified as Python
 the full suite inside the new image and exercises configuration/startup and
 bounded shutdown. Automatic release rejects previous Python-family or Bookworm
 baselines: the first Trixie image needs explicit reviewed promotion before
-two-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
+three-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
 logs, journals and permissions are retained; changing the base is not authority
 to migrate or reset runtime state. Application changes bundled with a migration
 still require approved code-bound live authorization before deployment.
@@ -70,6 +70,25 @@ Trixie is Debian's current stable release, with full support through August 2028
 and LTS through June 2030; see [Debian's release information](https://www.debian.org/releases/trixie/).
 The image contains user-space packages, not a separate kernel or full OS install;
 this change does not upgrade the container host's operating system.
+
+## CI minutes and caching
+
+- Source and container checks run for `main` pushes and pull requests, not release
+  tag pushes or pushes to the secondary development branch. Newer commits cancel
+  older tests for the same branch/PR. Scheduled/manual publishers use unique,
+  non-cancelling groups; promotion keeps its existing non-cancelling release lock.
+- There are no application pip dependencies to download/cache. Commit-pinned
+  Docker Buildx/build actions reuse GitHub-hosted image-layer cache for test builds.
+  Only `main` push tests export cache; PRs and publishers do not write that cache.
+  No credentials, runtime config, appdata or journals are stored in it.
+- Cache is an optimization, not release evidence. Maintenance and explicitly
+  published candidates always pull the compatible base and disable layer reuse
+  for the build, ensuring package upgrades execute. All source/privacy tests,
+  built-image tests and startup/shutdown checks still run before publication.
+  Cache export failure is non-fatal and bounded to avoid wasting CI minutes.
+- The daily cadence check is lightweight; the full maintenance build runs every
+  three days. This reduces future usage but cannot reset an exhausted GitHub
+  allowance or guarantee an immediate hosted run. No billing settings are changed.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse
 when the same source is rebuilt with different packages. The run summary reports

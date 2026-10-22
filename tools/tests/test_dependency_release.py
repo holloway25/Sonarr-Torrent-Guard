@@ -192,7 +192,7 @@ with patch('pathlib.Path', side_effect=fixture_path):
                 self.assertIn("timezone: Australia/Melbourne", block)
                 self.assertNotIn("interval: daily", block)
 
-    def test_actual_cadence_script_runs_every_48_hours_across_calendar_boundaries(self):
+    def test_actual_cadence_script_runs_every_72_hours_across_calendar_boundaries(self):
         workflow = (self.root / ".github/workflows/container.yml").read_text()
         match = re.search(r"      - name: Decide maintenance cadence\n"
                           r"        id: cadence\n        run: \|\n((?:          [^\n]*\n)+)", workflow)
@@ -223,23 +223,53 @@ with patch('pathlib.Path', side_effect=fixture_path):
                       datetime.date(2027, 2, 25), datetime.date(2028, 2, 25))
             for start in starts:
                 results = []
-                for offset in range(8):
+                for offset in range(12):
                     day = start + datetime.timedelta(days=offset)
                     stamp = int(datetime.datetime.combine(day, datetime.time(23, 17),
                                 tzinfo=datetime.timezone.utc).timestamp())
                     with self.subTest(day=day):
                         result = due("schedule", stamp)
-                        self.assertEqual(result, (stamp // 86400) % 2 == 0)
+                        self.assertEqual(result, (stamp // 86400) % 3 == 0)
                         results.append(result)
-                self.assertTrue(all(a != b for a, b in zip(results, results[1:])))
+                due_days = [i for i, result in enumerate(results) if result]
+                self.assertTrue(all(b - a == 3 for a, b in zip(due_days, due_days[1:])))
                 self.assertEqual(sum(results), 4)
             for event in ("push", "pull_request", "workflow_dispatch"):
-                for stamp in (86400, 172800):
+                for stamp in (86400, 172800, 259200):
                     with self.subTest(event=event, stamp=stamp):
                         self.assertTrue(due(event, stamp))
             failed_clock = run("schedule", 0, 'date() { return 1; }\n')
             self.assertNotEqual(failed_clock.returncode, 0)
             self.assertEqual(output.read_text(), "")
+
+    def test_test_runs_exclude_tags_and_cancel_only_superseded_tests(self):
+        checks = (self.root / ".github/workflows/checks.yml").read_text()
+        container = (self.root / ".github/workflows/container.yml").read_text()
+        for workflow in (checks, container):
+            triggers = workflow.split("concurrency:", 1)[0]
+            self.assertIn("  push:\n    branches: [main]\n  pull_request:", triggers)
+            self.assertNotIn("tags:", triggers)
+            self.assertNotIn("release:", triggers)
+        self.assertIn("group: checks-${{ github.event.pull_request.number || github.ref }}", checks)
+        self.assertIn("cancel-in-progress: true", checks)
+        self.assertIn("&& 'tests' || github.run_id", container)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}", container)
+        for name in ("release-dependencies.yml", "promote-image.yml"):
+            release = (self.root / ".github/workflows" / name).read_text()
+            self.assertIn("group: reviewed-image-promotion\n  cancel-in-progress: false", release)
+
+    def test_test_build_cache_cannot_skip_fresh_release_builds_or_tests(self):
+        text = (self.root / ".github/workflows/container.yml").read_text()
+        build = text.split("      - name: Build image\n", 1)[1].split("      - name:", 1)[0]
+        self.assertRegex(build, r"uses: docker/build-push-action@[a-f0-9]{40}")
+        self.assertIn("pull: true", build)
+        self.assertIn("no-cache: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}", build)
+        self.assertIn("load: true\n          push: false", build)
+        self.assertIn("cache-from: type=gha,version=2,scope=guard-ci-3.15-trixie", build)
+        self.assertIn("cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'", build)
+        self.assertIn("mode=min,ignore-error=true,timeout=1m", build)
+        self.assertLess(text.index("push: false"), text.index("Run regression suite using the image Python"))
+        self.assertLess(text.index("Offline active-cycle shutdown smoke check"), text.index('docker push "$IMAGE"'))
 
     def test_automatic_workflow_is_main_only_after_success_and_serialized_with_manual_release(self):
         text = (self.root / ".github/workflows/release-dependencies.yml").read_text()

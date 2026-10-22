@@ -10,9 +10,13 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Lightweight daily trigger; cadence gate permits builds every 48 hours.
+    # Lightweight daily trigger; cadence gate permits builds every 72 hours.
     # Due builds start at 09:17/10:17 Melbourne (AEST/AEDT).
     - cron: '17 23 * * *'
+concurrency:
+  # Only superseded push/PR tests share a cancellable group. Publications are unique.
+  group: container-${{ github.event.pull_request.number || github.ref }}-${{ (github.event_name == 'push' || github.event_name == 'pull_request') && 'tests' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
@@ -26,11 +30,11 @@ jobs:
         id: cadence
         run: |
           set -euo pipefail
-          # Epoch-day parity stays 48-hourly across month/year boundaries.
+          # Epoch-day modulo stays 72-hourly across month/year boundaries.
           run_build=true
           if [ "$GITHUB_EVENT_NAME" = schedule ]; then
             epoch_seconds=$(date -u +%s)
-            if [ "$(( (epoch_seconds / 86400) % 2 ))" -ne 0 ]; then
+            if [ "$(( (epoch_seconds / 86400) % 3 ))" -ne 0 ]; then
               run_build=false
             fi
           fi
@@ -65,8 +69,29 @@ jobs:
           python3 tools/dependency_release.py render --digest "$BASE_DIGEST" --output "$RUNNER_TEMP/dependency.Dockerfile"
           echo "BASE_DIGEST=$BASE_DIGEST" >> "$GITHUB_ENV"
           echo "BUILD_DOCKERFILE=$RUNNER_TEMP/dependency.Dockerfile" >> "$GITHUB_ENV"
+      - name: Set up cached image builder
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build image
-        run: docker build --pull --no-cache --file "${BUILD_DOCKERFILE:-Dockerfile}" --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --label "org.opencontainers.image.revision=${GITHUB_SHA}" --label "org.opencontainers.image.base.name=python:3.15-slim-trixie" --label "org.opencontainers.image.base.digest=${BASE_DIGEST:-repository-pin}" --label "io.stguard.build.run-id=$GITHUB_RUN_ID" --label "io.stguard.build.attempt=$GITHUB_RUN_ATTEMPT" --tag "$IMAGE" .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ env.BUILD_DOCKERFILE || 'Dockerfile' }}
+          pull: true
+          # Release candidates must rerun apt upgrades, never reuse a stale RUN layer.
+          no-cache: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,version=2,scope=guard-ci-3.15-trixie
+          # Only main push tests write cache; PRs and publishers do not export it.
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,version=2,scope=guard-ci-3.15-trixie,mode=min,ignore-error=true,timeout=1m' || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.base.name=python:3.15-slim-trixie
+            org.opencontainers.image.base.digest=${{ env.BASE_DIGEST || 'repository-pin' }}
+            io.stguard.build.run-id=${{ github.run_id }}
+            io.stguard.build.attempt=${{ github.run_attempt }}
       - name: Run regression suite using the image Python and system libraries
         run: docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" --workdir /src --entrypoint python3 "$IMAGE" -m unittest discover -s tools/tests -t .
       - name: Offline non-root read-only smoke check

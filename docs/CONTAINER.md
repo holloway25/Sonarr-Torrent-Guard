@@ -11,7 +11,8 @@ for authorized publication, never passed into the image build.
 
 ## Build and publication
 
-Pushes and PRs build/smoke-test without publishing or deploying. Every-two-day maintenance
+Main-branch pushes and PRs build/smoke-test without publishing or deploying. Release
+tag pushes do not rerun the full suite. Every-three-day maintenance
 builds and manual Container dispatch with `publish: true` publish tested candidates
 to GHCR in the repository-derived namespace, tagged
 `sha-<full-source-commit>-run-<run-id>-<attempt>`. This publishes a candidate, not a
@@ -30,8 +31,11 @@ that path still requires an operator's explicit review confirmation.
 The template uses `:latest`, so a host's existing image updater can pull reviewed
 releases. The immutable candidate digest remains available for audit/rollback.
 No host connection, host schedule or deployment is performed by these workflows.
-Dependabot proposes base-image/build-action updates; a fresh build every two days refreshes
+Dependabot proposes base-image/build-action updates; a fresh build every three days refreshes
 available Debian packages. See [dependency maintenance](DEPENDENCY-MAINTENANCE.md).
+Superseded push/PR tests are cancelled, but publishing and promotion runs are not.
+Test builds reuse cached image layers; maintenance and manual publishing builds
+still pull the base and rerun package upgrades without reusing cached RUN layers.
 Dependency-only updates are released after tests and unchanged-application checks;
 application changes still require review. Rebuilding can update packages even
 for the same source. Application-code/scope changes still require fresh live

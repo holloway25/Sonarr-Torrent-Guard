@@ -413,8 +413,8 @@ class ContainerTests(unittest.TestCase):
         self.assertIn('org.opencontainers.image.licenses="GPL-3.0-only"', docker)
         self.assertIn("!LICENSE", (root / ".dockerignore").read_text().splitlines())
         workflow = (root / ".github/workflows/container.yml").read_text()
-        self.assertIn("org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}", workflow)
-        self.assertIn("org.opencontainers.image.revision=${GITHUB_SHA}", workflow)
+        self.assertIn("org.opencontainers.image.source=https://github.com/${{ github.repository }}", workflow)
+        self.assertIn("org.opencontainers.image.revision=${{ github.sha }}", workflow)
 
     def test_all_regression_modules_live_under_tools_and_ci_uses_discovery(self):
         root = Path(__file__).resolve().parents[2]
