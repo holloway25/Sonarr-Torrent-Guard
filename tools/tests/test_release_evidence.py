@@ -144,7 +144,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
     def test_build_publishes_candidates_only_and_dependency_updates_are_proposals(self):
         root = Path(__file__).resolve().parents[2]
         dependabot = (root / ".github/dependabot.yml").read_text()
-        for value in ("package-ecosystem: docker", "package-ecosystem: github-actions", "interval: daily"):
+        for value in ("package-ecosystem: docker", "package-ecosystem: github-actions", "interval: weekly"):
             self.assertIn(value, dependabot)
         workflow = (root / ".github/workflows/container.yml").read_text()
         self.assertIn("  schedule:", workflow)

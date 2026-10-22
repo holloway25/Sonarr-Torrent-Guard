@@ -9,16 +9,16 @@ still need maintenance.
 
 ## Automated checks and candidate builds
 
-- Dependabot checks the Docker base on weekdays at 09:10 Melbourne time. It opens
+- Dependabot checks the Docker base every Monday at 09:10 Melbourne time. It opens
   update PRs; major/minor Python upgrades are excluded from routine updates.
-  Base-family/distro changes still need review. Daily maintenance independently
+  Base-family/distro changes still need review. Weekly maintenance independently
   resolves the compatible Python tag, so security patch delivery does not wait
   for those bookkeeping PRs to be merged.
 - Dependabot checks GitHub Actions every Monday at 09:20 Melbourne time. It opens
   PRs, not automatic merges. PRs run the source and container tests without
   publishing a release or receiving registry credentials.
-- The Container workflow also runs daily at 23:17 UTC (09:17 AEST / 10:17 AEDT,
-  Melbourne). It pulls the current official Python 3.12 Bookworm base and renders
+- The Container workflow runs weekly on Sunday at 23:17 UTC (Monday 09:17 AEST /
+  10:17 AEDT, Melbourne). It pulls the current official Python 3.12 Bookworm base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.
   Fresh `--pull --no-cache` builds upgrade available Debian packages
   within the configured distro and install current timezone/CA packages. This
@@ -29,6 +29,26 @@ still need maintenance.
   libraries, with only read-only source and temporary test files mounted in CI.
   Scheduled jobs may be delayed by GitHub; inactive public repositories can have
   schedules disabled by GitHub. Check Actions for failures or missing runs.
+
+## What updates and what stays pinned
+
+- Compatible Python 3.12 patch releases and Debian Bookworm package updates are
+  included in maintenance builds, including timezone data and trusted CA certificates.
+  There are no third-party pip packages in this application.
+- Python's major/minor version and the Debian distribution stay fixed. The
+  repository Dockerfile pins an exact base-image digest. Each maintenance build
+  resolves a fresh compatible digest and then builds against that exact digest;
+  its identity is recorded in the resulting image labels.
+- Actions used by image publication and release workflows are pinned to full
+  commit hashes. Dependabot proposes action updates as reviewable PRs; it does
+  not merge them automatically. The general Checks workflow uses major-version
+  action tags; this is separate from dependencies inside the Docker image.
+- Published candidate images have unique build tags and immutable digests.
+  The host-facing `latest` tag deliberately moves after the release checks pass,
+  allowing an independently configured host updater to receive updates. Pinning
+  the host to one digest instead would prevent those automatic updates.
+- Application-code changes still need review. The weekly schedule changes only
+  GitHub maintenance, not any host's polling schedule or runtime settings.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse
 when the same source is rebuilt with different packages. The run summary reports

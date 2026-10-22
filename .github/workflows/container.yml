@@ -10,8 +10,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Daily candidate refresh, 09:17/10:17 Melbourne time (AEST/AEDT).
-    - cron: '17 23 * * *'
+    # Weekly candidate refresh: Monday 09:17/10:17 Melbourne (AEST/AEDT).
+    - cron: '17 23 * * 0'
 permissions:
   contents: read
 jobs:

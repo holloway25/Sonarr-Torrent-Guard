@@ -144,6 +144,20 @@ with patch('pathlib.Path', side_effect=fixture_path):
             with self.subTest(values=values), self.assertRaises(policy.DependencyReviewRequired):
                 policy.newer_build(*values)
 
+    def test_maintenance_and_dependency_checks_are_weekly(self):
+        workflow = (self.root / ".github/workflows/container.yml").read_text()
+        schedules = [line.strip() for line in workflow.splitlines() if line.strip().startswith("- cron:")]
+        self.assertEqual(schedules, ["- cron: '17 23 * * 0'"])
+        dependabot = (self.root / ".github/dependabot.yml").read_text()
+        for ecosystem in ("docker", "github-actions"):
+            block = dependabot.split("- package-ecosystem: " + ecosystem + "\n", 1)[1].split(
+                "- package-ecosystem:", 1)[0]
+            with self.subTest(ecosystem=ecosystem):
+                self.assertIn("interval: weekly", block)
+                self.assertIn("day: monday", block)
+                self.assertIn("timezone: Australia/Melbourne", block)
+                self.assertNotIn("interval: daily", block)
+
     def test_automatic_workflow_is_main_only_after_success_and_serialized_with_manual_release(self):
         text = (self.root / ".github/workflows/release-dependencies.yml").read_text()
         for value in ("workflow_run:", "workflows: [Container]", "types: [completed]",
