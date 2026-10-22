@@ -8,11 +8,11 @@ import re
 import subprocess
 
 
-BASE = "python:3.12-slim-bookworm"
+BASE = "python:3.15-slim-bookworm"
 IMAGE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
                "authorization.py", "routine.py", "workflow.py", "reports.py", "retention.py",
                "container_worker.py", "LICENSE")
-FROM = re.compile(r"\AFROM python:3\.12-slim-bookworm@sha256:[a-f0-9]{64}\n")
+FROM = re.compile(r"\AFROM python:3\.15-slim-bookworm@sha256:[a-f0-9]{64}\n")
 OLD_APT = "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata ca-certificates \\\n"
 NEW_APT = ("RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \\\n"
            "    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata ca-certificates \\\n")

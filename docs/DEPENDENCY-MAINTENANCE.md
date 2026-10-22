@@ -1,6 +1,6 @@
 # Dependency maintenance and reviewed releases
 
-The image uses the official Python 3.12 slim Debian Bookworm base. Normal builds
+The image targets the official Python 3.15 slim Debian Bookworm base. Normal builds
 use the repository's reviewable pin; maintenance builds resolve the current digest
 of that same compatible tag and record it in image labels. The application uses
 Python's standard library: there are no
@@ -18,7 +18,7 @@ still need maintenance.
   PRs, not automatic merges. PRs run the source and container tests without
   publishing a release or receiving registry credentials.
 - The Container workflow runs weekly on Sunday at 23:17 UTC (Monday 09:17 AEST /
-  10:17 AEDT, Melbourne). It pulls the current official Python 3.12 Bookworm base and renders
+  10:17 AEDT, Melbourne). It pulls the current official Python 3.15 Bookworm base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.
   Fresh `--pull --no-cache` builds upgrade available Debian packages
   within the configured distro and install current timezone/CA packages. This
@@ -32,7 +32,7 @@ still need maintenance.
 
 ## What updates and what stays pinned
 
-- Compatible Python 3.12 patch releases and Debian Bookworm package updates are
+- Compatible Python 3.15 patch releases and Debian Bookworm package updates are
   included in maintenance builds, including timezone data and trusted CA certificates.
   There are no third-party pip packages in this application.
 - Python's major/minor version and the Debian distribution stay fixed. The
@@ -49,6 +49,14 @@ still need maintenance.
   the host to one digest instead would prevent those automatic updates.
 - Application-code changes still need review. The weekly schedule changes only
   GitHub maintenance, not any host's polling schedule or runtime settings.
+
+The Python 3.12 to 3.15 upgrade is a deliberate, review-gated migration, not a
+routine dependency refresh. The pinned base was verified as Python 3.15.1; CI
+checks the actual interpreter family, runs the full suite inside the new image
+and exercises configuration/startup and bounded shutdown. Automatic release
+rejects a previous 3.12-family baseline: the first 3.15 image needs explicit
+reviewed promotion before weekly 3.15 patch maintenance can advance `latest`.
+This source configuration alone does not deploy or change an existing container.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse
 when the same source is rebuilt with different packages. The run summary reports
