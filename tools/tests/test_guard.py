@@ -94,6 +94,42 @@ class WorkflowTests(unittest.TestCase):
     def check(self):
         return run(self.config, self.qb, {"HD": self.s}, now=1000)[0]
 
+    def test_queue_client_id_requires_positive_integer_without_numeric_coercion(self):
+        for value in (True, False, 1.0, "1", 0, -1, [], {}):
+            with self.subTest(value=value):
+                self.row["downloadClientId"] = value
+                report = self.check()
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], "wrong_download_client")
+        for value in (None, 1):
+            with self.subTest(valid=value):
+                self.row["downloadClientId"] = value
+                self.assertEqual(self.check()["decision"], "would_fail")
+
+    def test_grab_event_type_rejects_boolean_float_and_unknown_values(self):
+        for value in (True, False, 1.0, "1", None, 0, 99, [], {}):
+            with self.subTest(value=value):
+                self.grab["eventType"] = value
+                report = self.check()
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], "invalid_history_event_type")
+        for value in (1, "grabbed"):
+            self.grab["eventType"] = value
+            self.assertEqual(self.check()["decision"], "would_fail")
+
+    def test_grab_content_identity_requires_positive_integer_before_comparison(self):
+        self.row.update(seriesId=1, episodeId=1)
+        self.grab.update(seriesId=1, episodeId=1)
+        for field in ("seriesId", "episodeId"):
+            for value in (True, False, 1.0, "1", None, 0, -1, [], {}):
+                with self.subTest(field=field, value=value):
+                    self.grab[field] = value
+                    report = self.check()
+                    self.assertEqual(report["decision"], "skip")
+                    self.assertEqual(report["reason"], "unknown_content_identity")
+                self.grab[field] = 1
+        self.assertEqual(self.check()["decision"], "would_fail")
+
     def test_stopped_bad_torrent_is_candidate_without_mutations(self):
         report = self.check()
         self.assertEqual(report["decision"], "would_fail")

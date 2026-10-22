@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from guard import (Api, GuardError, endpoint_key, hard_deadline, integer, load_config,
+from guard import (Api, GuardError, endpoint_key, hard_deadline, history_event_type, integer, load_config,
                    records, recheck_candidate, run, torrent_hash, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
@@ -34,10 +34,6 @@ CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "c
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
                   "window_start", "baseline_history_ids", "baseline_blocklist_ids", "approval_digest"}
 ATTEMPT_CONTEXT_FIELDS = {"attempt_fingerprint", "download_added_on", "grab_ids"}
-HISTORY_EVENT_TYPES = {
-    1: "grabbed", 2: "seriesFolderImported", 3: "downloadFolderImported",
-    4: "downloadFailed", 5: "episodeFileDeleted", 6: "episodeFileRenamed", 7: "downloadIgnored",
-}
 
 
 def digest(value):
@@ -186,8 +182,13 @@ def capture_context(config, api, report, approval_digest, now=None):
     if report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True:
         raise SafetyError("not_a_public_failure_candidate")
     series = report.get("series_ids")
-    if not isinstance(series, list) or len(series) != 1:
+    if (not isinstance(series, list) or len(series) != 1
+            or not integer(series[0]) or series[0] <= 0):
         raise SafetyError("single_series_required_for_controlled_test")
+    episodes = report.get("episode_ids")
+    if (not isinstance(episodes, list) or not episodes
+            or any(not integer(i) or i <= 0 for i in episodes)):
+        raise SafetyError("invalid_operation_context")
     status = api.call("/api/v3/system/status")
     if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
         raise SafetyError("unreviewed_sonarr_version")
@@ -196,10 +197,18 @@ def capture_context(config, api, report, approval_digest, now=None):
         raise SafetyError("invalid_history_download_id")
     grabs = records(api, "/api/v3/history", {"eventType": 1,
                     "downloadId": report["download_id_spelling"]}, config.get("max_pages", 20))
-    grabs = [g for g in grabs if str(g.get("downloadId", "")).lower() == report["hash"]
-             and g.get("eventType") in (1, "grabbed") and g.get("seriesId") == series[0]
-             and g.get("episodeId") in report["episode_ids"]
-             and g.get("id") in report["grab_ids"]]
+    matched = []
+    for grab in grabs:
+        if str(grab.get("downloadId", "")).lower() != report["hash"]:
+            continue
+        if history_event_type(grab) != "grabbed":
+            continue
+        if any(not integer(grab.get(field)) or grab[field] <= 0 for field in ("seriesId", "episodeId")):
+            raise SafetyError("invalid_history_identity")
+        if (grab["seriesId"] == series[0] and grab["episodeId"] in episodes
+                and grab["id"] in report["grab_ids"]):
+            matched.append(grab)
+    grabs = matched
     titles = {g.get("sourceTitle") for g in grabs}
     if (not grabs or len(titles) != 1 or not all(isinstance(t, str) and t for t in titles)
             or {g["episodeId"] for g in grabs} != set(report["episode_ids"])):
@@ -262,7 +271,8 @@ class OutcomeVerifier:
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
             for r in new:
-                if not integer(r.get("seriesId")) or not integer(r.get("episodeId")):
+                kind = history_event_type(r)
+                if any(not integer(r.get(field)) or r[field] <= 0 for field in ("seriesId", "episodeId")):
                     raise SafetyError("invalid_history_identity")
                 if r.get("seriesId") != c["series_id"] or r.get("episodeId") not in c["episode_ids"]:
                     continue
@@ -274,15 +284,15 @@ class OutcomeVerifier:
                     continue
                 h = str(r.get("downloadId", "")).lower()
                 added = current_torrent.get("added_on") if current_torrent else None
-                if (r.get("eventType") in (1, "grabbed") and h == c["hash"] and after is True
+                if (kind == "grabbed" and h == c["hash"] and after is True
                         and "grab_ids" in c and r["id"] > max(c["grab_ids"])
                         and integer(added) and added > max(c["download_added_on"], self.not_before)
                         and abs(event_time(r) - added) <= 120):
                     regrab.add(r["episodeId"])
-                if (r.get("eventType") in (4, "downloadFailed") and h == c["hash"]
+                if (kind == "downloadFailed" and h == c["hash"]
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
                     (failed if after else ambiguous_failed).add(r["episodeId"])
-                if r.get("eventType") in (1, "grabbed") and h != c["hash"]:
+                if kind == "grabbed" and h != c["hash"]:
                     try:
                         torrent_hash(h)
                     except GuardError:
@@ -301,7 +311,7 @@ class OutcomeVerifier:
             rows = records(api, "/api/v3/blocklist", {"seriesIds": c["series_id"]}, self.config.get("max_pages", 20))
             matched, ambiguous = set(), set()
             for r in rows:
-                if not integer(r.get("seriesId")):
+                if not integer(r.get("seriesId")) or r["seriesId"] <= 0:
                     raise SafetyError("invalid_blocklist_identity")
                 if (r["id"] in c["baseline_blocklist_ids"] or r.get("seriesId") != c["series_id"]
                         or r.get("indexer") != c["indexer"]
@@ -407,12 +417,10 @@ def metadata_policy(report):
 
 def metadata_history_type(event):
     """Known v4 history types only; Unknown=0 is not a safe non-grab exclusion."""
-    value = event.get("eventType")
-    if integer(value) and value in HISTORY_EVENT_TYPES:
-        return HISTORY_EVENT_TYPES[value]
-    if isinstance(value, str) and value in HISTORY_EVENT_TYPES.values():
-        return value
-    raise SafetyError("replacement_history_event_invalid")
+    try:
+        return history_event_type(event)
+    except GuardError:
+        raise SafetyError("replacement_history_event_invalid") from None
 
 
 def finish_metadata_retry(config, qb, apis, journal, row, validate):

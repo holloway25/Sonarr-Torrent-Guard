@@ -32,6 +32,11 @@ changing these documents, and never escalates to blocklisting after three attemp
    until the next ten-minute cycle during maintenance, without downloader-only
    cleanup. Read and validate both queues, explicit downloader binding, Sonarr grab
    provenance, content identity and public-source classification.
+   Numeric ownership/content IDs must be positive JSON integers, not booleans,
+   floats or coercible strings. History events must be known integer enums or
+   their exact named forms; malformed event values cannot establish grab
+   provenance or confirm outcomes. These checks repeat before dispatch and
+   during context capture, including the final refreshed baseline.
 2. Assess a complete qBittorrent manifest under the agreed failure rules. Do not
    infer failure from paused/stopped state, size alone or warning text.
    Separately, the agreed public metadata-timeout rule can fail active

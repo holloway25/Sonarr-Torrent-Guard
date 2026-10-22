@@ -160,6 +160,22 @@ def integer(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+HISTORY_EVENT_TYPES = {
+    1: "grabbed", 2: "seriesFolderImported", 3: "downloadFolderImported",
+    4: "downloadFailed", 5: "episodeFileDeleted", 6: "episodeFileRenamed", 7: "downloadIgnored",
+}
+
+
+def history_event_type(row):
+    """Normalize known Sonarr enums without bool/float numeric coercion."""
+    value = row.get("eventType")
+    if integer(value) and value in HISTORY_EVENT_TYPES:
+        return HISTORY_EVENT_TYPES[value]
+    if isinstance(value, str) and value in HISTORY_EVENT_TYPES.values():
+        return value
+    raise GuardError("invalid_history_event_type")
+
+
 def torrent_hash(value):
     if not isinstance(value, str) or len(value) not in (40, 64):
         raise GuardError("missing_or_invalid_hash")
@@ -336,8 +352,15 @@ def source_for(api, hash_value, rows, max_pages, added=None):
         "eventType": 1, "downloadId": rows[0]["downloadId"],
         "sortKey": "date", "sortDirection": "descending",
     }, max_pages)
-    matches = [r for r in history if r.get("eventType") in ("grabbed", 1)
-               and str(r.get("downloadId", "")).lower() == hash_value]
+    matches = []
+    for grab in history:
+        if str(grab.get("downloadId", "")).lower() != hash_value:
+            continue
+        if history_event_type(grab) != "grabbed":
+            continue
+        if any(not integer(grab.get(field)) or grab[field] <= 0 for field in ("seriesId", "episodeId")):
+            raise GuardError("unknown_content_identity")
+        matches.append(grab)
     if not matches:
         raise GuardError("no_sonarr_grab_history")
     sources, grab_ids, grab_times = set(), set(), []
@@ -437,7 +460,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                 verify_client_binding(instance, config["qbittorrent"]["url"], client)
                 for row in rows:
                     cid, cname = row.get("downloadClientId"), row.get("downloadClient")
-                    if cid is not None and cid != client.get("id"):
+                    if cid is not None and (not integer(cid) or cid <= 0 or cid != client["id"]):
                         raise GuardError("wrong_download_client")
                     if cid is None and (not cname or cname != client.get("name")):
                         raise GuardError("unconfirmed_download_client")

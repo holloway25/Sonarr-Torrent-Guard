@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import datetime
 import time
@@ -6,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import production
-from guard import run
+from guard import GuardError, run
 from safety import Journal, SafetyError
 from tools.tests.test_guard import FakeApi, manifest
 
@@ -71,6 +72,116 @@ class ProductionTests(unittest.TestCase):
 
     def observe(self):
         return production.OutcomeVerifier(self.config, self.qb, self.apis, self.context).observe()
+
+    def identity_one_report(self):
+        # ID 1 exposes Python's True == 1 and 1.0 == 1 aliasing directly.
+        self.s.routes["/api/v3/queue"]["records"][0].update(seriesId=1, episodeId=1)
+        for row in self.s.routes["/api/v3/history"]["records"]:
+            row.update(seriesId=1, episodeId=1)
+        for row in self.s.routes["/api/v3/history/since"]:
+            row.update(seriesId=1, episodeId=1)
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "would_fail")
+        approval = dict(self.approval, **{k: report[k] for k in (
+            "ownership_fingerprint", "manifest_fingerprint")})
+        return report, approval
+
+    def malformed_api_cases(self):
+        for route, fields in (("/api/v3/queue", ("downloadClientId", "seriesId", "episodeId")),
+                              ("/api/v3/history", ("eventType", "seriesId", "episodeId"))):
+            for field in fields:
+                for value in (True, False, 1.0, "1", None, 0, -1):
+                    yield route, field, value
+
+    def test_malformed_api_identity_never_sends_at_initial_or_postcommit_recheck(self):
+        baseline = copy.deepcopy(self.s.routes)
+        for phase in ("initial", "postcommit"):
+            for route, field, value in self.malformed_api_cases():
+                with self.subTest(phase=phase, route=route, field=field, value=value):
+                    self.s.routes = copy.deepcopy(baseline)
+                    report, approval = self.identity_one_report()
+                    def corrupt():
+                        self.s.routes[route]["records"][0][field] = value
+                    if phase == "initial":
+                        corrupt()
+                    with tempfile.TemporaryDirectory() as folder:
+                        journal = Journal(Path(folder) / "actions.sqlite3", allow_single_test=True)
+                        try:
+                            original = journal.transition
+                            def transition(*args, **kwargs):
+                                row = original(*args, **kwargs)
+                                if phase == "postcommit" and args[1:3] == ("prepared", "dispatch_recorded"):
+                                    corrupt()
+                                return row
+                            with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                                    journal, "transition", side_effect=transition), patch(
+                                    "production._send_queue_delete") as sender:
+                                if phase == "initial":
+                                    with self.assertRaises((GuardError, SafetyError)):
+                                        production.execute_single_test(self.config, self.qb, self.apis,
+                                                                       journal, report, approval)
+                                    self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+                                else:
+                                    row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                                         journal, report, approval)
+                                    self.assertEqual(row["stage"], "dispatch_blocked")
+                                sender.assert_not_called()
+                        finally:
+                            journal.close()
+
+    def test_context_capture_independently_rejects_malformed_grab_types_before_send(self):
+        baseline = copy.deepcopy(self.s.routes)
+        capture = production.capture_context
+        for route, field, value in self.malformed_api_cases():
+            if route != "/api/v3/history":
+                continue
+            with self.subTest(field=field, value=value):
+                self.s.routes = copy.deepcopy(baseline)
+                report, approval = self.identity_one_report()
+                def corrupt_capture(*args, **kwargs):
+                    row = self.s.routes[route]["records"][0]
+                    valid = row[field]
+                    row[field] = value
+                    try:
+                        return capture(*args, **kwargs)
+                    finally:
+                        row[field] = valid
+                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                        "production.capture_context", side_effect=corrupt_capture), patch(
+                        "production._send_queue_delete") as sender:
+                    with self.assertRaises((GuardError, SafetyError)):
+                        production.execute_single_test(self.config, self.qb, self.apis,
+                                                       self.journal, report, approval)
+                    sender.assert_not_called()
+                self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+
+    def test_numeric_and_named_grabs_with_valid_integer_identity_can_send(self):
+        baseline = copy.deepcopy(self.s.routes)
+        for event in (1, "grabbed"):
+            with self.subTest(event=event), tempfile.TemporaryDirectory() as folder:
+                self.s.routes = copy.deepcopy(baseline)
+                self.s.routes["/api/v3/history"]["records"][0]["eventType"] = event
+                report, approval = self.identity_one_report()
+                journal = Journal(Path(folder) / "actions.sqlite3", allow_single_test=True)
+                try:
+                    with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                            "production._send_queue_delete") as sender:
+                        production.execute_single_test(self.config, self.qb, self.apis,
+                                                       journal, report, approval)
+                        sender.assert_called_once_with(self.s, 7)
+                finally:
+                    journal.close()
+
+    def test_malformed_outcome_event_type_never_confirms_failure_or_replacement(self):
+        for index, values in ((1, (True, 4.0, "4", None)), (2, (True, 1.0, "1", None))):
+            for value in values:
+                with self.subTest(index=index, value=value):
+                    self.results()
+                    self.s.routes["/api/v3/history/since"][index]["eventType"] = value
+                    observed = self.observe()
+                    self.assertIsNone(observed["failed"])
+                    self.assertIsNone(observed["replacement_observed"])
+                    self.assertIs(observed["blocklisted"], True)
 
     def test_api_results_are_independent_and_data_deletion_remains_unknown(self):
         self.results()
