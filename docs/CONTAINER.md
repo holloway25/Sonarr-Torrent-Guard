@@ -11,7 +11,7 @@ for authorized publication, never passed into the image build.
 
 ## Build and publication
 
-Pushes and PRs build/smoke-test without publishing or deploying. Weekly maintenance
+Pushes and PRs build/smoke-test without publishing or deploying. Every-two-day maintenance
 builds and manual Container dispatch with `publish: true` publish tested candidates
 to GHCR in the repository-derived namespace, tagged
 `sha-<full-source-commit>-run-<run-id>-<attempt>`. This publishes a candidate, not a
@@ -30,7 +30,7 @@ that path still requires an operator's explicit review confirmation.
 The template uses `:latest`, so a host's existing image updater can pull reviewed
 releases. The immutable candidate digest remains available for audit/rollback.
 No host connection, host schedule or deployment is performed by these workflows.
-Dependabot proposes base-image/build-action updates; a weekly fresh build refreshes
+Dependabot proposes base-image/build-action updates; a fresh build every two days refreshes
 available Debian packages. See [dependency maintenance](DEPENDENCY-MAINTENANCE.md).
 Dependency-only updates are released after tests and unchanged-application checks;
 application changes still require review. Rebuilding can update packages even

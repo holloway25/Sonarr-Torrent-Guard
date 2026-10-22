@@ -11,14 +11,18 @@ still need maintenance.
 
 - Dependabot checks the Docker base every Monday at 09:10 Melbourne time. It opens
   update PRs; major/minor Python upgrades are excluded from routine updates.
-  Base-family/distro changes still need review. Weekly maintenance independently
+  Base-family/distro changes still need review. Two-day maintenance independently
   resolves the compatible Python tag, so security patch delivery does not wait
   for those bookkeeping PRs to be merged.
 - Dependabot checks GitHub Actions every Monday at 09:20 Melbourne time. It opens
   PRs, not automatic merges. PRs run the source and container tests without
   publishing a release or receiving registry credentials.
-- The Container workflow runs weekly on Sunday at 23:17 UTC (Monday 09:17 AEST /
-  10:17 AEDT, Melbourne). It pulls the current official Python 3.15 Bookworm base and renders
+- GitHub checks the maintenance cadence daily at 23:17 UTC (09:17 AEST /
+  10:17 AEDT the following day, Melbourne). A lightweight gate permits an image
+  build only on even-numbered UTC days since the Unix epoch: every 48 hours,
+  including across month/year boundaries. Off-days skip the build and publish
+  jobs; push/PR tests and explicitly requested manual builds are not delayed.
+  A due build pulls the current official Python 3.15 Bookworm base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.
   Fresh `--pull --no-cache` builds upgrade available Debian packages
   within the configured distro and install current timezone/CA packages. This
@@ -47,7 +51,7 @@ still need maintenance.
   The host-facing `latest` tag deliberately moves after the release checks pass,
   allowing an independently configured host updater to receive updates. Pinning
   the host to one digest instead would prevent those automatic updates.
-- Application-code changes still need review. The weekly schedule changes only
+- Application-code changes still need review. The two-day schedule changes only
   GitHub maintenance, not any host's polling schedule or runtime settings.
 
 The Python 3.12 to 3.15 upgrade is a deliberate, review-gated migration, not a
@@ -55,7 +59,7 @@ routine dependency refresh. The pinned base was verified as Python 3.15.1; CI
 checks the actual interpreter family, runs the full suite inside the new image
 and exercises configuration/startup and bounded shutdown. Automatic release
 rejects a previous 3.12-family baseline: the first 3.15 image needs explicit
-reviewed promotion before weekly 3.15 patch maintenance can advance `latest`.
+reviewed promotion before two-day 3.15 patch maintenance can advance `latest`.
 This source configuration alone does not deploy or change an existing container.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse

@@ -1,9 +1,13 @@
 import hashlib
 import json
+import datetime
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 from tools import dependency_release as policy
@@ -163,10 +167,12 @@ with patch('pathlib.Path', side_effect=fixture_path):
             with self.subTest(values=values), self.assertRaises(policy.DependencyReviewRequired):
                 policy.newer_build(*values)
 
-    def test_maintenance_and_dependency_checks_are_weekly(self):
+    def test_image_maintenance_is_gated_and_dependency_pr_checks_stay_weekly(self):
         workflow = (self.root / ".github/workflows/container.yml").read_text()
         schedules = [line.strip() for line in workflow.splitlines() if line.strip().startswith("- cron:")]
-        self.assertEqual(schedules, ["- cron: '17 23 * * 0'"])
+        self.assertEqual(schedules, ["- cron: '17 23 * * *'"])
+        self.assertIn("    needs: cadence\n    if: needs.cadence.outputs.run_build == 'true'", workflow)
+        self.assertIn("run_build: ${{ steps.cadence.outputs.run_build }}", workflow)
         dependabot = (self.root / ".github/dependabot.yml").read_text()
         for ecosystem in ("docker", "github-actions"):
             block = dependabot.split("- package-ecosystem: " + ecosystem + "\n", 1)[1].split(
@@ -176,6 +182,49 @@ with patch('pathlib.Path', side_effect=fixture_path):
                 self.assertIn("day: monday", block)
                 self.assertIn("timezone: Australia/Melbourne", block)
                 self.assertNotIn("interval: daily", block)
+
+    def test_actual_cadence_script_runs_every_48_hours_across_calendar_boundaries(self):
+        workflow = (self.root / ".github/workflows/container.yml").read_text()
+        match = re.search(r"      - name: Decide maintenance cadence\n"
+                          r"        id: cadence\n        run: \|\n((?:          [^\n]*\n)+)", workflow)
+        self.assertIsNotNone(match)
+        script = textwrap.dedent(match.group(1))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            fake_date = root / "date"
+            fake_date.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_NOW"\n')
+            fake_date.chmod(0o700)
+            output = root / "output"
+
+            def due(event, stamp):
+                output.write_text("")
+                env = dict(os.environ, GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output),
+                           TEST_NOW=str(stamp), PATH=str(root) + os.pathsep + os.environ["PATH"])
+                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                value = output.read_text().strip()
+                self.assertIn(value, ("run_build=true", "run_build=false"))
+                return value == "run_build=true"
+
+            starts = (datetime.date(2026, 10, 28), datetime.date(2026, 12, 28),
+                      datetime.date(2027, 2, 25), datetime.date(2028, 2, 25))
+            for start in starts:
+                results = []
+                for offset in range(8):
+                    day = start + datetime.timedelta(days=offset)
+                    stamp = int(datetime.datetime.combine(day, datetime.time(23, 17),
+                                tzinfo=datetime.timezone.utc).timestamp())
+                    with self.subTest(day=day):
+                        result = due("schedule", stamp)
+                        self.assertEqual(result, (stamp // 86400) % 2 == 0)
+                        results.append(result)
+                self.assertTrue(all(a != b for a, b in zip(results, results[1:])))
+                self.assertEqual(sum(results), 4)
+            for event in ("push", "pull_request", "workflow_dispatch"):
+                for stamp in (86400, 172800):
+                    with self.subTest(event=event, stamp=stamp):
+                        self.assertTrue(due(event, stamp))
 
     def test_automatic_workflow_is_main_only_after_success_and_serialized_with_manual_release(self):
         text = (self.root / ".github/workflows/release-dependencies.yml").read_text()

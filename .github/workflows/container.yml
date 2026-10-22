@@ -10,12 +10,31 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Weekly candidate refresh: Monday 09:17/10:17 Melbourne (AEST/AEDT).
-    - cron: '17 23 * * 0'
+    # Lightweight daily trigger; cadence gate permits builds every 48 hours.
+    # Due builds start at 09:17/10:17 Melbourne (AEST/AEDT).
+    - cron: '17 23 * * *'
 permissions:
   contents: read
 jobs:
+  cadence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run_build: ${{ steps.cadence.outputs.run_build }}
+    steps:
+      - name: Decide maintenance cadence
+        id: cadence
+        run: |
+          set -euo pipefail
+          # Epoch-day parity stays 48-hourly across month/year boundaries.
+          if [ "$GITHUB_EVENT_NAME" != schedule ] || [ "$(( ($(date -u +%s) / 86400) % 2 ))" -eq 0 ]; then
+            echo "run_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_build=false" >> "$GITHUB_OUTPUT"
+          fi
   build:
+    needs: cadence
+    if: needs.cadence.outputs.run_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
