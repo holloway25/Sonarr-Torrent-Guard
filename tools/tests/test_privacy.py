@@ -1,6 +1,7 @@
 """Exercise private filename rejection through both checker CLI modes."""
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,8 @@ import unittest
 CHECKER = Path(__file__).resolve().parents[1] / "privacy_check.py"
 
 
+# Repository-only tooling is exercised by source CI; the runtime image has no Git.
+@unittest.skipUnless(shutil.which("git"), "Repository privacy CLI requires Git")
 class PrivacyFilenameTests(unittest.TestCase):
     def test_private_configuration_families_in_staged_and_tracked_files(self):
         names = (".env", ".env.production", ".ENV.production", "connections.json",
