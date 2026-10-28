@@ -526,7 +526,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             report["grab_time_floor"] = grab_time_floor
             report["attempt_fingerprint"] = hashlib.sha256(
                 json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
-            ownership = {"instance": label, "hash": h, "category": category, "indexer": source,
+            ownership = {"instance": label, "hash": h, "category": instance["category"], "indexer": source,
                          "source_policy": source_policy_key(instance["indexers"]),
                          "client_id": report["download_client_id"],
                          "sonarr_endpoint": endpoint_key(instance["url"]),

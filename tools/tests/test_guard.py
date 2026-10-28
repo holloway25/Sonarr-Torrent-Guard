@@ -94,6 +94,26 @@ class WorkflowTests(unittest.TestCase):
     def check(self):
         return run(self.config, self.qb, {"HD": self.s}, now=1000)[0]
 
+    def test_ownership_category_is_bound_to_owning_instance(self):
+        self.config["sonarr"]["UHD"] = copy.deepcopy(self.config["sonarr"]["HD"])
+        self.config["sonarr"]["UHD"]["category"] = "tv-uhd"
+        other = copy.deepcopy(self.s)
+        other.routes["/api/v3/queue"] = {"totalRecords": 0, "records": []}
+
+        def fingerprint(apis):
+            result = run(self.config, self.qb, apis, now=1000)[0]
+            self.assertEqual(result["decision"], "would_fail")
+            return result["ownership_fingerprint"]
+
+        original = fingerprint({"HD": self.s, "UHD": other})
+        self.assertEqual(original, fingerprint({"UHD": other, "HD": self.s}))
+        self.config["sonarr"]["UHD"]["category"] = "other-uhd"
+        self.assertEqual(original, fingerprint({"HD": self.s, "UHD": other}))
+        self.config["sonarr"]["HD"]["category"] = "other-hd"
+        self.t["category"] = "other-hd"
+        self.s.routes["/api/v3/downloadclient"][0]["fields"][0]["value"] = "other-hd"
+        self.assertNotEqual(original, fingerprint({"HD": self.s, "UHD": other}))
+
     def test_queue_client_id_requires_positive_integer_without_numeric_coercion(self):
         for value in (True, False, 1.0, "1", 0, -1, [], {}):
             with self.subTest(value=value):
