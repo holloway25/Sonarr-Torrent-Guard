@@ -354,7 +354,11 @@ def source_for(api, hash_value, rows, max_pages, added=None):
     }, max_pages)
     matches = []
     for grab in history:
-        if str(grab.get("downloadId", "")).lower() != hash_value:
+        try:
+            grab_hash = torrent_hash(grab.get("downloadId"))
+        except GuardError:
+            continue
+        if grab_hash != hash_value:
             continue
         if history_event_type(grab) != "grabbed":
             continue
@@ -575,11 +579,20 @@ def recheck_candidate(original, config, qb, apis):
     return {"assessment": reports[0], "readiness": readiness}
 
 
+def unique_config_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise GuardError("duplicate_configuration_key")
+        result[key] = value
+    return result
+
+
 def load_config(path):
     try:
         if os.name != "nt" and path.stat().st_mode & 0o077:
             raise GuardError("config_permissions_must_be_private")
-        config = json.loads(path.read_text())
+        config = json.loads(path.read_text(), object_pairs_hook=unique_config_keys)
         if config.get("dry_run") is not True:
             raise GuardError("only_dry_run_supported")
         if not isinstance(config.get("sonarr"), dict) or not config["sonarr"]:

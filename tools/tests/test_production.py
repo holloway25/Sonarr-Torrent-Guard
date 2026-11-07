@@ -172,6 +172,58 @@ class ProductionTests(unittest.TestCase):
                 finally:
                     journal.close()
 
+    def digit_hash_report(self):
+        self.hash = "1" * 40
+        self.grab["downloadId"] = self.hash
+        self.s.routes["/api/v3/queue"]["records"][0]["downloadId"] = self.hash
+        self.qb.routes["/api/v2/torrents/info"][0]["hash"] = self.hash
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "would_fail")
+        return report
+
+    def test_assessment_rejects_numeric_history_download_id(self):
+        self.digit_hash_report()
+        self.grab["downloadId"] = int(self.hash)
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "no_sonarr_grab_history")
+
+    def test_context_capture_rejects_numeric_history_download_id(self):
+        report = self.digit_hash_report()
+        approval = {**self.approval, **{key: report[key] for key in (
+            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
+        capture = production.capture_context
+
+        def capture_with_numeric_id(*args, **kwargs):
+            self.grab["downloadId"] = int(self.hash)
+            try:
+                return capture(*args, **kwargs)
+            finally:
+                self.grab["downloadId"] = self.hash
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.capture_context", side_effect=capture_with_numeric_id), patch(
+                "production._send_queue_delete") as sender:
+            with self.assertRaisesRegex(SafetyError, "ambiguous_release_title_evidence"):
+                production.execute_single_test(self.config, self.qb, self.apis,
+                                               self.journal, report, approval)
+            sender.assert_not_called()
+
+    def test_numeric_history_download_id_cannot_confirm_outcomes(self):
+        report = self.digit_hash_report()
+        self.context = production.capture_context(self.config, self.s, report,
+                                                  production.digest(self.approval["nonce"]))
+        self.results()
+        history = self.s.routes["/api/v3/history/since"]
+        history[2]["downloadId"] = "2" * 40
+        self.assertIs(self.observe()["replacement_observed"], True)
+        history[2]["downloadId"] = int("2" * 40)
+        history[1]["downloadId"] = int(self.hash)
+        observed = self.observe()
+        self.assertIs(observed["replacement_observed"], False)
+        self.assertIs(observed["failed"], False)
+        self.assertIs(observed["blocklisted"], True)
+
     def test_malformed_outcome_event_type_never_confirms_failure_or_replacement(self):
         for index, values in ((1, (True, 4.0, "4", None)), (2, (True, 1.0, "1", None))):
             for value in values:

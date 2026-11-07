@@ -599,6 +599,22 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(GuardError):
                 records(api, "queue")
 
+    def test_duplicate_private_indexer_keys_are_rejected(self):
+        from pathlib import Path
+        import tempfile
+        example = Path(__file__).resolve().parents[2] / "config.example.json"
+        original = example.read_text()
+        private = '"private": ["Private Source", "Private Source - Freeleech"]'
+        self.assertIn(private, original)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "settings.json"
+            path.write_text(original)
+            path.chmod(0o600)
+            self.assertIn("Private Source", load_config(path)["sonarr"]["HD"]["indexers"]["private"])
+            path.write_text(original.replace(private, private + ', "private": []', 1))
+            with self.assertRaisesRegex(GuardError, "^duplicate_configuration_key$"):
+                load_config(path)
+
     def test_live_config_refused(self):
         from pathlib import Path
         import tempfile, json, os

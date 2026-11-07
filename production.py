@@ -199,7 +199,11 @@ def capture_context(config, api, report, approval_digest, now=None):
                     "downloadId": report["download_id_spelling"]}, config.get("max_pages", 20))
     matched = []
     for grab in grabs:
-        if str(grab.get("downloadId", "")).lower() != report["hash"]:
+        try:
+            grab_hash = torrent_hash(grab.get("downloadId"))
+        except GuardError:
+            continue
+        if grab_hash != report["hash"]:
             continue
         if history_event_type(grab) != "grabbed":
             continue
@@ -282,7 +286,10 @@ class OutcomeVerifier:
                 data = r.get("data")
                 if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
                     continue
-                h = str(r.get("downloadId", "")).lower()
+                try:
+                    h = torrent_hash(r.get("downloadId"))
+                except GuardError:
+                    continue
                 added = current_torrent.get("added_on") if current_torrent else None
                 if (kind == "grabbed" and h == c["hash"] and after is True
                         and "grab_ids" in c and r["id"] > max(c["grab_ids"])
@@ -293,10 +300,6 @@ class OutcomeVerifier:
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
                     (failed if after else ambiguous_failed).add(r["episodeId"])
                 if kind == "grabbed" and h != c["hash"]:
-                    try:
-                        torrent_hash(h)
-                    except GuardError:
-                        continue
                     (replacement if after else ambiguous_replacement).add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
