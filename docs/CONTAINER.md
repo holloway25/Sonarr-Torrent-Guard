@@ -38,7 +38,7 @@ Test builds reuse cached image layers; maintenance and manual publishing builds
 still pull the base and rerun package upgrades without reusing cached RUN layers.
 Dependency-only updates are released after tests and unchanged-application checks;
 application changes still require review. Rebuilding can update packages even
-for the same source. Scope changes and code changes for grants without opt-in require fresh live
+for the same source. Scope changes and trial-grant code changes require fresh live
 authorization; a release tag does not bypass runtime permission checks.
 New GHCR packages default to private; package access/visibility is an operator
 decision. Never paste registry/API credentials into issues or build logs.
@@ -166,11 +166,9 @@ Before cutover:
    archive, cursor and identity evidence, not just credentials/hashes. Never copy
    a database while a writer is active or replace it with an old snapshot.
 5. Revalidate labels, bindings, sources, categories, permissions and clock.
-   A code change requires a matching grant for trials and ongoing grants that
-   bind the code. Preserve any trial expiry. For seamless reviewed updates,
-   explicitly add `"allow_code_updates": true` to the ongoing grant while
-   moving to a release that supports it. Existing grants retain their original
-   scope and rule.
+   A code change requires a matching grant for trials. Preserve any trial
+   expiry. An ongoing grant carries forward within its approved scope and
+   rule without a host-side migration.
 6. Run ONE live worker, verify logs and the first eligible action. Keep the old
    worker disabled. Rollback must stop the new worker and preserve newer evidence
    before considering old source; never use an old journal to bypass holds.

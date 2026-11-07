@@ -107,11 +107,17 @@ class RoutineTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 RoutineAuthorization(dict(self.ongoing_grant(), **changes), self.f.config)
 
-    def test_code_updates_require_explicit_ongoing_opt_in(self):
+    def test_existing_ongoing_grant_loads_after_code_update_without_an_edit(self):
         old_code = "f" * 64
         ongoing = dict(self.ongoing_grant(), code_digest=old_code)
+        path = self.write_grant(ongoing)
+        before = path.read_bytes()
+        authority = RoutineAuthorization.load(path, self.f.config)
+        authority.validate(self.f.config, self.f.report)
+        self.assertEqual(path.read_bytes(), before)
         with self.assertRaisesRegex(SafetyError, "routine_code_not_authorized"):
-            RoutineAuthorization(ongoing, self.f.config)
+            RoutineAuthorization(dict(self.grant, code_digest=old_code), self.f.config)
+        # Preserve compatibility with grants created by the previous release.
         RoutineAuthorization(dict(ongoing, allow_code_updates=True), self.f.config)
         for grant in (dict(ongoing, allow_code_updates=1),
                       dict(ongoing, allow_code_updates=False),
@@ -150,7 +156,7 @@ class RoutineTests(unittest.TestCase):
                     authority.validate(self.f.config, self.f.report)
 
     def test_final_dispatch_blocks_grant_disabled_after_baseline_commit(self):
-        grant = dict(self.ongoing_grant(), allow_code_updates=True)
+        grant = self.ongoing_grant()
         path = self.write_grant(grant)
         self.authority = RoutineAuthorization.load(path, self.f.config)
         refresh = self.f.journal.refresh_baselines

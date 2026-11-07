@@ -314,8 +314,7 @@ Paths are templates; review them for the chosen installation before any use.
 
 `routine.py --live` uses a separate explicit, owner-private authorization grant
 bound to the configured scope. Trial grants last at most seven days and also
-bind the exact application code. An ongoing grant survives reviewed code updates within its scope only after
-the operator opts in on the host.
+bind the exact application code. An ongoing grant survives reviewed code updates within its existing scope.
 There is no installed/enabled grant by default. It uses the same coordinator and
 Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
 action and grant digest; old uncertain evidence is preserved, while a strictly
