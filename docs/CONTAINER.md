@@ -159,8 +159,8 @@ remain available for standalone installations or rollback.
 
 Changing scope, including removing a private indexer exception, holds live
 cleanup until you confirm the new settings. A missing, unreadable or changed
-scope record cannot authorize a running cycle. Guard checks it again before
-removal and search.
+scope record cannot authorize a running cycle. Before removal and search, Guard
+re-reads both the scope record and the connection file.
 
 To confirm an existing install or a changed scope, save and review the intended
 connection and source settings first, then stop the normal worker. Run the

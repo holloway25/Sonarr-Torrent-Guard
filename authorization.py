@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 import time
 
-from guard import (endpoint_key, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
+from guard import (GuardError, endpoint_key, load_config, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
                    unique_config_keys)
 from safety import SafetyError, valid_digest
 
@@ -156,8 +156,9 @@ class ContainerAuthorization:
     mode = "container"
     expires_at = None
 
-    def __init__(self, config, directory):
-        self._path = directory / CONTAINER_SCOPE_FILE
+    def __init__(self, config, config_path):
+        self._config_path = config_path.absolute()
+        self._path = self._config_path.parent / CONTAINER_SCOPE_FILE
         self._scope = container_scope_record(config)
         self.identifier = digest({"mode": self.mode, **self._scope})
         self.validate(config)
@@ -168,6 +169,14 @@ class ContainerAuthorization:
         if config.get("minimum_age_seconds", 120) < 120:
             raise SafetyError("routine_authorization_expired_or_scope_changed")
         if container_scope_record(config) != self._scope or read_container_scope(self._path) != self._scope:
+            raise SafetyError("container_live_scope_confirmation_required")
+        try:
+            if self._config_path.is_symlink() or not self._config_path.is_file():
+                raise GuardError("invalid_or_missing_configuration")
+            current = container_scope_record(load_config(self._config_path))
+        except GuardError:
+            raise SafetyError("container_live_scope_confirmation_required") from None
+        if current != self._scope:
             raise SafetyError("container_live_scope_confirmation_required")
         validate_candidate(config, report)
 

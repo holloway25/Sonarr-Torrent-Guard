@@ -266,7 +266,7 @@ def main():
                 if approved["scope_digest"] is None and not args.check_config:
                     atomic_json(scope_path, container_scope_record(config))
                 if not args.check_config or approved["scope_digest"] is not None:
-                    ContainerAuthorization(config, CONFIG_DIR)
+                    ContainerAuthorization(config, path)
             elif args.approve_live_scope:
                 raise SafetyError("live_execution_disabled")
             if args.check_config:

@@ -40,11 +40,18 @@ class RoutineTests(unittest.TestCase):
         path = Path(self.f.folder.name) / CONTAINER_SCOPE_FILE
         path.write_text(json.dumps(container_scope_record(self.f.config)))
         path.chmod(0o600)
+        config = copy.deepcopy(self.f.config)
+        config["dry_run"] = True
+        config["qbittorrent"].update(username="REPLACE_ME", password="REPLACE_ME")
+        config_path = path.parent / "connections.json"
+        config_path.write_text(json.dumps(config))
+        config_path.chmod(0o600)
+        return config_path
 
     def test_container_live_switch_authorizes_the_existing_dispatch_path(self):
-        self.write_container_scope()
+        config_path = self.write_container_scope()
         with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
-            self.authority = ContainerAuthorization(self.f.config, Path(self.f.folder.name))
+            self.authority = ContainerAuthorization(self.f.config, config_path)
             with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                     "production._send_queue_delete", side_effect=lambda *args: self.f.results()) as send:
                 row = self.execute()
@@ -52,13 +59,13 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(row["stage"], "cleanup_resolved")
 
     def test_container_permission_requires_live_mode_and_valid_scope(self):
-        self.write_container_scope()
+        config_path = self.write_container_scope()
         for env in ({}, {"STGUARD_MODE": "dry-run"}):
             with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(
                     SafetyError, "live_execution_disabled"):
-                ContainerAuthorization(self.f.config, Path(self.f.folder.name))
+                ContainerAuthorization(self.f.config, config_path)
         with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
-            authority = ContainerAuthorization(self.f.config, Path(self.f.folder.name))
+            authority = ContainerAuthorization(self.f.config, config_path)
             with self.assertRaisesRegex(SafetyError, "routine_candidate_not_authorized"):
                 authority.validate(self.f.config, dict(self.f.report, indexer="Private Source"))
             with self.assertRaisesRegex(SafetyError, "container_live_scope_confirmation_required"):
@@ -66,7 +73,29 @@ class RoutineTests(unittest.TestCase):
             changed = copy.deepcopy(self.f.config)
             changed["sonarr"]["HD"]["indexers"]["private"].clear()
             with self.assertRaisesRegex(SafetyError, "container_live_scope_confirmation_required"):
-                ContainerAuthorization(changed, Path(self.f.folder.name))
+                ContainerAuthorization(changed, config_path)
+
+    def test_final_dispatch_rechecks_on_disk_private_exceptions(self):
+        config_path = self.write_container_scope()
+        refresh = self.f.journal.refresh_baselines
+
+        def protect_source_after_baseline(*args, **kwargs):
+            row = refresh(*args, **kwargs)
+            changed = json.loads(config_path.read_text())
+            changed["sonarr"]["HD"]["indexers"] = {
+                "mode": "private_exclusions", "private": ["Public Source"]}
+            config_path.write_text(json.dumps(changed))
+            return row
+
+        with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
+            self.authority = ContainerAuthorization(self.f.config, config_path)
+            with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                    self.f.journal, "refresh_baselines", side_effect=protect_source_after_baseline), patch(
+                    "production._send_queue_delete") as sender:
+                row = self.execute()
+                sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "container_live_scope_confirmation_required")
 
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
