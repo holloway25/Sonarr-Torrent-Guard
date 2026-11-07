@@ -151,11 +151,18 @@ or set it to `dry-run` for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.
 
-Docker uses this switch as its authorization. Older grant files in appdata are
-ignored by Docker and can be retained for standalone installations or rollback.
-If a previous Docker grant was disabled to stop cleanup, set the Docker mode to
-`dry-run` before updating to this version. Standalone `routine.py` and user
-service installations still use their [private grants](UNATTENDED-TRIAL.md).
+Docker uses the configured mode as its authorization, including on upgrades.
+An existing `live` setting enables qualifying cleanup on the next start, even
+if a previous grant was missing, expired or disabled. Set the Docker mode to
+`dry-run` before updating if you want cleanup to stay off. Older grant files
+can be retained for standalone installations or rollback.
+
+Each live cycle uses the current configured cleanup scope. Changing source
+policy or removing a private indexer exception can make more sources eligible
+on a later cycle. Review those settings before applying changes in live mode. Standalone service installations normally use [private grants](UNATTENDED-TRIAL.md).
+The internal `routine.py --live --container-mode` entry point explicitly selects
+environment-based authorization. It requires `STGUARD_MODE=live` and works on
+any host that invokes it. A container runtime is not an authorization boundary.
 
 For a migration from another worker, stop and disable the old worker first.
 Preserve the complete journal, archive, cursor and identity evidence with the

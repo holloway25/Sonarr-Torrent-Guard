@@ -26,21 +26,18 @@ directory must be owner-private, outside the checkout. It contains exactly:
   requires explicit operator approval and a newly issued grant; no automatic renewal.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
 - `code_digest`: `authorization.code_digest()` for the reviewed application files.
-  Trials require an exact match. For ongoing grants the field is retained and
-  validated for format, and the approved scope and rule govern permission.
+  Trials and ongoing grants require an exact match by default.
 
 An ongoing grant additionally requires `authorization_mode: "ongoing"` and
 `expires_at: null`. Its finite, non-future `issued_at`, scope and rule checks are
-still required. Existing ongoing grants continue across reviewed application
-updates without a file edit. The legacy `"allow_code_updates": true` field is
-accepted on ongoing grants for compatibility. Review releases before promotion
-and use an image source you trust. A scope or workflow change requires a new
-reviewed grant. Null expiry without ongoing mode, duplicate keys, unknown modes
-and extra fields fail closed.
+still required. An operator can add `"allow_code_updates": true` to an ongoing
+standalone grant to authorize reviewed releases within the same scope and rule.
+A scope or workflow change requires a new reviewed grant. Null expiry without
+ongoing mode, duplicate keys, unknown modes and extra fields fail closed.
 
-There is no automatically issued or installed grant. Missing, disabled, expired,
-future-dated, malformed or publicly readable grants fail closed. Trials also
-reject a code mismatch.
+Missing, disabled, expired, future-dated, malformed or publicly readable grants
+fail closed. A code mismatch also fails unless an ongoing grant explicitly
+allows code updates.
 The scope binds all Sonarr/downloader endpoints, pinned clients, categories,
 source-policy mode and public/private lists, work/page limits and minimum age without storing raw
 deployment details in the grant. Secret rotations alone do not expand scope.
@@ -121,7 +118,7 @@ for one EpisodeSearch. It never escalates metadata timeouts to blocklisting.
 The metadata policy gate is enabled, but sender gates and explicit permission
 still apply; the v3 grant cannot silently reuse a v2 grant. File-policy failures
 still use blocklisting and native retry. No DHT/PeX/tracker settings are changed. Rule or scope changes
-require reissuing permission. Code changes require a new grant for trials only.
+require reissuing permission. Code changes require a matching grant unless an ongoing grant allows updates.
 Preserve the original trial deadline when reissuing for a code update.
 
 ## Scheduling, reporting and bounds

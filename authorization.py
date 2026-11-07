@@ -72,8 +72,7 @@ class RoutineAuthorization:
         self.value = json.loads(json.dumps(value))
         self.identifier = digest(self.value)
         self._path = None
-        # The explicit ongoing mode authorizes the configured scope across releases.
-        if self.value.get("authorization_mode") != "ongoing" and self.value["code_digest"] != code_digest():
+        if self.value.get("allow_code_updates") is not True and self.value["code_digest"] != code_digest():
             raise SafetyError("routine_code_not_authorized")
         self.validate(config)
 

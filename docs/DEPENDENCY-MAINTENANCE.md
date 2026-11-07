@@ -64,7 +64,7 @@ three-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
 logs, journals and permissions are retained; changing the base is not authority
 to migrate or reset runtime state. Docker keeps its configured mode across updates.
 Standalone trial grants require refreshed code authorization for application changes.
-Ongoing grants remain valid across reviewed updates within their existing scope.
+Standalone ongoing grants can follow reviewed updates within their scope after explicit opt-in.
 This source configuration alone does not deploy or change an existing container.
 
 Trixie is Debian's current stable release, with full support through August 2028
@@ -141,8 +141,8 @@ retags the exact approved image without rebuilding it.
 The host's existing updater can then pull `latest`; GitHub never connects to the
 host or changes its schedule, appdata or services. Dependency-only image rebuilds
 preserve the configured Docker mode and any standalone grants. For standalone
-workers, reviewed application updates retain an ongoing grant when its cleanup scope
-and rule still match. Trials bind the exact code, and
+workers, reviewed application updates retain an ongoing grant only when it explicitly
+allows code updates and its cleanup scope and rule still match. Other grants bind the exact code, and
 scope or rule changes require a newly approved grant. Existing resolved/unresolved journal evidence
 must be preserved during host updates.
 
