@@ -268,6 +268,17 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(row["stage"], "dispatch_blocked")
         self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
 
+    def test_final_baseline_rejects_different_hash_for_approved_history_id(self):
+        conflicting = dict(self.grab, downloadId="b" * 40)
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.history_since", side_effect=[[self.grab], [conflicting]]), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
     def test_numeric_history_download_id_cannot_confirm_outcomes(self):
         report = self.digit_hash_report()
         self.context = production.capture_context(self.config, self.s, report,

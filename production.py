@@ -211,18 +211,29 @@ def capture_context(config, api, report, approval_digest, now=None):
         raise SafetyError("ambiguous_release_title_evidence")
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
+    approved_by_id = {grab["id"]: grab for grab in grabs}
     approved_ids = {(grab["seriesId"], grab["episodeId"]): grab["id"] for grab in grabs}
     # Recent history is a second read. Do not hide evidence that arrived
     # between the targeted lookup and this baseline behind a baseline ID.
     oldest_approved_id = min(approved_ids.values())
     try:
+        for row in baseline_history:
+            approved = approved_by_id.get(row["id"])
+            if approved is None:
+                continue
+            if (torrent_hash(row.get("downloadId")) != report["hash"]
+                    or history_event_type(row) != "grabbed"
+                    or any(not integer(row.get(key)) or row[key] != approved[key]
+                           for key in ("seriesId", "episodeId"))
+                    or grab_indexer(row) != report["indexer"]
+                    or row.get("sourceTitle") != approved["sourceTitle"]):
+                raise SafetyError("identity_or_manifest_changed")
         recent_grabs = select_latest_grabs(
             (row for row in baseline_history if row["id"] >= oldest_approved_id),
             report["hash"], identities, require_all=False)
         for grab in recent_grabs:
             approved_id = approved_ids[(grab["seriesId"], grab["episodeId"])]
-            if (grab["id"] > approved_id or
-                    (grab["id"] == approved_id and grab_indexer(grab) != report["indexer"])):
+            if grab["id"] > approved_id:
                 raise SafetyError("identity_or_manifest_changed")
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
