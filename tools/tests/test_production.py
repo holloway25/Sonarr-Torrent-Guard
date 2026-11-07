@@ -186,7 +186,7 @@ class ProductionTests(unittest.TestCase):
         self.grab["downloadId"] = int(self.hash)
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["decision"], "skip")
-        self.assertEqual(report["reason"], "no_sonarr_grab_history")
+        self.assertEqual(report["reason"], "invalid_history_download_id")
 
     def test_context_capture_rejects_numeric_history_download_id(self):
         report = self.digit_hash_report()
@@ -204,10 +204,47 @@ class ProductionTests(unittest.TestCase):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
                 "production.capture_context", side_effect=capture_with_numeric_id), patch(
                 "production._send_queue_delete") as sender:
-            with self.assertRaisesRegex(SafetyError, "ambiguous_release_title_evidence"):
+            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
                 production.execute_single_test(self.config, self.qb, self.apis,
                                                self.journal, report, approval)
             sender.assert_not_called()
+
+    def test_newer_private_grab_never_falls_back_to_older_public_grab(self):
+        self.digit_hash_report()
+        private = dict(self.grab, id=self.grab["id"] + 1,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, private]}
+        for download_id, reason in ((self.hash, "private_source_protected"),
+                                    (int(self.hash), "invalid_history_download_id")):
+            with self.subTest(download_id=download_id):
+                private["downloadId"] = download_id
+                report = run(self.config, self.qb, self.apis)[0]
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], reason)
+
+    def test_final_history_read_blocks_newer_private_grab_before_delete(self):
+        capture = production.capture_context
+        private = dict(self.grab, id=self.grab["id"] + 1,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        calls = 0
+
+        def inject_on_final_capture(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.s.routes["/api/v3/history"] = {
+                    "totalRecords": 2, "records": [self.grab, private]}
+            return capture(*args, **kwargs)
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.capture_context", side_effect=inject_on_final_capture), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(calls, 2)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
 
     def test_numeric_history_download_id_cannot_confirm_outcomes(self):
         report = self.digit_hash_report()

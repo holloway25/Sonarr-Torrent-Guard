@@ -346,55 +346,67 @@ def classify_source(policy, source):
     return "public" if source in policy["public"] else "unknown"
 
 
-def source_for(api, hash_value, rows, max_pages, added=None):
+def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
     history = records(api, "/api/v3/history", {
         # Preserve Sonarr's original spelling for its case-sensitive DB filter.
-        "eventType": 1, "downloadId": rows[0]["downloadId"],
+        "eventType": 1, "downloadId": spelling,
         "sortKey": "date", "sortDirection": "descending",
     }, max_pages)
-    matches = []
+    latest = {}
+    has_matching_hash = False
     for grab in history:
+        identity = (grab.get("seriesId"), grab.get("episodeId"))
+        valid_identity = all(integer(value) and value > 0 for value in identity)
         try:
             grab_hash = torrent_hash(grab.get("downloadId"))
         except GuardError:
+            # A malformed grab returned by the target-filtered query can hide
+            # the true source. Only a known unrelated identity can rule it out.
+            if (not valid_identity or identity in identities) and history_event_type(grab) == "grabbed":
+                raise GuardError("invalid_history_download_id") from None
             continue
-        if grab_hash != hash_value:
+        if grab_hash != hash_value or history_event_type(grab) != "grabbed":
             continue
-        if history_event_type(grab) != "grabbed":
-            continue
-        if any(not integer(grab.get(field)) or grab[field] <= 0 for field in ("seriesId", "episodeId")):
+        has_matching_hash = True
+        if not valid_identity:
             raise GuardError("unknown_content_identity")
-        matches.append(grab)
-    if not matches:
+        if identity in identities and (identity not in latest or grab["id"] > latest[identity]["id"]):
+            latest[identity] = grab
+    if not has_matching_hash:
         raise GuardError("no_sonarr_grab_history")
-    sources, grab_ids, grab_times = set(), set(), []
+    if latest.keys() != identities:
+        raise GuardError("content_identity_not_in_grab_history")
+    return list(latest.values())
+
+
+def grab_indexer(grab):
+    data = grab.get("data")
+    if (not isinstance(data, dict) or not isinstance(data.get("indexer"), str)
+            or not data["indexer"].strip()):
+        raise GuardError("missing_indexer_identity")
+    return data["indexer"]
+
+
+def source_for(api, hash_value, rows, max_pages, added=None):
+    identities = set()
     for row in rows:
-        series_id, episode_id = row.get("seriesId"), row.get("episodeId")
-        if not integer(series_id) or series_id <= 0 or not integer(episode_id) or episode_id <= 0:
+        identity = (row.get("seriesId"), row.get("episodeId"))
+        if any(not integer(value) or value <= 0 for value in identity):
             raise GuardError("unknown_content_identity")
-        matching = [r for r in matches if r.get("seriesId") == series_id
-                    and r.get("episodeId") == episode_id]
-        if not matching:
-            raise GuardError("content_identity_not_in_grab_history")
-        # A repeated hash can have older grabs from other sources. Bind only
-        # the newest grab for each affected episode to this download incarnation.
-        latest = max(matching, key=lambda r: r["id"])
+        identities.add(identity)
+    grabs = latest_history_grabs(api, hash_value, rows[0]["downloadId"], identities, max_pages)
+    sources, grab_ids, grab_times = set(), set(), []
+    for grab in grabs:
         try:
-            stamp = datetime.datetime.fromisoformat(latest["date"].replace("Z", "+00:00"))
+            stamp = datetime.datetime.fromisoformat(grab["date"].replace("Z", "+00:00"))
             if stamp.tzinfo is None or added is None or abs(stamp.timestamp() - added) > 120:
                 raise ValueError()
         except (KeyError, TypeError, AttributeError, ValueError):
             raise GuardError("grab_not_bound_to_current_download") from None
-        matching = [latest]
-        grab_ids.add(latest["id"])
+        grab_ids.add(grab["id"])
         grab_times.append(stamp.timestamp())
-        for r in matching:
-            data = r.get("data")
-            if (not isinstance(data, dict) or not isinstance(data.get("indexer"), str)
-                    or not data["indexer"].strip()):
-                raise GuardError("missing_indexer_identity")
-            sources.add(data["indexer"])
-    if len(sources) != 1 or not next(iter(sources)):
+        sources.add(grab_indexer(grab))
+    if len(sources) != 1:
         raise GuardError("ambiguous_indexer_identity")
     return next(iter(sources)), sorted(grab_ids), min(grab_times)
 

@@ -16,7 +16,8 @@ import time
 import urllib.parse
 import urllib.request
 
-from guard import (Api, GuardError, endpoint_key, hard_deadline, history_event_type, integer, load_config,
+from guard import (Api, GuardError, endpoint_key, grab_indexer, hard_deadline, history_event_type,
+                   integer, latest_history_grabs, load_config,
                    records, recheck_candidate, run, torrent_hash, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
@@ -195,27 +196,17 @@ def capture_context(config, api, report, approval_digest, now=None):
     client = bound_client(config, api, report["instance"])
     if torrent_hash(report.get("download_id_spelling")) != report["hash"]:
         raise SafetyError("invalid_history_download_id")
-    grabs = records(api, "/api/v3/history", {"eventType": 1,
-                    "downloadId": report["download_id_spelling"]}, config.get("max_pages", 20))
-    matched = []
-    for grab in grabs:
-        try:
-            grab_hash = torrent_hash(grab.get("downloadId"))
-        except GuardError:
-            continue
-        if grab_hash != report["hash"]:
-            continue
-        if history_event_type(grab) != "grabbed":
-            continue
-        if any(not integer(grab.get(field)) or grab[field] <= 0 for field in ("seriesId", "episodeId")):
-            raise SafetyError("invalid_history_identity")
-        if (grab["seriesId"] == series[0] and grab["episodeId"] in episodes
-                and grab["id"] in report["grab_ids"]):
-            matched.append(grab)
-    grabs = matched
+    try:
+        grabs = latest_history_grabs(api, report["hash"], report["download_id_spelling"],
+                                     {(series[0], episode) for episode in episodes},
+                                     config.get("max_pages", 20))
+        sources = {grab_indexer(grab) for grab in grabs}
+    except GuardError:
+        raise SafetyError("identity_or_manifest_changed") from None
+    if sorted(grab["id"] for grab in grabs) != report["grab_ids"] or sources != {report["indexer"]}:
+        raise SafetyError("identity_or_manifest_changed")
     titles = {g.get("sourceTitle") for g in grabs}
-    if (not grabs or len(titles) != 1 or not all(isinstance(t, str) and t for t in titles)
-            or {g["episodeId"] for g in grabs} != set(report["episode_ids"])):
+    if len(titles) != 1 or not all(isinstance(t, str) and t for t in titles):
         raise SafetyError("ambiguous_release_title_evidence")
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
