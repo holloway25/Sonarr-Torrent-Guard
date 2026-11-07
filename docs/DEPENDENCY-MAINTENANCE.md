@@ -62,8 +62,8 @@ bounded shutdown. Automatic release rejects previous Python-family or Bookworm
 baselines: the first Trixie image needs explicit reviewed promotion before
 three-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
 logs, journals and permissions are retained; changing the base is not authority
-to migrate or reset runtime state. Application changes bundled with a migration
-still require approved code-bound live authorization before deployment.
+to migrate or reset runtime state. Trial grants require refreshed code authorization for application changes.
+Ongoing grants remain valid across reviewed updates within their existing scope.
 This source configuration alone does not deploy or change an existing container.
 
 Trixie is Debian's current stable release, with full support through August 2028
@@ -139,9 +139,9 @@ retags the exact approved image without rebuilding it.
 
 The host's existing updater can then pull `latest`; GitHub never connects to the
 host or changes its schedule, appdata or services. Dependency-only image rebuilds
-with identical application source/scope retain their code-bound permission.
-Application-source or scope changes still require a newly approved grant; image
-tags never bypass authorization. Existing resolved/unresolved journal evidence
+retain existing grants. Reviewed application updates retain an ongoing grant
+within the same cleanup scope and rule. Trials still bind the exact code, and
+scope or rule changes require a newly approved grant. Existing resolved/unresolved journal evidence
 must be preserved during host updates.
 
 References: [Dependabot configuration](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configure-version-updates),

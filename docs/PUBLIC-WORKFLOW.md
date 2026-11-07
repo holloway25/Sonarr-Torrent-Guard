@@ -2,7 +2,7 @@
 
 A gated single-test sender and read-only production verifier exist for review.
 Manual sender release gates are false; the separate unattended entry point needs
-an explicit code/scope-bound trial or separately approved ongoing grant. See
+an explicit code/scope-bound trial or separately approved scope-bound ongoing grant. See
 [unattended authorization](UNATTENDED-TRIAL.md). Unit-tested requests do not establish
 production mutation behaviour or implicitly authorize live operation.
 Private-source downloads remain protected; the private archive helper and web UI
@@ -15,7 +15,7 @@ Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):
 new containers treat identified sources as public except private exclusions;
 legacy allowlists remain supported. Private matches and missing, malformed or
 ambiguous source identity are protected before manifest assessment. A policy
-change requires new reviewed code/scope authorization, not a journal reset.
+change requires new reviewed authorization, not a journal reset.
 Dispatch/recovery behaviour is tested using simulations and mocked production
 adapters. Enable
 `--check-safeguards` to exercise rechecks and preview journaling against the APIs.

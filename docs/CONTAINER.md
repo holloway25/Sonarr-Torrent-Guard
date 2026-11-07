@@ -38,7 +38,7 @@ Test builds reuse cached image layers; maintenance and manual publishing builds
 still pull the base and rerun package upgrades without reusing cached RUN layers.
 Dependency-only updates are released after tests and unchanged-application checks;
 application changes still require review. Rebuilding can update packages even
-for the same source. Application-code/scope changes still require fresh live
+for the same source. Scope changes and trial-grant code changes still require fresh live
 authorization; a release tag does not bypass runtime permission checks.
 New GHCR packages default to private; package access/visibility is an operator
 decision. Never paste registry/API credentials into issues or build logs.
@@ -68,7 +68,7 @@ by the operator; they are not claimed to be hidden from root.
 
 | Variables | Meaning |
 | --- | --- |
-| `STGUARD_MODE` | Defaults to `dry-run`; `live` additionally requires a private valid code/scope-bound grant |
+| `STGUARD_MODE` | Defaults to `dry-run`; `live` additionally requires a private valid scope-bound grant |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
 | `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
@@ -90,7 +90,7 @@ Legacy environment templates with public-list variables and no explicit policy
 retain allowlist mode. File configurations without a mode also retain allowlists.
 Changing a persisted mode requires explicitly selecting the new environment
 policy (or deliberately editing a file in file-source mode), and a new reviewed
-code/scope grant before live use. Old approvals cannot authorize the broader mode.
+scope-bound grant before live use. Old approvals cannot authorize the broader mode.
 The binding endpoint is QBIT_URL, maintaining the exact endpoint contract. Config
 stays `dry_run: true`. New appdata uses labels Sonarr-HD and Sonarr-UHD. When a
 config already exists, environment mode matches normalized Sonarr/downloader
@@ -149,12 +149,11 @@ Docker log rotation on the host too. No automatic journal archival is enabled.
 
 `CONTAINER_LIVE_RELEASE_ENABLED=true` releases only the reviewed container entry
 point, not permission to send. Setting live mode alone cannot activate it: startup
-requires a private valid code/scope-bound grant, including for `--check-config`.
+requires a private valid scope-bound grant, including for `--check-config`.
 The routine worker reloads/revalidates permission every cycle and before dispatch.
 The image never issues or renews grants. Existing trial grants retain their
 seven-day limit; ongoing operation requires a separately approved explicit ongoing
-grant, not migration of an expired trial. Container worker source is included in
-the approval code digest. See [authorization](UNATTENDED-TRIAL.md).
+grant, not migration of an expired trial. Trial grants also bind the application code, including the container worker. See [authorization](UNATTENDED-TRIAL.md).
 
 Before cutover:
 
@@ -167,7 +166,7 @@ Before cutover:
    archive, cursor and identity evidence, not just credentials/hashes. Never copy
    a database while a writer is active or replace it with an old snapshot.
 5. Revalidate labels, bindings, sources, categories, permissions and clock. Issue
-   a new explicit code/scope-bound grant for that source; do not silently extend
+   a new explicit scope-bound grant for that source; do not silently extend
    an existing expiry. A source/image change invalidates old code authorization.
 6. Run ONE live worker, verify logs and the first eligible action. Keep the old
    worker disabled. Rollback must stop the new worker and preserve newer evidence

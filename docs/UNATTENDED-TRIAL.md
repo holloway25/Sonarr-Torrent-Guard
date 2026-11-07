@@ -22,16 +22,20 @@ directory must be owner-private, outside the checkout. It contains exactly:
   requires explicit operator approval and a newly issued grant; no automatic renewal.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
 - `code_digest`: `authorization.code_digest()` for the reviewed application files.
+  Trials require an exact match. Ongoing grants retain this field for compatibility
+  and require valid digest syntax.
 
 An ongoing grant additionally requires `authorization_mode: "ongoing"` and
-`expires_at: null`. Its finite, non-future `issued_at`, all other fields and all
-code/scope checks are still required. Null expiry without this explicit mode,
-unknown modes, mixed trial/ongoing formats and extra fields fail closed. Ongoing
-permission has no scheduled expiry; it does not authorize different code,
-endpoints, source policy or workflow. Updates require a new reviewed grant.
+`expires_at: null`. Its finite, non-future `issued_at`, all other fields and its
+scope and rule checks are still required. Null expiry without this explicit mode,
+unknown modes, mixed trial/ongoing formats and extra fields fail closed. An ongoing
+grant stays valid across application updates within the same scope and rule. Use
+an image source you trust and review application releases before promotion.
+Scope or workflow changes require a new reviewed grant.
 
 There is no automatically issued or installed grant. Missing, disabled, expired,
-future-dated, malformed, publicly readable or wrong-code grants fail closed.
+future-dated, malformed or publicly readable grants fail closed. Trials also
+reject a code mismatch.
 The scope binds all Sonarr/downloader endpoints, pinned clients, categories,
 source-policy mode and public/private lists, work/page limits and minimum age without storing raw
 deployment details in the grant. Secret rotations alone do not expand scope.
@@ -109,9 +113,9 @@ blocklisting, confirms original-incarnation absence, and then asks owning Sonarr
 for one EpisodeSearch. It never escalates metadata timeouts to blocklisting.
 The metadata policy gate is enabled, but sender gates and explicit permission
 still apply; the v3 grant cannot silently reuse a v2 grant. File-policy failures
-still use blocklisting and native retry. No DHT/PeX/tracker settings are changed. New rule/code/scope
-digests require reissuing explicit permission; an existing trial deadline must
-not be extended merely to deploy the fix.
+still use blocklisting and native retry. No DHT/PeX/tracker settings are changed. Rule or scope changes
+require reissuing permission. Code changes require a new grant for trials only.
+Preserve the original trial deadline when reissuing for a code update.
 
 ## Scheduling, reporting and bounds
 

@@ -2,7 +2,7 @@
 
 The reviewed policy gate `METADATA_RETRY_RELEASE_ENABLED` is enabled, but does
 not authorize requests on its own. Manual/test sender gates remain disabled;
-routine execution requires explicit live mode and a valid code/scope-bound v3
+routine execution requires explicit live mode and a valid scope-bound v3
 grant. Deployment approval and the new grant are required; existing live
 checkouts/grants are not changed automatically. Ordinary commands stay dry-run.
 

@@ -2,11 +2,11 @@
 
 This implementation is for review. `retention.ARCHIVE_RELEASE_ENABLED` is false;
 no service/timer or automatic worker call is added. Deployment and application
-need explicit approval after review. Do not update an authorized running checkout
-casually: changes to safety.py affect the grant's code digest. Housekeeping never
+need explicit approval after review. Review changes to an authorized running checkout before deployment.
+Changes to safety.py affect the code digest checked by trial grants. Housekeeping never
 extends permission, changes queue/client settings or sends network requests.
 
-Deploy the archive-aware worker FIRST, and verify its source-bound permission,
+Deploy the archive-aware worker FIRST, and verify its authorization,
 before enabling or applying archival. Never move production rows while an older
 worker that cannot read archives could later resume. Acquiring its lock alone
 does not upgrade that worker. Stop incompatible worker versions and preserve a

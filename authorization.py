@@ -49,7 +49,9 @@ class RoutineAuthorization:
             raise SafetyError("routine_authorization_invalid")
         self.value = json.loads(json.dumps(value))
         self.identifier = digest(self.value)
-        if self.value["code_digest"] != code_digest():
+        # Ongoing grants trust the installed release within the approved scope.
+        # Trials still authorize one exact set of application files.
+        if self.value.get("authorization_mode") != "ongoing" and self.value["code_digest"] != code_digest():
             raise SafetyError("routine_code_not_authorized")
         self.validate(config)
 

@@ -193,7 +193,7 @@ class ContainerTests(unittest.TestCase):
             self.assertEqual(worker.main(), 1)
         cycle.assert_not_called()
 
-    def test_live_mode_requires_exact_private_grant_even_for_config_check(self):
+    def test_live_mode_requires_private_scope_grant_even_for_config_check(self):
         import secrets
         from authorization import RULE, RoutineAuthorization, code_digest, scope_digest
         from safety import SafetyError
@@ -203,7 +203,8 @@ class ContainerTests(unittest.TestCase):
                  "issued_at": time.time() - 1, "expires_at": None, "authorization_mode": "ongoing",
                  "scope_digest": scope_digest(config), "code_digest": code_digest()}
         path = self.path / "routine-authorization.json"
-        for changes, expected in (({}, 0), ({"enabled": False}, 1), ({"code_digest": "e" * 64}, 1),
+        for changes, expected in (({}, 0), ({"enabled": False}, 1), ({"code_digest": "e" * 64}, 0),
+                                  ({"code_digest": "malformed"}, 1),
                                   ({"scope_digest": "f" * 64}, 1)):
             worker.atomic_json(path, dict(grant, **changes))
             with self.subTest(changes=changes), patch.dict(os.environ, env, clear=True), patch(

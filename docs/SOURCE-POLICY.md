@@ -50,5 +50,5 @@ Policy changes do not enable any live gate or issue/renew a grant.
 
 Before live adoption, review the exact private exceptions for BOTH owners and
 the updated code, retain the complete journal, and explicitly authorize the new
-code/scope. Do not clear holds, remove private exceptions or reuse an old grant to
+scope. Do not clear holds, remove private exceptions or reuse an old grant to
 work around a refusal. Updating source/template/image alone is not activation.

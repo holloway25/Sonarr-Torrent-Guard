@@ -101,9 +101,9 @@ class RoutineTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             RoutineAuthorization(dict(self.grant, expires_at=None), self.f.config)
 
-    def test_ongoing_grant_still_checks_time_code_scope_and_enabled(self):
+    def test_ongoing_grant_still_checks_time_scope_and_enabled(self):
         for changes in ({"issued_at": time.time() + 60}, {"issued_at": True}, {"issued_at": float("nan")},
-                        {"enabled": False}, {"scope_digest": "e" * 64}, {"code_digest": "f" * 64}):
+                        {"enabled": False}, {"scope_digest": "e" * 64}, {"code_digest": "malformed"}):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 RoutineAuthorization(dict(self.ongoing_grant(), **changes), self.f.config)
 

@@ -94,4 +94,4 @@ jobs:
           docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" \
             --metadata-file "$RUNNER_TEMP/dependency-release.json" "$IMAGE@$DIGEST"
           test "$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/dependency-release.json")" = "$DIGEST"
-          printf 'Automatic dependency-only release: %s\nApplication files unchanged; existing grant remains code-bound.\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Automatic dependency-only release: %s\nApplication files unchanged; existing authorization remains valid within its scope.\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

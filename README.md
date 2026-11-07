@@ -7,7 +7,7 @@ Distributed without warranty; see the licence for its full terms.
 A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
-are currently enabled by default. The routine CLI requires explicit code/scope-bound
+are currently enabled by default. The routine CLI requires explicit scope-bound
 trial or ongoing permission. A metadata-only removal and additional episode search is
 implemented with a reviewed policy gate; actual sending still requires separate
 authorization and sender gates. No resume, extraction,
@@ -313,8 +313,9 @@ Paths are templates; review them for the chosen installation before any use.
 ## Unattended entry point
 
 `routine.py --live` uses a separate explicit, owner-private authorization grant
-bound to the reviewed application and configured scope. Trial grants last at most
-seven days; ongoing operation requires a separately approved explicit ongoing grant.
+bound to the configured scope. Trial grants last at most seven days and also
+bind the exact application code. An explicitly approved ongoing grant survives
+reviewed code updates within its existing scope.
 There is no installed/enabled grant by default. It uses the same coordinator and
 Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
 action and grant digest; old uncertain evidence is preserved, while a strictly
@@ -330,7 +331,7 @@ maintenance, expiry, reporting and capacity boundaries.
 - Review the disabled sender and production verifier, then explicitly approve a
   controlled single-torrent integration test separately. Define independent data
   deletion confirmation. Guard/public commands remain dry-run; the routine worker
-  requires explicit live mode and a valid code/scope-bound grant (an unexpired
+  requires explicit live mode and a valid scope-bound grant (an unexpired
   trial or separately approved ongoing permission).
 - Longer term: define private split-RAR selection, share access, safe extraction, atomic
   publication, positive import confirmation and exact helper-file cleanup.
