@@ -28,11 +28,12 @@ For file configuration:
 }
 ```
 
-The same classification is checked during assessment and routine authorization,
-including final fresh checks before dispatch. Full source policy is bound into
-the ownership fingerprint and grant scope; changing mode or lists invalidates
-previous approval. Adding a private exception before sending blocks that action.
-Policy changes do not enable any live gate or issue/renew a grant.
+Guard checks the same classification during assessment and before dispatch.
+The full source policy is bound to each candidate's ownership fingerprint.
+A mode or list change invalidates a standalone grant whose approved scope no
+longer matches. In Docker, `STGUARD_MODE=live` authorizes qualifying cleanup
+under the configuration loaded for each cycle. Changing the lists can change
+eligibility on a later cycle, including when a private exception is removed.
 
 ## Existing configurations and migration
 
@@ -48,7 +49,8 @@ Policy changes do not enable any live gate or issue/renew a grant.
 - New private-exception mode ignores any obsolete public list; a private match
   always wins. Invalid policy modes/lists fail closed.
 
-Before live adoption, review the exact private exceptions for BOTH owners and
-the updated code, retain the complete journal, and explicitly authorize the new
-scope. Do not clear holds, remove private exceptions or reuse an old grant to
-work around a refusal. Updating source/template/image alone is not activation.
+Before running with a changed policy, review the exact private exceptions for
+both Sonarr owners and retain the complete journal. Standalone workers need a
+grant for the new scope. Docker workers follow the configured mode. Set
+`STGUARD_MODE=dry-run` before applying policy changes if you want to review their
+effect before cleanup resumes.
