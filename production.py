@@ -18,7 +18,7 @@ import urllib.request
 
 from guard import (Api, GuardError, endpoint_key, grab_indexer, hard_deadline, history_event_type,
                    integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, torrent_hash, verify_client_binding)
+                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -196,9 +196,10 @@ def capture_context(config, api, report, approval_digest, now=None):
     client = bound_client(config, api, report["instance"])
     if torrent_hash(report.get("download_id_spelling")) != report["hash"]:
         raise SafetyError("invalid_history_download_id")
+    identities = {(series[0], episode) for episode in episodes}
     try:
         grabs = latest_history_grabs(api, report["hash"], report["download_id_spelling"],
-                                     {(series[0], episode) for episode in episodes},
+                                     identities,
                                      config.get("max_pages", 20))
         sources = {grab_indexer(grab) for grab in grabs}
     except GuardError:
@@ -210,6 +211,21 @@ def capture_context(config, api, report, approval_digest, now=None):
         raise SafetyError("ambiguous_release_title_evidence")
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
+    approved_ids = {(grab["seriesId"], grab["episodeId"]): grab["id"] for grab in grabs}
+    # Recent history is a second read. Do not hide evidence that arrived
+    # between the targeted lookup and this baseline behind a baseline ID.
+    oldest_approved_id = min(approved_ids.values())
+    try:
+        recent_grabs = select_latest_grabs(
+            (row for row in baseline_history if row["id"] >= oldest_approved_id),
+            report["hash"], identities, require_all=False)
+        for grab in recent_grabs:
+            approved_id = approved_ids[(grab["seriesId"], grab["episodeId"])]
+            if (grab["id"] > approved_id or
+                    (grab["id"] == approved_id and grab_indexer(grab) != report["indexer"])):
+                raise SafetyError("identity_or_manifest_changed")
+    except GuardError:
+        raise SafetyError("identity_or_manifest_changed") from None
     blocklist = records(api, "/api/v3/blocklist", {"seriesIds": series[0]}, config.get("max_pages", 20))
     context = {
         "instance": report["instance"], "hash": report["hash"], "series_id": series[0],

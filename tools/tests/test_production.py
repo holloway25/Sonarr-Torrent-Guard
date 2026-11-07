@@ -246,6 +246,28 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(row["stage"], "dispatch_blocked")
         self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
 
+    def test_final_baseline_history_blocks_newer_private_grab_before_delete(self):
+        history_since = production.history_since
+        private = dict(self.grab, id=self.grab["id"] + 1,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        calls = 0
+
+        def inject_into_final_baseline(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            rows = history_since(*args, **kwargs)
+            return [*rows, private] if calls == 2 else rows
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.history_since", side_effect=inject_into_final_baseline), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(calls, 2)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
     def test_numeric_history_download_id_cannot_confirm_outcomes(self):
         report = self.digit_hash_report()
         self.context = production.capture_context(self.config, self.s, report,

@@ -352,6 +352,10 @@ def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
         "eventType": 1, "downloadId": spelling,
         "sortKey": "date", "sortDirection": "descending",
     }, max_pages)
+    return select_latest_grabs(history, hash_value, identities)
+
+
+def select_latest_grabs(history, hash_value, identities, require_all=True):
     latest = {}
     has_matching_hash = False
     for grab in history:
@@ -360,8 +364,8 @@ def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
         try:
             grab_hash = torrent_hash(grab.get("downloadId"))
         except GuardError:
-            # A malformed grab returned by the target-filtered query can hide
-            # the true source. Only a known unrelated identity can rule it out.
+            # A malformed grab can hide the true source. Only a known
+            # unrelated identity can rule it out.
             if (not valid_identity or identity in identities) and history_event_type(grab) == "grabbed":
                 raise GuardError("invalid_history_download_id") from None
             continue
@@ -372,9 +376,9 @@ def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
             raise GuardError("unknown_content_identity")
         if identity in identities and (identity not in latest or grab["id"] > latest[identity]["id"]):
             latest[identity] = grab
-    if not has_matching_hash:
+    if require_all and not has_matching_hash:
         raise GuardError("no_sonarr_grab_history")
-    if latest.keys() != identities:
+    if require_all and latest.keys() != identities:
         raise GuardError("content_identity_not_in_grab_history")
     return list(latest.values())
 
