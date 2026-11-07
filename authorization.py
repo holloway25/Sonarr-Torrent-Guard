@@ -3,10 +3,13 @@
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import stat
 import time
 
-from guard import endpoint_key, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source
+from guard import (endpoint_key, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
+                   unique_config_keys)
 from safety import SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v3"
@@ -39,23 +42,48 @@ def scope_digest(config):
     return digest(scope)
 
 
+def read_grant(path):
+    try:
+        if path.is_symlink() or path.parent.stat().st_mode & 0o077:
+            raise ValueError()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        with os.fdopen(os.open(path, flags), "rb") as file:
+            mode = os.fstat(file.fileno()).st_mode
+            if not stat.S_ISREG(mode) or mode & 0o077:
+                raise ValueError()
+            data = file.read(8193)
+        if len(data) > 8192:
+            raise ValueError()
+        return json.loads(data, object_pairs_hook=unique_config_keys)
+    except Exception:
+        raise SafetyError("routine_authorization_unavailable") from None
+
+
 class RoutineAuthorization:
     def __init__(self, value, config):
         fields = {"enabled", "rule", "grant_id", "issued_at", "expires_at", "scope_digest", "code_digest"}
         if (not isinstance(value, dict)
-                or set(value) not in (fields, fields | {"authorization_mode"})
+                or set(value) not in (fields, fields | {"authorization_mode"},
+                                      fields | {"authorization_mode", "allow_code_updates"})
                 or ("authorization_mode" in value and value["authorization_mode"] != "ongoing")
-                or (value.get("authorization_mode") == "ongoing" and value["expires_at"] is not None)):
+                or (value.get("authorization_mode") == "ongoing" and value["expires_at"] is not None)
+                or ("allow_code_updates" in value and value["allow_code_updates"] is not True)):
             raise SafetyError("routine_authorization_invalid")
         self.value = json.loads(json.dumps(value))
         self.identifier = digest(self.value)
-        # Ongoing grants trust the installed release within the approved scope.
-        # Trials still authorize one exact set of application files.
-        if self.value.get("authorization_mode") != "ongoing" and self.value["code_digest"] != code_digest():
+        self._path = None
+        if self.value.get("allow_code_updates") is not True and self.value["code_digest"] != code_digest():
             raise SafetyError("routine_code_not_authorized")
         self.validate(config)
 
     def validate(self, config, report=None):
+        if self._path is not None:
+            try:
+                current = read_grant(self._path)
+            except SafetyError:
+                raise SafetyError("routine_authorization_revoked_or_changed") from None
+            if digest(current) != self.identifier:
+                raise SafetyError("routine_authorization_revoked_or_changed")
         v = self.value
         now = time.time()
         ongoing = v.get("authorization_mode") == "ongoing"
@@ -87,14 +115,7 @@ class RoutineAuthorization:
 
     @classmethod
     def load(cls, path, config):
-        path = Path(path)
-        try:
-            if path.is_symlink() or path.stat().st_mode & 0o077 or path.parent.stat().st_mode & 0o077:
-                raise ValueError()
-            if path.stat().st_size > 8192:
-                raise ValueError()
-            return cls(json.loads(path.read_text()), config)
-        except SafetyError:
-            raise
-        except Exception:
-            raise SafetyError("routine_authorization_unavailable") from None
+        path = Path(path).absolute()
+        authority = cls(read_grant(path), config)
+        authority._path = path
+        return authority

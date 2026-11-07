@@ -107,6 +107,67 @@ class RoutineTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 RoutineAuthorization(dict(self.ongoing_grant(), **changes), self.f.config)
 
+    def test_code_updates_require_explicit_ongoing_opt_in(self):
+        old_code = "f" * 64
+        ongoing = dict(self.ongoing_grant(), code_digest=old_code)
+        with self.assertRaisesRegex(SafetyError, "routine_code_not_authorized"):
+            RoutineAuthorization(ongoing, self.f.config)
+        RoutineAuthorization(dict(ongoing, allow_code_updates=True), self.f.config)
+        for grant in (dict(ongoing, allow_code_updates=1),
+                      dict(ongoing, allow_code_updates=False),
+                      dict(self.grant, allow_code_updates=True)):
+            with self.subTest(grant=grant), self.assertRaisesRegex(SafetyError, "routine_authorization_invalid"):
+                RoutineAuthorization(grant, self.f.config)
+
+    def write_grant(self, value):
+        path = Path(self.f.folder.name) / "routine-authorization.json"
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+        return path
+
+    def test_grant_file_rejects_duplicate_enable_and_expiry(self):
+        grant = self.ongoing_grant()
+        path = self.write_grant(grant)
+        original = path.read_text()
+        RoutineAuthorization.load(path, self.f.config)
+        for before, after in (('"enabled": true', '"enabled": false, "enabled": true'),
+                              ('"expires_at": null', '"expires_at": 1, "expires_at": null')):
+            with self.subTest(field=before):
+                path.write_text(original.replace(before, after))
+                with self.assertRaisesRegex(SafetyError, "routine_authorization_unavailable"):
+                    RoutineAuthorization.load(path, self.f.config)
+
+    def test_loaded_grant_rejects_removal_and_replacement(self):
+        for removed in (True, False):
+            with self.subTest(removed=removed):
+                path = self.write_grant(self.ongoing_grant())
+                authority = RoutineAuthorization.load(path, self.f.config)
+                if removed:
+                    path.unlink()
+                else:
+                    self.write_grant(dict(self.ongoing_grant(), grant_id="d" * 64))
+                with self.assertRaisesRegex(SafetyError, "routine_authorization_revoked_or_changed"):
+                    authority.validate(self.f.config, self.f.report)
+
+    def test_final_dispatch_blocks_grant_disabled_after_baseline_commit(self):
+        grant = dict(self.ongoing_grant(), allow_code_updates=True)
+        path = self.write_grant(grant)
+        self.authority = RoutineAuthorization.load(path, self.f.config)
+        refresh = self.f.journal.refresh_baselines
+
+        def revoke_after_refresh(*args, **kwargs):
+            row = refresh(*args, **kwargs)
+            self.write_grant(dict(grant, enabled=False))
+            return row
+
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                self.f.journal, "refresh_baselines", side_effect=revoke_after_refresh), patch(
+                "production._send_queue_delete") as sender:
+            row = self.execute()
+            sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "routine_authorization_revoked_or_changed")
+
     def test_ongoing_authority_cannot_be_changed_in_memory(self):
         authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
         # Still structurally valid and enabled: only the integrity check rejects it.
@@ -145,17 +206,11 @@ class RoutineTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_auth_file_requires_private_permissions_and_valid_content(self):
-        path = Path(self.f.folder.name) / "routine-authorization.json"
-        # Test-only fixture file, not an installed permission grant.
-        with patch.object(Path, "read_text", return_value=json.dumps(self.grant)), patch.object(
-                Path, "stat") as stat:
-            stat.return_value.st_mode = 0o600
-            stat.return_value.st_size = 500
-            with patch.object(Path, "is_symlink", return_value=False):
-                self.assertEqual(RoutineAuthorization.load(path, self.f.config).identifier, self.authority.identifier)
-                stat.return_value.st_mode = 0o644
-                with self.assertRaises(SafetyError):
-                    RoutineAuthorization.load(path, self.f.config)
+        path = self.write_grant(self.grant)
+        self.assertEqual(RoutineAuthorization.load(path, self.f.config).identifier, self.authority.identifier)
+        path.chmod(0o644)
+        with self.assertRaises(SafetyError):
+            RoutineAuthorization.load(path, self.f.config)
 
     def newer_attempt(self, legacy=False):
         f = self.f

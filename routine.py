@@ -20,6 +20,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
     "journal_capacity_reached", "previous_attempt_unresolved", "another_run_is_active",
     "approval_already_consumed", "new_attempt_not_confirmed", "attempt_identity_required",
     "routine_authorization_invalid", "routine_code_not_authorized",
+    "routine_authorization_revoked_or_changed",
     "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
     "metadata_retry_not_released",
     "journal_history_limit_reached", "journal_archive_capacity_reached", "invalid_archive_evidence",

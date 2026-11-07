@@ -607,9 +607,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
     def validate():
         if not _enabled(config, journal, mode, authority):
             raise SafetyError("live_execution_disabled")
-        validate_approval(approval, report)
         if authority is not None:
             authority.validate(config, report)
+        validate_approval(approval, report)
     validate()
     with open(journal.path.parent / "guard.lock", "a") as lock:
         try:
@@ -652,8 +652,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 reason = "cancellation_validation_failed"
             return journal.transition(row["key"], "prepared", "cancelled", stop_reason=reason)
         row = journal.transition(row["key"], "prepared", "dispatch_recorded")
-        # FULL-sync commit and the status request may take time. There must be no
-        # disk/network work between the final local expiry checks and send.
+        # FULL-sync commits and requests may take time. Re-read permission
+        # after them, then check the local expiry and freshness before send.
         try:
             wait_for_event_boundary(row["dispatched_at"])
             check_fresh(report, final_snapshot)
@@ -682,8 +682,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                     endpoint_key(apis[report["instance"]].config["url"]) !=
                     endpoint_key(config["sonarr"][report["instance"]]["url"])):
                 raise SafetyError("identity_or_manifest_changed")
-            check_fresh(report, final_snapshot)
             validate()
+            check_fresh(report, final_snapshot)
             if not event_boundary_reached(row["dispatched_at"]):
                 raise SafetyError("dispatch_clock_unavailable")
         except Exception as error:

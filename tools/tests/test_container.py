@@ -203,8 +203,9 @@ class ContainerTests(unittest.TestCase):
                  "issued_at": time.time() - 1, "expires_at": None, "authorization_mode": "ongoing",
                  "scope_digest": scope_digest(config), "code_digest": code_digest()}
         path = self.path / "routine-authorization.json"
-        for changes, expected in (({}, 0), ({"enabled": False}, 1), ({"code_digest": "e" * 64}, 0),
-                                  ({"code_digest": "malformed"}, 1),
+        for changes, expected in (({}, 0), ({"enabled": False}, 1), ({"code_digest": "e" * 64}, 1),
+                                  ({"code_digest": "e" * 64, "allow_code_updates": True}, 0),
+                                  ({"code_digest": "malformed", "allow_code_updates": True}, 1),
                                   ({"scope_digest": "f" * 64}, 1)):
             worker.atomic_json(path, dict(grant, **changes))
             with self.subTest(changes=changes), patch.dict(os.environ, env, clear=True), patch(

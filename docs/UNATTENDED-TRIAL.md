@@ -22,27 +22,31 @@ directory must be owner-private, outside the checkout. It contains exactly:
   requires explicit operator approval and a newly issued grant; no automatic renewal.
 - `scope_digest`: `authorization.scope_digest(config)` for the approved configuration.
 - `code_digest`: `authorization.code_digest()` for the reviewed application files.
-  Trials require an exact match. Ongoing grants retain this field for compatibility
-  and require valid digest syntax.
+  Trials and existing ongoing grants require an exact match by default.
 
 An ongoing grant additionally requires `authorization_mode: "ongoing"` and
-`expires_at: null`. Its finite, non-future `issued_at`, all other fields and its
-scope and rule checks are still required. Null expiry without this explicit mode,
-unknown modes, mixed trial/ongoing formats and extra fields fail closed. An ongoing
-grant stays valid across application updates within the same scope and rule. Use
-an image source you trust and review application releases before promotion.
-Scope or workflow changes require a new reviewed grant.
+`expires_at: null`. Its finite, non-future `issued_at`, scope and rule checks are
+still required. The operator can explicitly add `"allow_code_updates": true` to
+an approved ongoing grant to keep it valid across application updates. Perform
+this one-time edit on the host in coordination with installing a release that
+supports it. Earlier releases reject the new field. The code digest remains a
+required valid field, but only opted-in grants can use a different code digest.
+Review releases before promotion and use an image source you trust. A scope or
+workflow change requires a new reviewed grant. Null expiry without ongoing mode,
+duplicate keys, unknown modes and extra fields fail closed.
 
 There is no automatically issued or installed grant. Missing, disabled, expired,
-future-dated, malformed or publicly readable grants fail closed. Trials also
-reject a code mismatch.
+future-dated, malformed or publicly readable grants fail closed. Trials and
+ongoing grants without the opt-in also reject a code mismatch.
 The scope binds all Sonarr/downloader endpoints, pinned clients, categories,
 source-policy mode and public/private lists, work/page limits and minimum age without storing raw
 deployment details in the grant. Secret rotations alone do not expand scope.
 Source changes require a new reviewed grant. Grant contents are immutable within
 an active run; scope and expiry are revalidated at every dispatch phase, including
-after journal commits. Permission is loaded once per run: remove/disable the file
-to prevent the next run; stop the service as well to interrupt an in-flight run.
+after journal commits. Guard re-reads the grant before sending a removal or
+search request. Removing, disabling or replacing the file blocks further
+requests from the current run once the change is visible to that final check.
+A request already sent can still complete.
 
 New containers use identified sources as public except configured private
 exceptions; legacy allowlist behavior is retained until explicit migration.
@@ -114,7 +118,7 @@ for one EpisodeSearch. It never escalates metadata timeouts to blocklisting.
 The metadata policy gate is enabled, but sender gates and explicit permission
 still apply; the v3 grant cannot silently reuse a v2 grant. File-policy failures
 still use blocklisting and native retry. No DHT/PeX/tracker settings are changed. Rule or scope changes
-require reissuing permission. Code changes require a new grant for trials only.
+require reissuing permission. Code changes require a new grant unless ongoing permission explicitly allows updates.
 Preserve the original trial deadline when reissuing for a code update.
 
 ## Scheduling, reporting and bounds
