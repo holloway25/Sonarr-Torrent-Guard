@@ -7,7 +7,11 @@ Seven-day trials and separately approved ongoing operation are supported. Trial
 permission never becomes ongoing implicitly. Unit defaults and the ordinary
 guard/public commands remain non-live.
 
-## Required grant
+For Docker, set `STGUARD_MODE=live` to enable the routine worker. Docker uses that
+switch and does not read or generate the standalone grant described here. See
+[container setup](CONTAINER.md).
+
+## Required grant for standalone workers
 
 The operator must issue an external `routine-authorization.json` only after
 approving the reviewed code and configured public workflow. The file and parent

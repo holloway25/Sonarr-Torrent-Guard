@@ -1,8 +1,8 @@
 # Public failure workflow: dry-run and disabled senders
 
 A gated single-test sender and read-only production verifier exist for review.
-Manual sender release gates are false; the separate unattended entry point needs
-an explicit code/scope-bound trial or separately approved scope-bound ongoing grant. See
+Manual sender release gates are false. Docker uses the explicit live-mode
+switch. Standalone unattended workers use a private trial or ongoing grant. See
 [unattended authorization](UNATTENDED-TRIAL.md). Unit-tested requests do not establish
 production mutation behaviour or implicitly authorize live operation.
 Private-source downloads remain protected; the private archive helper and web UI
@@ -15,7 +15,7 @@ Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):
 new containers treat identified sources as public except private exclusions;
 legacy allowlists remain supported. Private matches and missing, malformed or
 ambiguous source identity are protected before manifest assessment. A policy
-change requires new reviewed authorization, not a journal reset.
+change needs review and a new grant for standalone live workers. Preserve the journal.
 Dispatch/recovery behaviour is tested using simulations and mocked production
 adapters. Enable
 `--check-safeguards` to exercise rechecks and preview journaling against the APIs.

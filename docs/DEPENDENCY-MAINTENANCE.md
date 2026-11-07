@@ -62,7 +62,8 @@ bounded shutdown. Automatic release rejects previous Python-family or Bookworm
 baselines: the first Trixie image needs explicit reviewed promotion before
 three-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
 logs, journals and permissions are retained; changing the base is not authority
-to migrate or reset runtime state. Trial grants require refreshed code authorization for application changes.
+to migrate or reset runtime state. Docker keeps its configured mode across updates.
+Standalone trial grants require refreshed code authorization for application changes.
 Ongoing grants remain valid across reviewed updates within their existing scope.
 This source configuration alone does not deploy or change an existing container.
 
@@ -139,7 +140,8 @@ retags the exact approved image without rebuilding it.
 
 The host's existing updater can then pull `latest`; GitHub never connects to the
 host or changes its schedule, appdata or services. Dependency-only image rebuilds
-retain existing grants. Reviewed application updates retain an ongoing grant when its cleanup scope
+preserve the configured Docker mode and any standalone grants. For standalone
+workers, reviewed application updates retain an ongoing grant when its cleanup scope
 and rule still match. Trials bind the exact code, and
 scope or rule changes require a newly approved grant. Existing resolved/unresolved journal evidence
 must be preserved during host updates.

@@ -1,4 +1,4 @@
-"""An unattended public worker; explicit code/scope-bound permission required."""
+"""An unattended public worker with explicit live authorization."""
 
 import argparse
 import copy
@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 import time
 
-from authorization import RoutineAuthorization
+from authorization import ContainerAuthorization, RoutineAuthorization
 from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config,
                    load_batch_state, save_batch_state)
 import production
@@ -54,8 +54,8 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
         if on_action is not None:
             on_action(actions[-1])
     return {"mode": "routine", "live_authorized": True, "status": "completed", "retry_after_seconds": 600,
-            "grant_expires_at": authority.value["expires_at"],
-            "grant_authorization_mode": authority.value.get("authorization_mode", "trial"),
+            "grant_expires_at": authority.expires_at,
+            "grant_authorization_mode": authority.mode,
             "assessment": proposal["assessment"],
             "recovery": proposal["recovery"], "actions": actions}
 
@@ -63,9 +63,11 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--authorization", type=Path, required=True)
+    permission = parser.add_mutually_exclusive_group(required=True)
+    permission.add_argument("--authorization", type=Path)
+    permission.add_argument("--container-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--log-file", type=Path, required=True)
-    parser.add_argument("--live", action="store_true", help="Use the explicit expiring routine grant")
+    parser.add_argument("--live", action="store_true", help="Enable live routine actions")
     args = parser.parse_args()
     result = {"mode": "routine", "live_authorized": False, "status": "waiting", "actions": [], "retry_after_seconds": 600}
     handler = None
@@ -76,7 +78,8 @@ def main():
         if args.log_file.parent.resolve() != args.config.parent.resolve():
             raise SafetyError("routine_log_requires_private_config_directory")
         handler = PrivateRotatingFileHandler(args.log_file)
-        authority = RoutineAuthorization.load(args.authorization, config)
+        authority = (ContainerAuthorization(config) if args.container_mode
+                     else RoutineAuthorization.load(args.authorization, config))
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
@@ -106,7 +109,8 @@ def main():
         allowed = {"routine_authorization_invalid", "routine_authorization_unavailable",
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",
             "routine_authorization_revoked_or_changed",
-            "explicit_live_mode_required", "routine_log_requires_private_config_directory"}
+            "explicit_live_mode_required", "live_execution_disabled",
+            "routine_log_requires_private_config_directory"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

@@ -1,4 +1,4 @@
-"""Non-root container scheduler; dry-run by default, no automatic live grants."""
+"""Non-root container scheduler, dry-run by default."""
 
 import argparse
 import fcntl
@@ -22,7 +22,7 @@ CYCLE_TIMEOUT = 210
 CYCLE_POLL_SECONDS = 0.25
 TERMINATE_TIMEOUT = 2
 KILL_TIMEOUT = 2
-CONTAINER_LIVE_RELEASE_ENABLED = True  # Explicit mode AND reviewed code/scope grant remain mandatory.
+CONTAINER_LIVE_RELEASE_ENABLED = True  # The operator must still select live mode.
 STOP = threading.Event()
 CHILD = None
 
@@ -193,12 +193,14 @@ def run_cycle(mode, path):
     command = [sys.executable, str(APP_DIR / ("routine.py" if mode == "live" else "public.py")),
                "--config", str(path)]
     if mode == "live":
-        command.extend(["--live", "--authorization", str(CONFIG_DIR / "routine-authorization.json"),
+        command.extend(["--live", "--container-mode",
                         "--log-file", str(CONFIG_DIR / "routine.log")])
     # Credentials are in the owner-private runtime config, not process arguments
     # or a child environment dump. No shell command construction.
     env = {key: value for key, value in os.environ.items() if key in
            ("PATH", "HOME", "TZ", "LANG", "LC_ALL", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE")}
+    if mode == "live":
+        env["STGUARD_MODE"] = "live"
     if STOP.is_set():
         return 143
     CHILD = subprocess.Popen(command, env=env)
@@ -243,8 +245,8 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             path = configure(os.environ)
             if mode == "live":
-                from authorization import RoutineAuthorization
-                RoutineAuthorization.load(CONFIG_DIR / "routine-authorization.json", load_config(path))
+                from authorization import ContainerAuthorization
+                ContainerAuthorization(load_config(path))
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0

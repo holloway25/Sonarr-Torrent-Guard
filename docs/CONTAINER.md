@@ -38,8 +38,7 @@ Test builds reuse cached image layers; maintenance and manual publishing builds
 still pull the base and rerun package upgrades without reusing cached RUN layers.
 Dependency-only updates are released after tests and unchanged-application checks;
 application changes still require review. Rebuilding can update packages even
-for the same source. Scope changes and trial-grant code changes require fresh live
-authorization; a release tag does not bypass runtime permission checks.
+for the same source. The container keeps the configured mode across image updates.
 New GHCR packages default to private; package access/visibility is an operator
 decision. Never paste registry/API credentials into issues or build logs.
 New builds carry `GPL-3.0-only` licence metadata and `/app/LICENSE`; the workflow
@@ -68,7 +67,7 @@ by the operator; they are not claimed to be hidden from root.
 
 | Variables | Meaning |
 | --- | --- |
-| `STGUARD_MODE` | Defaults to `dry-run`; `live` additionally requires a private valid scope-bound grant |
+| `STGUARD_MODE` | Defaults to `dry-run`. Set `live` to enable qualifying cleanup. |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
 | `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
@@ -89,8 +88,8 @@ See [source policy](SOURCE-POLICY.md) before migrating an existing configuration
 Legacy environment templates with public-list variables and no explicit policy
 retain allowlist mode. File configurations without a mode also retain allowlists.
 Changing a persisted mode requires explicitly selecting the new environment
-policy (or deliberately editing a file in file-source mode), and a new reviewed
-scope-bound grant before live use. Old approvals cannot authorize the broader mode.
+policy (or deliberately editing a file in file-source mode). Review the source
+policy before running in live mode.
 The binding endpoint is QBIT_URL, maintaining the exact endpoint contract. Config
 stays `dry_run: true`. New appdata uses labels Sonarr-HD and Sonarr-UHD. When a
 config already exists, environment mode matches normalized Sonarr/downloader
@@ -108,7 +107,7 @@ print/export/commit it. Children receive that file, not secret environment value
 or credential command-line arguments.
 
 Persistent `/config` contains connection config, entire journal/archive, batch
-cursor, locks, optional routine grant, private live log and container heartbeat.
+cursor, locks, private live log and container heartbeat.
 Do not replace this directory when updating an image or reset it to bypass holds.
 
 ## Scheduler and health
@@ -138,43 +137,31 @@ application waiting, not a guarantee against an uninterruptible kernel/storage
 stall or other containers delaying array shutdown. Do not change Unraid's array
 unmount/parity safety settings to compensate for an application shutdown fault.
 Durable intent/no-replay evidence survives
-in appdata; restarting does not renew grants or blindly repeat uncertain actions.
+in appdata. Restarting preserves holds on uncertain actions.
 
 Health means a recent scheduler heartbeat, NOT healthy API connectivity, valid
 permission or completed cleanup. Check sanitized cycle logs for waits/errors.
 Startup errors never print environment values/raw exceptions. Configure bounded
 Docker log rotation on the host too. No automatic journal archival is enabled.
 
-## Live migration is separate
+## Live mode and cutover
 
-`CONTAINER_LIVE_RELEASE_ENABLED=true` releases only the reviewed container entry
-point, not permission to send. Setting live mode alone cannot activate it: startup
-requires a private valid scope-bound grant, including for `--check-config`.
-The routine worker reloads/revalidates permission every cycle and before dispatch.
-The image never issues or renews grants. Existing trial grants retain their
-seven-day limit; ongoing operation requires a separately approved explicit ongoing
-grant, not migration of an expired trial. Trial grants also bind the application code, including the container worker. See [authorization](UNATTENDED-TRIAL.md).
+Set `STGUARD_MODE=live` to enable qualifying Sonarr cleanup. Unset the variable
+or set it to `dry-run` for reporting only. Apply a mode change by recreating the
+container with the new environment. To stop new live requests immediately,
+stop the container. A request already sent can still complete.
 
-Before cutover:
+Docker uses this switch as its authorization. Older grant files in appdata are
+ignored by Docker and can be retained for standalone installations or rollback.
+If a previous Docker grant was disabled to stop cleanup, set the Docker mode to
+`dry-run` before updating to this version. Standalone `routine.py` and user
+service installations still use their [private grants](UNATTENDED-TRIAL.md).
 
-1. Review packaging and the exact source/image digest; validate dry-run on Unraid
-   using a separate staging appdata directory and real runtime credentials.
-2. Agree trial expiry or explicit ongoing permission for the reviewed image.
-   Keep retention application separately gated.
-3. STOP and disable the LXC live service/timer before ANY container live action.
-4. Take a private consistent backup while stopped and transfer the ENTIRE journal,
-   archive, cursor and identity evidence, not just credentials/hashes. Never copy
-   a database while a writer is active or replace it with an old snapshot.
-5. Revalidate labels, bindings, sources, categories, permissions and clock.
-   A code change requires a matching grant for trials. Preserve any trial
-   expiry. An ongoing grant carries forward within its approved scope and
-   rule without a host-side migration.
-6. Run ONE live worker, verify logs and the first eligible action. Keep the old
-   worker disabled. Rollback must stop the new worker and preserve newer evidence
-   before considering old source; never use an old journal to bypass holds.
-
-Publishing the image performs none of those live steps. No media volume or
-download-side deletion is added.
+For a migration from another worker, stop and disable the old worker first.
+Preserve the complete journal, archive, cursor and identity evidence with the
+existing configuration. Never copy a database while a writer is active or use
+an old journal to bypass holds. Verify labels, bindings, source policy,
+permissions and clock, then run one worker and check its cycle logs.
 
 ## Prepared Unraid template
 
@@ -216,8 +203,8 @@ Before applying the template on Unraid:
    journal/cursor evidence survive. Do not disturb unrelated containers or array.
 5. Keep the new appdata separate from the current worker's appdata until cutover.
    Continue using this permanent container name after validation. Live cutover still
-   requires the stopped-worker consistent backup/full state transfer and explicit
-   new authorization described above; never run two live workers.
+   requires the stopped-worker consistent backup and full state transfer described
+   above. Set the mode to `live` when ready, and never run two live workers.
 
 Official references:
 

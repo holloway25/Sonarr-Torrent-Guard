@@ -18,8 +18,8 @@ priority change or filesystem cleanup is implemented.
 A non-root Docker image and GitHub build/publish workflow are implemented.
 Runtime environment variables supply connections and credentials; nothing private
 is baked into the image. Persistent appdata keeps journal/config/logs across
-updates. The container defaults to dry-run; live mode additionally requires a
-private valid grant, and publishing never deploys it. See
+updates. The container defaults to dry-run. Set `STGUARD_MODE=live` to allow
+qualifying cleanup. Publishing never deploys it. See
 [container setup](docs/CONTAINER.md) before activation or migration.
 Retention application remains separately disabled.
 
@@ -121,8 +121,8 @@ Metadata timeouts use Sonarr removal **without blocklisting**,
 followed by one explicitly journaled episode search after confirmed removal.
 There is no three-attempt escalation. Sonarr selects the replacement using its
 normal rules; it may choose the same release again. The separate metadata-retry
-policy gate is enabled, but sender gates and an explicit valid grant are still required. Existing live
-deployments are not upgraded or reauthorized automatically. File-policy failures
+policy gate is enabled. Sender gates and explicit live mode still apply. Docker
+uses its mode switch and standalone routine workers use a private grant. File-policy failures
 continue to use immediate blocklisting and native Sonarr retry. See
 [metadata retry](docs/METADATA-RETRY.md) for request and recovery details.
 
@@ -329,7 +329,7 @@ maintenance, expiry, reporting and capacity boundaries.
 - Add explicit Sonarr v5 compatibility tests. This milestone uses Sonarr v4's v3 API.
 - Review the disabled sender and production verifier, then explicitly approve a
   controlled single-torrent integration test separately. Define independent data
-  deletion confirmation. Guard/public commands remain dry-run; the routine worker
+  deletion confirmation. Guard/public commands remain dry-run. The standalone routine worker
   requires explicit live mode and a valid scope-bound grant (an unexpired
   trial or separately approved ongoing permission).
 - Longer term: define private split-RAR selection, share access, safe extraction, atomic

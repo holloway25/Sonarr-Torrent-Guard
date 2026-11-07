@@ -1,12 +1,13 @@
 import copy
 import datetime
 import json
+import os
 from pathlib import Path
 import time
 import unittest
 from unittest.mock import Mock, patch
 
-from authorization import RoutineAuthorization, code_digest, scope_digest, RULE, MAX_TRIAL_SECONDS
+from authorization import ContainerAuthorization, RoutineAuthorization, code_digest, scope_digest, RULE, MAX_TRIAL_SECONDS
 from guard import run
 import production
 import routine
@@ -33,6 +34,27 @@ class RoutineTests(unittest.TestCase):
     def execute(self):
         f = self.f
         return production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, self.authority)
+
+    def test_container_live_switch_authorizes_the_existing_dispatch_path(self):
+        with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
+            self.authority = ContainerAuthorization(self.f.config)
+            with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                    "production._send_queue_delete", side_effect=lambda *args: self.f.results()) as send:
+                row = self.execute()
+        send.assert_called_once()
+        self.assertEqual(row["stage"], "cleanup_resolved")
+
+    def test_container_permission_requires_live_mode_and_valid_scope(self):
+        for env in ({}, {"STGUARD_MODE": "dry-run"}):
+            with patch.dict(os.environ, env, clear=True), self.assertRaisesRegex(
+                    SafetyError, "live_execution_disabled"):
+                ContainerAuthorization(self.f.config)
+        with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
+            authority = ContainerAuthorization(self.f.config)
+            with self.assertRaisesRegex(SafetyError, "routine_candidate_not_authorized"):
+                authority.validate(self.f.config, dict(self.f.report, indexer="Private Source"))
+            with self.assertRaisesRegex(SafetyError, "routine_authorization_expired_or_scope_changed"):
+                authority.validate(dict(self.f.config, minimum_age_seconds=180))
 
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(

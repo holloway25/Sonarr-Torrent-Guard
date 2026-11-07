@@ -104,10 +104,15 @@ class RoutineAuthorization:
                 or v["scope_digest"] != scope_digest(config)
                 or config.get("minimum_age_seconds", 120) < 120):
             raise SafetyError("routine_authorization_expired_or_scope_changed")
-        if report is not None and (report.get("instance") not in config["sonarr"]
-                or report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True
-                or classify_source(config["sonarr"][report["instance"]]["indexers"], report.get("indexer")) != "public"):
-            raise SafetyError("routine_candidate_not_authorized")
+        validate_candidate(config, report)
+
+    @property
+    def mode(self):
+        return self.value.get("authorization_mode", "trial")
+
+    @property
+    def expires_at(self):
+        return self.value["expires_at"]
 
     def execution_expiry(self):
         """Even an ongoing grant delegates at most 120 seconds to one action."""
@@ -120,3 +125,32 @@ class RoutineAuthorization:
         authority = cls(read_grant(path), config)
         authority._path = path
         return authority
+
+
+def validate_candidate(config, report):
+    if report is not None and (report.get("instance") not in config["sonarr"]
+            or report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True
+            or classify_source(config["sonarr"][report["instance"]]["indexers"], report.get("indexer")) != "public"):
+        raise SafetyError("routine_candidate_not_authorized")
+
+
+class ContainerAuthorization:
+    """Authorize one cycle from the explicit Docker live-mode switch."""
+
+    mode = "container"
+    expires_at = None
+
+    def __init__(self, config):
+        self._scope = scope_digest(config)
+        self.identifier = digest({"mode": self.mode, "rule": RULE, "scope_digest": self._scope})
+        self.validate(config)
+
+    def validate(self, config, report=None):
+        if os.environ.get("STGUARD_MODE") != "live":
+            raise SafetyError("live_execution_disabled")
+        if scope_digest(config) != self._scope or config.get("minimum_age_seconds", 120) < 120:
+            raise SafetyError("routine_authorization_expired_or_scope_changed")
+        validate_candidate(config, report)
+
+    def execution_expiry(self):
+        return time.time() + 120

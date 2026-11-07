@@ -538,13 +538,12 @@ def execute_public_attempt(config, qb, apis, journal, report, approval):
 
 def execute_routine_attempt(config, qb, apis, journal, report, authority):
     """Explicit delegated permission still produces an expiring per-action token."""
-    from authorization import RoutineAuthorization
+    from authorization import ContainerAuthorization, RoutineAuthorization
     import secrets
-    if not isinstance(authority, RoutineAuthorization):
+    if not isinstance(authority, (ContainerAuthorization, RoutineAuthorization)):
         raise SafetyError("routine_authorization_invalid")
     authority.validate(config, report)
-    # Exact short-lived execution token is derived under the routine grant. It
-    # cannot authorize another target or outlive the grant; no user is prompted.
+    # Each action still needs an exact short-lived execution token.
     approval = {k: report[k] for k in ("instance", "hash", "ownership_fingerprint", "manifest_fingerprint")}
     approval.update(operation="sonarr_fail_remove_retry", nonce=secrets.token_hex(32),
                     expires_at=authority.execution_expiry())
