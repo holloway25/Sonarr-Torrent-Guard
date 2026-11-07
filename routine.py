@@ -105,6 +105,7 @@ def main():
     except (SafetyError, GuardError) as error:
         allowed = {"routine_authorization_invalid", "routine_authorization_unavailable",
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",
+            "routine_authorization_revoked_or_changed",
             "explicit_live_mode_required", "routine_log_requires_private_config_directory"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
