@@ -139,9 +139,23 @@ jobs:
           set -euo pipefail
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-          docker push "$IMAGE" | tee "$RUNNER_TEMP/candidate-push.txt"
-          DIGEST=$(sed -nE 's/.*: digest: (sha256:[a-f0-9]{64}) size: [0-9]+$/\1/p' "$RUNNER_TEMP/candidate-push.txt")
+          # Wrap the tested image so update checkers can negotiate an index.
+          PAYLOAD="$IMAGE-payload"
+          docker tag "$IMAGE" "$PAYLOAD"
+          docker push "$PAYLOAD" | tee "$RUNNER_TEMP/candidate-push.txt"
+          PAYLOAD_DIGEST=$(sed -nE 's/.*: digest: (sha256:[a-f0-9]{64}) size: [0-9]+$/\1/p' "$RUNNER_TEMP/candidate-push.txt")
+          [[ "$PAYLOAD_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools create --prefer-index=true --tag "$IMAGE" \
+            --metadata-file "$RUNNER_TEMP/candidate-index.json" "${IMAGE%:*}@$PAYLOAD_DIGEST"
+          DIGEST=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/candidate-index.json")
           [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          docker buildx imagetools inspect --raw "${IMAGE%:*}@$DIGEST" |
+            jq -e --arg payload "$PAYLOAD_DIGEST" '
+              (.mediaType == "application/vnd.oci.image.index.v1+json" or
+               .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") and
+              (.manifests | length == 1) and
+              (.manifests[0] | .digest == $payload and
+               .platform.os == "linux" and .platform.architecture == "amd64")' > /dev/null
           python3 tools/release_evidence.py record --digest "$DIGEST" --output "$RUNNER_TEMP/publication.json"
           printf 'Review candidate: %s\nDigest: %s\nRun: %s (attempt %s)\n' "$IMAGE" "$DIGEST" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_STEP_SUMMARY"
       - name: Store exact publication evidence for review and promotion

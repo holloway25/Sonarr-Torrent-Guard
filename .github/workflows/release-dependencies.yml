@@ -90,7 +90,8 @@ jobs:
           NEW_CODE=$(docker run --rm --network none --read-only --entrypoint python3 "$IMAGE@$DIGEST" -c "$HASH_SCRIPT")
           [[ "$OLD_CODE" =~ ^[a-f0-9]{64}$ ]]
           test "$NEW_CODE" = "$OLD_CODE"
-          docker tag "$IMAGE@$DIGEST" "$IMAGE:latest"
-          docker push "$IMAGE:latest" | tee "$RUNNER_TEMP/dependency-release.txt"
-          grep -F "latest: digest: $DIGEST " "$RUNNER_TEMP/dependency-release.txt"
+          # Copy the registry object directly to preserve its index and digest.
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" \
+            --metadata-file "$RUNNER_TEMP/dependency-release.json" "$IMAGE@$DIGEST"
+          test "$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/dependency-release.json")" = "$DIGEST"
           printf 'Automatic dependency-only release: %s\nApplication files unchanged; existing grant remains code-bound.\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

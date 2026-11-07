@@ -91,8 +91,11 @@ this change does not upgrade the container host's operating system.
   allowance or guarantee an immediate hosted run. No billing settings are changed.
 
 Each candidate is tagged `sha-<source>-run-<run-id>-<attempt>`, avoiding tag reuse
-when the same source is rebuilt with different packages. The run summary reports
-the exact digest. A private GitHub job token is used only by the registry-publish
+when the same source is rebuilt with different packages. Publication wraps the
+tested Linux amd64 image in a single-platform OCI index or Docker manifest list
+so Unraid can look up its digest. CI verifies that the list contains exactly the
+tested image before recording its digest. The run summary reports the index or
+list digest, which both release workflows copy directly to `latest`. A private GitHub job token is used only by the registry-publish
 step; application/API credentials are never involved.
 
 ## Automatic dependency release; manual application review

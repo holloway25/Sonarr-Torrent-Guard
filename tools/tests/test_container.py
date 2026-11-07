@@ -474,9 +474,10 @@ class ContainerTests(unittest.TestCase):
         self.assertIn("tools/release_evidence.py verify", workflow)
         self.assertLess(workflow.index("tools/release_evidence.py verify"), workflow.index("docker login"))
         self.assertIn("test \"$ACTUAL_REVISION\" = \"$REVISION\"", workflow)
-        self.assertIn('docker tag "$IMAGE@$CANDIDATE_DIGEST" "$IMAGE:latest"', workflow)
-        self.assertIn('latest: digest: $CANDIDATE_DIGEST ', workflow)
-        self.assertNotIn("docker build", workflow)
+        self.assertIn('imagetools create --prefer-index=false --tag "$IMAGE:latest"', workflow)
+        self.assertIn('"$IMAGE@$CANDIDATE_DIGEST"', workflow)
+        self.assertIn('."containerimage.descriptor".digest', workflow)
+        self.assertNotRegex(workflow, r"docker (?:build|buildx build)\b")
 
     def test_unraid_template_references_approved_transparent_icon(self):
         import xml.etree.ElementTree as ET

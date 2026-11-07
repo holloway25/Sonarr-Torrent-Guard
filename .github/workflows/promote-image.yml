@@ -59,7 +59,8 @@ jobs:
           docker pull "$IMAGE@$CANDIDATE_DIGEST"
           ACTUAL_REVISION=$(docker image inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE@$CANDIDATE_DIGEST")
           test "$ACTUAL_REVISION" = "$REVISION"
-          docker tag "$IMAGE@$CANDIDATE_DIGEST" "$IMAGE:latest"
-          docker push "$IMAGE:latest" | tee "$RUNNER_TEMP/guard-promotion.txt"
-          grep -F "latest: digest: $CANDIDATE_DIGEST " "$RUNNER_TEMP/guard-promotion.txt"
+          # Copy the registry object directly to preserve its index and digest.
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" \
+            --metadata-file "$RUNNER_TEMP/guard-promotion.json" "$IMAGE@$CANDIDATE_DIGEST"
+          test "$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/guard-promotion.json")" = "$CANDIDATE_DIGEST"
           printf 'Published reviewed image: %s:latest -> %s\n' "$IMAGE" "$CANDIDATE_DIGEST" >> "$GITHUB_STEP_SUMMARY"

@@ -269,7 +269,7 @@ with patch('pathlib.Path', side_effect=fixture_path):
         self.assertIn("cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main'", build)
         self.assertIn("mode=min,ignore-error=true,timeout=1m", build)
         self.assertLess(text.index("push: false"), text.index("Run regression suite using the image Python"))
-        self.assertLess(text.index("Offline active-cycle shutdown smoke check"), text.index('docker push "$IMAGE"'))
+        self.assertLess(text.index("Offline active-cycle shutdown smoke check"), text.index('docker push "$PAYLOAD"'))
 
     def test_automatic_workflow_is_main_only_after_success_and_serialized_with_manual_release(self):
         text = (self.root / ".github/workflows/release-dependencies.yml").read_text()
@@ -280,13 +280,13 @@ with patch('pathlib.Path', side_effect=fixture_path):
         self.assertNotIn("ref: ${{ github.event.workflow_run", text)
         for check in ("tools/release_evidence.py candidate", "tools/dependency_release.py compare",
                       "tools/dependency_release.py newer", 'test "$NEW_CODE" = "$OLD_CODE"'):
-            self.assertLess(text.index(check), text.index('docker tag "$IMAGE@$DIGEST"'))
+            self.assertLess(text.index(check), text.index('imagetools create --prefer-index=false --tag "$IMAGE:latest"'))
 
     def test_full_suite_runs_under_built_image_before_candidate_publication(self):
         text = (self.root / ".github/workflows/container.yml").read_text()
         command = '--entrypoint python3 "$IMAGE" -m unittest discover -s tools/tests -t .'
         self.assertIn(command, text)
-        self.assertLess(text.index(command), text.index('docker push "$IMAGE"'))
+        self.assertLess(text.index(command), text.index('docker push "$PAYLOAD"'))
         self.assertIn('source=$GITHUB_WORKSPACE,target=/src,readonly', text)
 
 
