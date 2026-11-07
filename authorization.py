@@ -14,6 +14,7 @@ from safety import SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v3"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
+CONTAINER_SCOPE_FILE = "container-live-scope.json"
 SOURCE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
                 "authorization.py", "routine.py", "workflow.py", "reports.py", "container_worker.py")
 
@@ -133,22 +134,41 @@ def validate_candidate(config, report):
         raise SafetyError("routine_candidate_not_authorized")
 
 
+def container_scope_record(config):
+    return {"rule": RULE, "scope_digest": scope_digest(config)}
+
+
+def read_container_scope(path):
+    try:
+        value = read_grant(path)
+    except SafetyError:
+        raise SafetyError("container_live_scope_confirmation_required") from None
+    if (not isinstance(value, dict) or set(value) != {"rule", "scope_digest"}
+            or value["rule"] != RULE
+            or (value["scope_digest"] is not None and not valid_digest(value["scope_digest"]))):
+        raise SafetyError("container_live_scope_confirmation_required")
+    return value
+
+
 class ContainerAuthorization:
     """Authorize one cycle from the explicit Docker live-mode switch."""
 
     mode = "container"
     expires_at = None
 
-    def __init__(self, config):
-        self._scope = scope_digest(config)
-        self.identifier = digest({"mode": self.mode, "rule": RULE, "scope_digest": self._scope})
+    def __init__(self, config, directory):
+        self._path = directory / CONTAINER_SCOPE_FILE
+        self._scope = container_scope_record(config)
+        self.identifier = digest({"mode": self.mode, **self._scope})
         self.validate(config)
 
     def validate(self, config, report=None):
         if os.environ.get("STGUARD_MODE") != "live":
             raise SafetyError("live_execution_disabled")
-        if scope_digest(config) != self._scope or config.get("minimum_age_seconds", 120) < 120:
+        if config.get("minimum_age_seconds", 120) < 120:
             raise SafetyError("routine_authorization_expired_or_scope_changed")
+        if container_scope_record(config) != self._scope or read_container_scope(self._path) != self._scope:
+            raise SafetyError("container_live_scope_confirmation_required")
         validate_candidate(config, report)
 
     def execution_expiry(self):

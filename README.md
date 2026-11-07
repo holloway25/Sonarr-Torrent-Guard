@@ -19,7 +19,8 @@ A non-root Docker image and GitHub build/publish workflow are implemented.
 Runtime environment variables supply connections and credentials; nothing private
 is baked into the image. Persistent appdata keeps journal/config/logs across
 updates. The container defaults to dry-run. Set `STGUARD_MODE=live` to allow
-qualifying cleanup. Publishing never deploys it. See
+qualifying cleanup. Existing installs confirm their cleanup scope once at cutover
+and again only if it changes. Publishing never deploys it. See
 [container setup](docs/CONTAINER.md) before activation or migration.
 Retention application remains separately disabled.
 

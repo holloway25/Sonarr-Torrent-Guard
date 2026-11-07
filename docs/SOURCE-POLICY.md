@@ -31,9 +31,9 @@ For file configuration:
 Guard checks the same classification during assessment and before dispatch.
 The full source policy is bound to each candidate's ownership fingerprint.
 A mode or list change invalidates a standalone grant whose approved scope no
-longer matches. In Docker, `STGUARD_MODE=live` authorizes qualifying cleanup
-under the configuration loaded for each cycle. Changing the lists can change
-eligibility on a later cycle, including when a private exception is removed.
+longer matches. In Docker, `STGUARD_MODE=live` enables qualifying cleanup
+within the confirmed scope. A changed list blocks live cleanup until the
+operator confirms the new scope. See [container setup](CONTAINER.md#live-mode-and-cutover).
 
 ## Existing configurations and migration
 
@@ -51,6 +51,5 @@ eligibility on a later cycle, including when a private exception is removed.
 
 Before running with a changed policy, review the exact private exceptions for
 both Sonarr owners and retain the complete journal. Standalone workers need a
-grant for the new scope. Docker workers follow the configured mode. Set
-`STGUARD_MODE=dry-run` before applying policy changes if you want to review their
-effect before cleanup resumes.
+grant for the new scope. Docker workers require a scope confirmation. You can
+review the changed policy in `dry-run` before confirming it.

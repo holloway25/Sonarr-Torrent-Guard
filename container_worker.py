@@ -13,7 +13,10 @@ import tempfile
 import threading
 import time
 
+from authorization import (CONTAINER_SCOPE_FILE, RULE, ContainerAuthorization,
+                           container_scope_record, read_container_scope)
 from guard import GuardError, load_config, source_policy_key
+from safety import SafetyError
 
 CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
@@ -226,9 +229,12 @@ def run_cycle(mode, path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check-config", action="store_true", help="Validate only; no API requests")
-    parser.add_argument("--once", action="store_true", help="Run a single cycle")
-    parser.add_argument("--healthcheck", action="store_true")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--check-config", action="store_true", help="Validate only; no API requests")
+    action.add_argument("--approve-live-scope", action="store_true",
+                        help="Confirm the current Docker cleanup scope and exit without API requests")
+    action.add_argument("--once", action="store_true", help="Run a single cycle")
+    action.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args()
     if args.healthcheck:
         return healthcheck()
@@ -243,10 +249,26 @@ def main():
             raise GuardError("container_private_appdata_required")
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fresh = all(entry.name == lock_path.name for entry in CONFIG_DIR.iterdir())
             path = configure(os.environ)
+            scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
+            if fresh:
+                atomic_json(scope_path, {"rule": RULE, "scope_digest": None})
             if mode == "live":
-                from authorization import ContainerAuthorization
-                ContainerAuthorization(load_config(path))
+                config = load_config(path)
+                if config.get("minimum_age_seconds", 120) < 120:
+                    raise SafetyError("routine_authorization_expired_or_scope_changed")
+                if args.approve_live_scope:
+                    atomic_json(scope_path, container_scope_record(config))
+                    print(json.dumps({"event": "container_live_scope_confirmed", "actions_sent": False}))
+                    return 0
+                approved = read_container_scope(scope_path)
+                if approved["scope_digest"] is None and not args.check_config:
+                    atomic_json(scope_path, container_scope_record(config))
+                if not args.check_config or approved["scope_digest"] is not None:
+                    ContainerAuthorization(config, CONFIG_DIR)
+            elif args.approve_live_scope:
+                raise SafetyError("live_execution_disabled")
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0
@@ -265,6 +287,9 @@ def main():
         return 0
     except BlockingIOError:
         reason = "another_container_worker_is_active"
+    except SafetyError as error:
+        reason = (str(error) if str(error) == "container_live_scope_confirmation_required"
+                  else "container_configuration_or_startup_unavailable")
     except Exception:
         # Environment/config/HTTP exceptions can contain credentials: never print them.
         reason = "container_configuration_or_startup_unavailable"

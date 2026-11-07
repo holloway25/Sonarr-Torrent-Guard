@@ -78,7 +78,7 @@ def main():
         if args.log_file.parent.resolve() != args.config.parent.resolve():
             raise SafetyError("routine_log_requires_private_config_directory")
         handler = PrivateRotatingFileHandler(args.log_file)
-        authority = (ContainerAuthorization(config) if args.container_mode
+        authority = (ContainerAuthorization(config, args.config.parent) if args.container_mode
                      else RoutineAuthorization.load(args.authorization, config))
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
@@ -110,6 +110,7 @@ def main():
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",
             "routine_authorization_revoked_or_changed",
             "explicit_live_mode_required", "live_execution_disabled",
+            "container_live_scope_confirmation_required",
             "routine_log_requires_private_config_directory"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:

@@ -195,6 +195,54 @@ class ContainerTests(unittest.TestCase):
         cycle.assert_called_once_with("live", self.path / "connections.json")
         self.assertFalse((self.path / "routine-authorization.json").exists())
 
+    def run_mode(self, env, command):
+        with patch.dict(os.environ, env, clear=True), patch(
+                "sys.argv", ["container_worker.py", command]), patch("signal.signal"), patch.object(
+                worker, "run_cycle", return_value=0) as cycle, contextlib.redirect_stderr(
+                io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()):
+            result = worker.main()
+        return result, cycle, errors.getvalue()
+
+    def test_legacy_install_cannot_start_live_until_explicitly_confirmed(self):
+        worker.configure(self.env)
+        env = dict(self.env, STGUARD_MODE="live")
+        grant = self.path / "routine-authorization.json"
+        for legacy in (None, {"enabled": False}, {"enabled": True, "expires_at": 1}):
+            with self.subTest(legacy=legacy):
+                if legacy is not None:
+                    worker.atomic_json(grant, legacy)
+                result, cycle, errors = self.run_mode(env, "--once")
+                self.assertEqual(result, 1)
+                cycle.assert_not_called()
+                self.assertIn("container_live_scope_confirmation_required", errors)
+        result, cycle, _ = self.run_mode(env, "--approve-live-scope")
+        self.assertEqual(result, 0)
+        cycle.assert_not_called()
+        result, cycle, _ = self.run_mode(env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+
+    def test_scope_change_requires_confirmation_even_after_restart(self):
+        env = dict(self.env, STGUARD_MODE="live")
+        self.assertEqual(self.run_mode(env, "--check-config")[0], 0)
+        path = self.path / "connections.json"
+        changed = json.loads(path.read_text())
+        changed["sonarr"]["Sonarr-HD"]["indexers"]["private"] = ["Private Source"]
+        worker.atomic_json(path, changed)
+        self.assertEqual(self.run_mode({"STGUARD_MODE": "live", "STGUARD_CONFIG_SOURCE": "file"}, "--once")[0], 0)
+        changed["sonarr"]["Sonarr-HD"]["indexers"]["private"] = []
+        worker.atomic_json(path, changed)
+        file_env = {"STGUARD_MODE": "live", "STGUARD_CONFIG_SOURCE": "file"}
+        for command in ("--check-config", "--once"):
+            result, cycle, errors = self.run_mode(file_env, command)
+            self.assertEqual(result, 1)
+            cycle.assert_not_called()
+            self.assertIn("container_live_scope_confirmation_required", errors)
+        self.assertEqual(self.run_mode(file_env, "--approve-live-scope")[0], 0)
+        result, cycle, _ = self.run_mode(file_env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+
     def test_live_scheduler_passes_mode_but_no_credentials_or_grant(self):
         process = Mock()
         process.wait.return_value = 0

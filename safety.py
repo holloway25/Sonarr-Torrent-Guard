@@ -13,7 +13,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
                          "sonarr_connectivity_unavailable", "identity_or_manifest_changed",
                          "dispatch_clock_unavailable", "routine_authorization_expired_or_scope_changed",
-                         "routine_authorization_revoked_or_changed",
+                         "routine_authorization_revoked_or_changed", "container_live_scope_confirmation_required",
                          "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued",
                          "replacement_already_grabbed", "replacement_history_ambiguous", "replacement_client_unknown",
                          "replacement_history_identity_invalid", "replacement_history_event_invalid",

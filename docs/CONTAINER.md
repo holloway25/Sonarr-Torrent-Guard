@@ -107,7 +107,7 @@ print/export/commit it. Children receive that file, not secret environment value
 or credential command-line arguments.
 
 Persistent `/config` contains connection config, entire journal/archive, batch
-cursor, locks, private live log and container heartbeat.
+cursor, locks, approved live scope, private live log and container heartbeat.
 Do not replace this directory when updating an image or reset it to bypass holds.
 
 ## Scheduler and health
@@ -151,15 +151,31 @@ or set it to `dry-run` for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.
 
-Docker uses the configured mode as its authorization, including on upgrades.
-An existing `live` setting enables qualifying cleanup on the next start, even
-if a previous grant was missing, expired or disabled. Set the Docker mode to
-`dry-run` before updating if you want cleanup to stay off. Older grant files
-can be retained for standalone installations or rollback.
+Fresh appdata records the configured cleanup scope on the first live start.
+Subsequent image updates reuse that record while the scope and rule match.
+An install with existing appdata from an older release holds live cleanup until
+you confirm its scope, even if its mode already says `live`. Old grant files
+remain available for standalone installations or rollback.
 
-Each live cycle uses the current configured cleanup scope. Changing source
-policy or removing a private indexer exception can make more sources eligible
-on a later cycle. Review those settings before applying changes in live mode. Standalone service installations normally use [private grants](UNATTENDED-TRIAL.md).
+Changing scope, including removing a private indexer exception, holds live
+cleanup until you confirm the new settings. A missing, unreadable or changed
+scope record cannot authorize a running cycle. Guard checks it again before
+removal and search.
+
+To confirm an existing install or a changed scope, save and review the intended
+connection and source settings first, then stop the normal worker. Run the
+following using the same dedicated appdata and reviewed image. Replace
+`APPDATA_PATH` and `REVIEWED_IMAGE` with your own values.
+
+```sh
+docker run --rm --network none \
+  --mount type=bind,source=APPDATA_PATH,target=/config \
+  -e STGUARD_CONFIG_SOURCE=file -e STGUARD_MODE=live \
+  REVIEWED_IMAGE --approve-live-scope
+```
+
+This writes the scope record and exits without calling Sonarr or the downloader.
+Start the normal container in your chosen mode after the command succeeds. Standalone service installations normally use [private grants](UNATTENDED-TRIAL.md).
 The internal `routine.py --live --container-mode` entry point explicitly selects
 environment-based authorization. It requires `STGUARD_MODE=live` and works on
 any host that invokes it. A container runtime is not an authorization boundary.
