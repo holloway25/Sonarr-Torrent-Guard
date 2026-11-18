@@ -48,12 +48,13 @@ The additive migration creates the table and owner/hash index only when opening
 a read-write journal; it does not move records. An explicit archive application
 requires separate housekeeping permission. `Journal.get` checks both stores;
 `prepare` finds old keys before insertion, so an archived operation cannot be
-recreated. `Journal.related` combines bounded active records and indexed matching
-archive records: older attempts continue to enforce cross-mode holds and new-grab
-identity rules. This is not a permanent hash ban; a genuinely newer corroborated
+recreated. `Journal.related` checks bounded active records and uses the archive
+index to narrow the lookup to the same Sonarr instance. It then evaluates stored
+hashes and verified aliases for that instance. Older attempts continue to enforce
+cross-mode holds and new-grab identity rules. This is not a permanent hash ban; a genuinely newer corroborated
 attempt can still pass the unchanged rules.
 
-The archive lookup never scans unrelated cold rows. More than1,000 matching
+More than 1,000 matching
 active/archive production records fails closed with `journal_history_limit_reached`
 rather than truncating history and losing safety constraints. An inconsistent
 duplicate key in both tables or malformed archive evidence also blocks. Recovery

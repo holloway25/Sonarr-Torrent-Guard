@@ -204,6 +204,84 @@ class ProductionTests(unittest.TestCase):
         self.s.routes["/api/v3/history"] = {"records": [private, self.grab], "totalRecords": 2}
         self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
 
+    def test_history_from_other_downloader_cannot_override_bound_private_grab(self):
+        private = dict(self.grab, data={**self.grab["data"], "indexer": "Private Source"})
+        for client_name in ("Other Downloader", None, 123):
+            with self.subTest(client_name=client_name):
+                other = dict(self.grab, id=6, data={**self.grab["data"],
+                             "downloadClientName": client_name})
+                self.s.routes["/api/v3/history"] = {"records": [other, private], "totalRecords": 2}
+                self.qb.calls.clear()
+                report = run(self.config, self.qb, self.apis)[0]
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], "unconfirmed_grab_download_client")
+                self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_final_context_blocks_a_grab_whose_downloader_changed(self):
+        original = production.capture_context
+        calls = 0
+
+        def capture(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                # Same ID and source, different downloader. Queue data stays valid.
+                self.grab["data"]["downloadClientName"] = "Other Downloader"
+            return original(*args, **kwargs)
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.capture_context", side_effect=capture), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(calls, 2)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
+    def test_final_baseline_rejects_a_changed_grab_downloader(self):
+        conflicting = dict(self.grab, data={**self.grab["data"], "downloadClientName": "Other Downloader"})
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.history_since", side_effect=[[self.grab], [conflicting]]), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
+    def test_single_hash_history_checks_newer_private_grab_regardless_of_case(self):
+        more_recent = datetime.datetime.fromtimestamp(
+            self.report["download_added_on"] + 5, datetime.timezone.utc).isoformat()
+        private = dict(self.grab, id=6, downloadId=self.hash.lower(), date=more_recent,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        original = self.s.call
+
+        def case_sensitive_history(route, params=None):
+            if route != "/api/v3/history":
+                return original(route, params)
+            self.assertEqual(params.get("episodeId"), self.grab["episodeId"])
+            self.assertEqual(params.get("seriesIds"), self.grab["seriesId"])
+            rows = [private, self.grab]
+            if params.get("downloadId"):
+                rows = [row for row in rows if row["downloadId"] == params["downloadId"]]
+            return {"records": rows, "totalRecords": len(rows)}
+
+        with patch.object(self.s, "call", side_effect=case_sensitive_history):
+            report = run(self.config, self.qb, self.apis)[0]
+            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
+                production.capture_context(self.config, self.s, self.report, production.digest(self.approval["nonce"]))
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "private_source_protected")
+
+    def test_hash_only_torrent_properties_cannot_verify_identity(self):
+        self.qb.routes["/api/v2/torrents/properties"] = {"hash": self.hash}
+        self.qb.calls.clear()
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "torrent_hash_identity_unavailable")
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
     def test_hybrid_history_is_case_independent_and_bounded_to_the_grab(self):
         self.hybrid_report()
         lower = dict(self.grab, downloadId="b" * 40)

@@ -24,7 +24,7 @@ class SourcePolicyTests(unittest.TestCase):
             "mode": "private_exclusions", "private": ["Private Source", "Private Source - Freeleech"]}
 
     def source(self, name):
-        self.f.grab["data"] = {"indexer": name}
+        self.f.grab["data"]["indexer"] = name
 
     def test_unlisted_identified_source_is_assessed_without_public_list(self):
         self.source("New Public Source")
@@ -56,13 +56,13 @@ class SourcePolicyTests(unittest.TestCase):
                 self.source(name)
                 self.assertEqual(self.f.check()["reason"], "missing_indexer_identity")
                 self.assertFalse(any(route.endswith("/files") for route, _ in self.f.qb.calls))
-        self.f.grab["data"] = {}
+        self.f.grab["data"].pop("indexer")
         self.assertEqual(self.f.check()["reason"], "missing_indexer_identity")
 
     def test_ambiguous_sources_still_block_even_if_both_are_unlisted(self):
         self.source("New Public Source")
         row = dict(self.f.row, id=2, episodeId=5)
-        grab = dict(self.f.grab, id=5, episodeId=5, data={"indexer": "Another Public Source"})
+        grab = dict(self.f.grab, id=5, episodeId=5, data={**self.f.grab["data"], "indexer": "Another Public Source"})
         self.f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [self.f.row, row]}
         self.f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.f.grab, grab]}
         self.assertEqual(self.f.check()["reason"], "ambiguous_indexer_identity")

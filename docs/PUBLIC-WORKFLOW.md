@@ -11,11 +11,13 @@ deployment described in [container setup](CONTAINER.md). Existing seeding/remova
 policies stay intact.
 
 For a queue item whose hash matches qBittorrent's torrent ID, Guard verifies
-the reported v1 and full v2 infohashes, including the shortened v2 ID. For a
-hybrid torrent it reads each affected episode's paginated grab history back
-to two minutes before the torrent was added. It compares hashes without
-regard to case and selects the newest matching grab for each episode. A
-second queue group under a verified alias holds the whole torrent, even
+the reported infohashes, including the shortened v2 ID where applicable.
+It reads each affected episode's paginated grab history back to two minutes
+before the torrent was added, regardless of how many hashes it has. It compares
+hashes without regard to case and selects the newest matching grab for each
+episode. That grab must name the uniquely configured, bound downloader before
+Guard trusts its indexer. A different or missing downloader name blocks cleanup.
+A second queue group under a verified alias holds the whole torrent, even
 when both groups belong to the same Sonarr instance. An alias that matches
 another listed torrent also blocks assessment.
 

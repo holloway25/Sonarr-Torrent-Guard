@@ -362,33 +362,28 @@ def verified_hashes(qb, torrent):
     properties = qb.call("/api/v2/torrents/properties", {"hash": canonical})
     if not isinstance(properties, dict) or torrent_hash(properties.get("hash")) != canonical:
         raise GuardError("torrent_hash_identity_unavailable")
-    return parse_hashes(properties)
+    return bulk_hashes(properties)
 
 
 def bulk_hashes(torrent):
     values = (torrent.get("infohash_v1"), torrent.get("infohash_v2"))
     if not all(isinstance(value, str) for value in values) or not any(values):
         raise GuardError("torrent_hash_identity_unavailable")
-    return parse_hashes(torrent)
-
-
-def parse_hashes(properties):
-    canonical = torrent_hash(properties.get("hash"))
+    canonical = torrent_hash(torrent.get("hash"))
     aliases = {canonical}
     identities = set()
-    for field, length in (("infohash_v1", 40), ("infohash_v2", 64)):
-        value = properties.get(field)
-        if value is None or value == "":
+    for length, value in zip((40, 64), values):
+        if not value:
             continue
         value = torrent_hash(value)
         if len(value) != length or set(value) == {"0"}:
             raise GuardError("torrent_hash_identity_unavailable")
         identities.add(value)
         aliases.add(value)
-        if field == "infohash_v2":
+        if length == 64:
             identities.add(value[:40])
             aliases.add(value[:40])
-    if identities and canonical not in identities:
+    if canonical not in identities:
         raise GuardError("torrent_hash_identity_unavailable")
     return sorted(aliases)
 
@@ -403,24 +398,24 @@ def grab_timestamp(row):
         raise GuardError("grab_not_bound_to_current_download") from None
 
 
-def latest_history_grabs(api, hashes, spelling, identities, max_pages, added):
+def latest_history_grabs(api, hashes, identities, max_pages, added):
+    if not integer(added) or added <= 0:
+        raise GuardError("grab_not_bound_to_current_download")
     query = {"eventType": 1, "sortKey": "date", "sortDirection": "descending"}
-    if len(hashes) == 1:
-        history = records(api, "/api/v3/history", dict(query, downloadId=spelling), max_pages)
-    else:
-        if not integer(added) or added <= 0:
-            raise GuardError("grab_not_bound_to_current_download")
-        history = []
-        for series, episode in sorted(identities):
-            rows = records(api, "/api/v3/history", dict(query, seriesIds=series, episodeId=episode),
-                           max_pages, since=added - 120)
-            if any(not integer(row.get("seriesId")) or not integer(row.get("episodeId"))
-                   or (row["seriesId"], row["episodeId"]) != (series, episode) for row in rows):
-                raise GuardError("unknown_content_identity")
-            history.extend(rows)
-        if len({row["id"] for row in history}) != len(history):
-            raise GuardError("duplicate_or_invalid_response_ids")
-    return select_latest_grabs(history, hashes, identities)
+    history = []
+    for series, episode in sorted(identities):
+        rows = records(api, "/api/v3/history", dict(query, seriesIds=series, episodeId=episode),
+                       max_pages, since=added - 120)
+        if any(not integer(row.get("seriesId")) or not integer(row.get("episodeId"))
+               or (row["seriesId"], row["episodeId"]) != (series, episode) for row in rows):
+            raise GuardError("unknown_content_identity")
+        history.extend(rows)
+    if len({row["id"] for row in history}) != len(history):
+        raise GuardError("duplicate_or_invalid_response_ids")
+    latest = select_latest_grabs(history, hashes, identities)
+    if any(abs(grab_timestamp(grab) - added) > 120 for grab in latest):
+        raise GuardError("grab_not_bound_to_current_download")
+    return latest
 
 
 def select_latest_grabs(history, hashes, identities, require_all=True):
@@ -452,33 +447,40 @@ def select_latest_grabs(history, hashes, identities, require_all=True):
     return list(latest.values())
 
 
-def grab_indexer(grab):
+def unique_client_name(client, clients):
+    name = client.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise GuardError("missing_client_name")
+    if sum(isinstance(c, dict) and isinstance(c.get("name"), str)
+           and c["name"].strip().casefold() == name.strip().casefold()
+           for c in clients) != 1:
+        raise GuardError("ambiguous_download_client")
+    return name
+
+
+def grab_indexer(grab, client_name):
     data = grab.get("data")
-    if (not isinstance(data, dict) or not isinstance(data.get("indexer"), str)
-            or not data["indexer"].strip()):
+    if not isinstance(data, dict) or data.get("downloadClientName") != client_name:
+        raise GuardError("unconfirmed_grab_download_client")
+    if not isinstance(data.get("indexer"), str) or not data["indexer"].strip():
         raise GuardError("missing_indexer_identity")
     return data["indexer"]
 
 
-def source_for(api, hashes, rows, max_pages, added):
+def source_for(api, hashes, rows, max_pages, added, client_name):
     identities = set()
     for row in rows:
         identity = (row.get("seriesId"), row.get("episodeId"))
         if any(not integer(value) or value <= 0 for value in identity):
             raise GuardError("unknown_content_identity")
         identities.add(identity)
-    grabs = latest_history_grabs(api, hashes, rows[0]["downloadId"], identities, max_pages, added)
-    sources, grab_ids, grab_times = set(), set(), []
-    for grab in grabs:
-        stamp = grab_timestamp(grab)
-        if added is None or abs(stamp - added) > 120:
-            raise GuardError("grab_not_bound_to_current_download")
-        grab_ids.add(grab["id"])
-        grab_times.append(stamp)
-        sources.add(grab_indexer(grab))
+    grabs = latest_history_grabs(api, hashes, identities, max_pages, added)
+    sources = {grab_indexer(grab, client_name) for grab in grabs}
+    grab_ids = sorted(grab["id"] for grab in grabs)
+    grab_time_floor = min(grab_timestamp(grab) for grab in grabs)
     if len(sources) != 1:
         raise GuardError("ambiguous_indexer_identity")
-    return next(iter(sources)), sorted(grab_ids), min(grab_times)
+    return next(iter(sources)), grab_ids, grab_time_floor
 
 
 def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False, target=None):
@@ -544,13 +546,14 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("ambiguous_download_client")
                 client = compatible[0]
                 verify_client_binding(instance, config["qbittorrent"]["url"], client)
+                client_name = unique_client_name(client, clients[label])
                 for row in rows:
                     cid, cname = row.get("downloadClientId"), row.get("downloadClient")
                     if cid is not None and (not integer(cid) or cid <= 0 or cid != client["id"]):
                         raise GuardError("wrong_download_client")
-                    if cid is None and (not cname or cname != client.get("name")):
+                    if cid is None and cname != client_name:
                         raise GuardError("unconfirmed_download_client")
-                candidates.append((label, h, rows, t, report))
+                candidates.append((label, h, rows, t, report, client_name))
             except GuardError as e:
                 report.update(decision="skip", reason=str(e))
                 reports.append(report)
@@ -562,7 +565,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     if after:
         candidates = ([x for x in candidates if x[:2] > after]
                       + [x for x in candidates if x[:2] <= after])
-    for number, (label, h, rows, t, report) in enumerate(candidates):
+    for number, (label, h, rows, t, report, client_name) in enumerate(candidates):
         if number >= maximum:
             report.update(decision="skip", reason="work_limit_reached")
             reports.append(report)
@@ -582,7 +585,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("ambiguous_alias_queue_ownership")
             if len(aliases) > 1:
                 report["hash_aliases"] = aliases
-            source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added)
+            source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added, client_name)
             classification = classify_source(instance["indexers"], source)
             if classification == "private":
                 raise GuardError("private_source_protected")
@@ -615,6 +618,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                           series_ids=sorted({r["seriesId"] for r in rows}),
                           episode_ids=sorted({r["episodeId"] for r in rows}),
                           download_client_id=instance["download_client_binding"]["id"],
+                          download_client_name_digest=hashlib.sha256(
+                              json.dumps(client_name).encode()).hexdigest(),
                           file_count=len(files), selected_file_count=sum(f["priority"] > 0 for f in files),
                           torrent_state=state)
             report["download_added_on"] = added
@@ -625,6 +630,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             ownership = {"instance": label, "hash": h, "category": instance["category"], "indexer": source,
                          "source_policy": source_policy_key(instance["indexers"]),
                          "client_id": report["download_client_id"],
+                         "client_name_digest": report["download_client_name_digest"],
                          "sonarr_endpoint": endpoint_key(instance["url"]),
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
                          "attempt": report["attempt_fingerprint"],

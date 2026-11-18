@@ -59,10 +59,18 @@ class FakeApi:
     def call(self, route, params=None):
         self.calls.append((route, params))
         if route == "/api/v2/torrents/properties" and route not in self.routes:
-            return {"hash": params["hash"]}
+            return {"hash": params["hash"], "infohash_v1": params["hash"], "infohash_v2": ""}
         result = self.routes[route]
         if isinstance(result, Exception):
             raise result
+        if route == "/api/v3/history" and params and "episodeId" in params:
+            # Model the server filter for known IDs but let malformed fixtures
+            # reach the validator, which must reject them independently.
+            rows = [row for row in result["records"] if all(
+                type(row.get(field)) is not int or row[field] <= 0 or row[field] == params[key]
+                for field, key in (("seriesId", "seriesIds"), ("episodeId", "episodeId")))]
+            rows.sort(key=lambda row: str(row.get("date")), reverse=True)
+            result = {"records": rows, "totalRecords": len(rows)}
         return copy.deepcopy(result)
 
 
@@ -79,7 +87,7 @@ class WorkflowTests(unittest.TestCase):
                     "episodeId": 3, "downloadClient": "Downloader"}
         self.grab = {"id": 4, "downloadId": self.h, "seriesId": 2, "episodeId": 3,
                      "eventType": "grabbed", "date": "1970-01-01T00:01:40Z",
-                     "data": {"indexer": "Public Source"}}
+                     "data": {"indexer": "Public Source", "downloadClientName": "Downloader"}}
         self.t = {"hash": self.h, "category": "tv-hd", "state": "stoppedUP", "added_on": 100}
         self.qb = FakeApi({"/api/v2/torrents/info": [self.t],
                            "/api/v2/torrents/files": manifest(("episode.exe", 0))})
@@ -202,15 +210,17 @@ class WorkflowTests(unittest.TestCase):
         self.s.routes["/api/v3/history"] = {"totalRecords": 0, "records": []}
         self.assertEqual(self.check()["reason"], "no_sonarr_grab_history")
 
-    def test_history_filter_preserves_sonarr_hash_case(self):
+    def test_history_filter_uses_episode_scope_instead_of_hash_spelling(self):
         self.check()
         queries = [params for route, params in self.s.calls if route == "/api/v3/history"]
-        self.assertEqual(queries[0]["downloadId"], self.h.upper())
+        self.assertEqual(queries[0]["seriesIds"], self.row["seriesId"])
+        self.assertEqual(queries[0]["episodeId"], self.row["episodeId"])
+        self.assertNotIn("downloadId", queries[0])
 
     def test_same_hash_regrab_uses_current_source_and_changes_attempt(self):
         first = self.check()
         latest = dict(self.grab, id=6, date="1970-01-01T00:05:00Z",
-                      data={"indexer": "Other Public Source"})
+                      data={**self.grab["data"], "indexer": "Other Public Source"})
         self.config["sonarr"]["HD"]["indexers"]["public"].append("Other Public Source")
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [latest, self.grab]}
         self.qb.routes["/api/v2/torrents/info"][0]["added_on"] = 300
@@ -225,7 +235,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_old_grab_does_not_authorize_manual_same_hash_readd(self):
         self.qb.routes["/api/v2/torrents/info"][0]["added_on"] = 600
-        self.assertEqual(self.check()["reason"], "grab_not_bound_to_current_download")
+        self.assertEqual(self.check()["reason"], "no_sonarr_grab_history")
 
     def test_rename_does_not_create_another_attempt(self):
         original = self.check()
@@ -244,14 +254,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_mixed_latest_episode_sources_are_ambiguous(self):
         row = dict(self.row, id=2, episodeId=5)
-        grab = dict(self.grab, id=5, episodeId=5, data={"indexer": "Private Source"})
+        grab = dict(self.grab, id=5, episodeId=5, data={**self.grab["data"], "indexer": "Private Source"})
         self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [self.row, row]}
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, grab]}
         self.assertEqual(self.check()["reason"], "ambiguous_indexer_identity")
 
     def test_latest_private_or_unknown_regrab_stays_protected(self):
         for source in ("Private Source", "Unknown Source"):
-            latest = dict(self.grab, id=6, data={"indexer": source})
+            latest = dict(self.grab, id=6, data={**self.grab["data"], "indexer": source})
             self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, latest]}
             self.assertEqual(self.check()["decision"], "skip")
 
@@ -376,7 +386,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_identity_mismatch(self):
         self.s.routes["/api/v3/history"]["records"][0]["episodeId"] = 99
-        self.assertEqual(self.check()["reason"], "content_identity_not_in_grab_history")
+        self.assertEqual(self.check()["reason"], "no_sonarr_grab_history")
 
     def test_metadata_age_and_transitional_states(self):
         for state in ("checkingUP", "moving", "error", "unknown"):

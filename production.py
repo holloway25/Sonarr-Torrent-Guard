@@ -18,7 +18,7 @@ import urllib.request
 
 from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, hard_deadline, history_event_type,
                    integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verify_client_binding)
+                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, unique_client_name, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -114,8 +114,10 @@ def bound_client(config, api, label):
     if len(matches) != 1:
         raise SafetyError("ambiguous_download_client")
     verify_client_binding(item, config["qbittorrent"]["url"], matches[0])
-    if not isinstance(matches[0].get("name"), str) or not matches[0]["name"]:
-        raise SafetyError("missing_client_name")
+    try:
+        unique_client_name(matches[0], clients)
+    except GuardError as error:
+        raise SafetyError(str(error)) from None
     return matches[0]
 
 
@@ -200,14 +202,16 @@ def capture_context(config, api, report, approval_digest, now=None):
     if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
         raise SafetyError("unreviewed_sonarr_version")
     client = bound_client(config, api, report["instance"])
+    if digest(client["name"]) != report.get("download_client_name_digest"):
+        raise SafetyError("identity_or_manifest_changed")
     aliases = report.get("hash_aliases", [report["hash"]])
     if torrent_hash(report.get("download_id_spelling")) not in aliases:
         raise SafetyError("invalid_history_download_id")
     identities = {(series[0], episode) for episode in episodes}
     try:
-        grabs = latest_history_grabs(api, aliases, report["download_id_spelling"], identities,
-                                     config.get("max_pages", 20), report.get("download_added_on"))
-        sources = {grab_indexer(grab) for grab in grabs}
+        grabs = latest_history_grabs(api, aliases, identities, config.get("max_pages", 20),
+                                     report.get("download_added_on"))
+        sources = {grab_indexer(grab, client["name"]) for grab in grabs}
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
     if sorted(grab["id"] for grab in grabs) != report["grab_ids"] or sources != {report["indexer"]}:
@@ -231,7 +235,7 @@ def capture_context(config, api, report, approval_digest, now=None):
                     or history_event_type(row) != "grabbed"
                     or any(not integer(row.get(key)) or row[key] != approved[key]
                            for key in ("seriesId", "episodeId"))
-                    or grab_indexer(row) != report["indexer"]
+                    or grab_indexer(row, client["name"]) != report["indexer"]
                     or row.get("sourceTitle") != approved["sourceTitle"]):
                 raise SafetyError("identity_or_manifest_changed")
         recent_grabs = select_latest_grabs(
