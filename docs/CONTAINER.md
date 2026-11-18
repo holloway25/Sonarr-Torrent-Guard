@@ -163,10 +163,12 @@ cleanup until you confirm the new settings. A missing, unreadable or changed
 scope record cannot authorize a running cycle. Before removal and search, Guard
 re-reads both the scope record and the connection file.
 
-To confirm an existing install or a changed scope, save and review the intended
-connection and source settings first, then stop the normal worker. Run the
-following using the same dedicated appdata and reviewed image. Replace
-`APPDATA_PATH` and `REVIEWED_IMAGE` with your own values.
+To confirm an existing install or a changed scope, stop the normal worker and
+use the same dedicated appdata and reviewed image. Choose the command that
+matches how the normal container gets its settings.
+
+For file-managed installs, save and review the intended changes in
+`connections.json`, then approve that file.
 
 ```sh
 docker run --rm --network none \
@@ -175,7 +177,22 @@ docker run --rm --network none \
   REVIEWED_IMAGE --approve-live-scope
 ```
 
-This writes the scope record and exits without calling Sonarr or the downloader.
+For environment-managed installs, put the full intended connection and source
+settings in a private environment file. Include the same values you will use in
+Unraid or Docker, including the changed private-indexer list. Pass that file to
+the approval command.
+
+```sh
+docker run --rm --network none \
+  --mount type=bind,source=APPDATA_PATH,target=/config \
+  --env-file PRIVATE_ENV_FILE \
+  -e STGUARD_CONFIG_SOURCE=env -e STGUARD_MODE=live \
+  REVIEWED_IMAGE --approve-live-scope
+```
+
+Both commands write the scope record and exit without calling Sonarr or the
+downloader. The environment-managed command also saves the validated settings
+to `connections.json`.
 Start the normal container in your chosen mode after the command succeeds. Standalone service installations normally use [private grants](UNATTENDED-TRIAL.md).
 The internal `routine.py --live --container-mode` entry point explicitly selects
 environment-based authorization. It requires `STGUARD_MODE=live` and works on

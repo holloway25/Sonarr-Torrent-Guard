@@ -786,6 +786,93 @@ class MetadataSenderTests(unittest.TestCase):
         send.assert_called_once_with(f.s, 7, blocklist=False)
         search.assert_called_once_with(f.s, [3, 4])
 
+    def blocklist_one_episode(self):
+        f = self.f
+        stamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).isoformat()
+        f.s.routes["/api/v3/blocklist"] = {"totalRecords": 1, "records": [
+            {"id": 33, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source",
+             "sourceTitle": f.grab["sourceTitle"], "date": stamp}]}
+
+    def test_metadata_partial_pack_blocklist_stops_retry(self):
+        self.assess_season_pack()
+
+        def remove(*args, **kwargs):
+            self.removed()
+            self.blocklist_one_episode()
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertIs(row["current_observation"]["blocklisted"], True)
+        self.assertEqual(row["stage"], "manual_review")
+        search.assert_not_called()
+
+    def test_metadata_partial_pack_blocklist_after_search_intent_stops_retry(self):
+        self.assess_season_pack()
+        transition = self.f.journal.transition
+
+        def blocklist_after_search_intent(*args, **kwargs):
+            row = transition(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                self.blocklist_one_episode()
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                self.f.journal, "transition", side_effect=blocklist_after_search_intent), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertIs(row["current_observation"]["blocklisted"], False)
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_blocklisted")
+        search.assert_not_called()
+
+    def test_ambiguous_new_blocklist_evidence_blocks_final_search(self):
+        self.assess_season_pack()
+        transition = self.f.journal.transition
+        dispatch_second = int(time.time())
+
+        def blocklist_after_search_intent(*args, **kwargs):
+            row = transition(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                self.blocklist_one_episode()
+                truncated = datetime.datetime.fromtimestamp(int(row["dispatched_at"]), datetime.timezone.utc)
+                self.f.s.routes["/api/v3/blocklist"]["records"][0]["date"] = truncated.isoformat()
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production.time.time", return_value=dispatch_second + .5), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                self.f.journal, "transition", side_effect=blocklist_after_search_intent), patch(
+                "production._send_episode_search") as search:
+            # The whole-second timestamp straddles the journal dispatch boundary.
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
+        search.assert_not_called()
+
+    def test_metadata_recovers_with_same_properties_fallback_as_assessment(self):
+        f = self.f
+        unrelated = "d" * 40
+        torrent = {"hash": unrelated, "category": "other"}
+        f.qb.routes["/api/v2/torrents/info"].append(torrent)
+
+        def remove_then_keep_unrelated(*args, **kwargs):
+            self.removed()
+            f.qb.routes["/api/v2/torrents/info"] = [torrent]
+            f.qb.calls.clear()
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_then_keep_unrelated), patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        self.assertIs(row["current_observation"]["torrent_absent"], True)
+        self.assertEqual([params["hash"] for route, params in f.qb.calls if route.endswith("/properties")],
+                         [unrelated, unrelated])
+        search.assert_called_once_with(f.s, [3])
+
     def test_final_queue_blocks_replacement_reusing_original_season_pack_row_id(self):
         f = self.f
         second = self.assess_season_pack()

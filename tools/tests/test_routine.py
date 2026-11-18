@@ -100,6 +100,27 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(row["stage"], "dispatch_blocked")
         self.assertEqual(row["stop_reason"], "container_live_scope_confirmation_required")
 
+    def test_routine_cli_does_not_append_waiting_message_to_config_or_grant(self):
+        import contextlib
+        import io
+
+        config = self.write_connections()
+        grant = config.parent / "custom-grant.json"
+        grant.write_text(json.dumps(self.grant))
+        before = {path: path.read_bytes() for path in (config, grant)}
+        for log_path in (config, grant, config.parent / "batch-state.json"):
+            args = ["routine.py", "--live", "--config", str(config),
+                    "--authorization", str(grant), "--log-file", str(log_path)]
+            with self.subTest(path=log_path.name), contextlib.redirect_stdout(io.StringIO()) as output, patch(
+                    "sys.argv", args), patch("routine.RoutineAuthorization.load") as authorize, patch("routine.Api") as api:
+                self.assertEqual(routine.main(), 0)
+                self.assertEqual(json.loads(output.getvalue())["reason"], "log_destination_reserved")
+                authorize.assert_not_called()
+                api.assert_not_called()
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            if log_path not in before:
+                self.assertFalse(log_path.exists())
+
     def test_assessment_cursor_is_accessed_only_under_the_lock(self):
         import contextlib
         import io

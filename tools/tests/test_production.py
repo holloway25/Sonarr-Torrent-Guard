@@ -636,7 +636,7 @@ class ProductionTests(unittest.TestCase):
         history[1]["downloadId"] = int(self.hash)
         observed = self.observe()
         self.assertIs(observed["replacement_observed"], False)
-        self.assertIs(observed["failed"], False)
+        self.assertIsNone(observed["failed"])
         self.assertIs(observed["blocklisted"], True)
 
     def test_malformed_outcome_event_type_never_confirms_failure_or_replacement(self):
@@ -782,6 +782,30 @@ class ProductionTests(unittest.TestCase):
                 self.assertIs(observed["failed"], expected)
                 self.assertIs(observed["replacement_observed"], True)
                 self.assertIs(observed["blocklisted"], True)
+
+    def test_current_alias_needs_new_attempt_evidence_to_count_as_replacement(self):
+        self.results()
+        current = {"hash": "b" * 40, "infohash_v1": self.hash, "infohash_v2": "b" * 64,
+                   "added_on": self.context["download_added_on"]}
+        self.qb.routes["/api/v2/torrents/info"] = [current]
+        result = self.observe()
+        self.assertIs(result["torrent_absent"], False)
+        self.assertIs(result["replacement_observed"], False)
+
+        current["added_on"] = int(time.time()) + 10
+        self.s.routes["/api/v3/history/since"][2]["date"] = datetime.datetime.fromtimestamp(
+            current["added_on"], datetime.timezone.utc).isoformat()
+        result = self.observe()
+        self.assertIs(result["torrent_absent"], True)
+        self.assertIs(result["replacement_observed"], True)
+
+    def test_file_cleanup_blocklist_evidence_still_requires_every_affected_episode(self):
+        self.results()
+        context = dict(self.context, episode_ids=[3, 4])
+        verifier = production.OutcomeVerifier(self.config, self.qb, self.apis, context)
+        self.assertIs(verifier.observe()["blocklisted"], False)
+        self.s.routes["/api/v3/blocklist"]["records"][0]["episodeIds"].append(4)
+        self.assertIs(verifier.observe()["blocklisted"], True)
 
     def test_partial_outage_does_not_erase_other_verified_results(self):
         self.results()

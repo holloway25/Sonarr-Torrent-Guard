@@ -135,7 +135,9 @@ service setup. Review installation paths rather than copying private deployment
 paths into source. Public dry-run units remain separate.
 
 The worker logs each finished/held action immediately and a cycle summary to
-owner-private rotating `routine.log` beside the configuration. It also prints a
+owner-private rotating `routine.log` beside the configuration. The active log
+and its backup paths must be separate from the configuration, grant, journal
+and other reserved state files. The worker also prints a
 sanitized summary for the service journal. If the shared three-minute deadline
 or a handled error interrupts the live pass, the summary says `interrupted`
 and includes the actions already reported.

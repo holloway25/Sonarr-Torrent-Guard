@@ -12,6 +12,7 @@ import logging.handlers
 import os
 from pathlib import Path, PurePosixPath
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -99,19 +100,40 @@ def verify_client_binding(instance, monitored_url, client):
 
 class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """Protect initial/new log files and any existing rotated backups."""
-    def __init__(self, filename, maxBytes=1024*1024, backupCount=3):
-        for path in [Path(filename), *(Path(str(filename) + "." + str(n))
-                                      for n in range(1, backupCount + 1))]:
+    def __init__(self, filename, maxBytes=1024*1024, backupCount=3, *,
+                 config_path=None, authorization_path=None):
+        paths = [Path(filename), *(Path(f"{filename}.{n}") for n in range(1, backupCount + 1))]
+        reserved = set()
+        if config_path is not None:
+            state_files = ("connections.json", ".connections-validation.json", "guard.lock", "batch-state.json",
+                           "routine-authorization.json", "container-live-scope.json", "container-status.json",
+                           "container-worker.lock", "action-journal.sqlite3", "action-journal.sqlite3-journal",
+                           "action-journal.sqlite3-wal", "action-journal.sqlite3-shm")
+            reserved = {(config_path.parent / name).resolve() for name in state_files}
+            reserved.add(config_path.resolve())
+        if authorization_path is not None:
+            reserved.add(authorization_path.resolve())
+        for path in paths:
             if path.is_symlink():
                 raise GuardError("log_symlink_refused")
+            if path.resolve() in reserved:
+                raise GuardError("log_destination_reserved")
+            if path.exists():
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise GuardError("log_destination_not_private_file")
+        for path in paths:
             if path.exists():
                 path.chmod(0o600)
         super().__init__(filename, maxBytes=maxBytes, backupCount=backupCount, encoding="utf-8")
 
     def _open(self):
-        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(self.baseFilename, flags, 0o600)
         try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise GuardError("log_destination_not_private_file")
             os.fchmod(fd, 0o600)
             return os.fdopen(fd, self.mode, encoding=self.encoding)
         except BaseException:
@@ -124,9 +146,9 @@ def load_batch_state(path):
         if not path.exists():
             return {}
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "recovery_after"}:
+        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "verification_after", "recovery_after"}:
             raise ValueError()
-        for key in ("after", "timed_out"):
+        for key in ("after", "timed_out", "verification_after"):
             if key not in state:
                 continue
             cursor = state[key]
@@ -538,10 +560,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     by_hash = torrents_by_hash(qb.call("/api/v2/torrents/info"))
     owners = collections.defaultdict(set)
     for label, api in sonarr_apis.items():
-        queues[label] = records(api, "/api/v3/queue", {
-            "includeUnknownSeriesItems": "true",
-            "includeSeries": "true", "includeEpisode": "true",
-        }, max_pages)
+        queues[label] = records(api, "/api/v3/queue", {"includeUnknownSeriesItems": "true"}, max_pages)
         clients[label] = api.call("/api/v3/downloadclient")
         if not isinstance(clients[label], list):
             raise GuardError("invalid_client_response")
@@ -812,7 +831,7 @@ def main():
             logger = logging.getLogger("guard")
             logger.setLevel(logging.INFO)
             if args.log_file:
-                handler = PrivateRotatingFileHandler(args.log_file)
+                handler = PrivateRotatingFileHandler(args.log_file, config_path=args.config)
                 logger.addHandler(handler)
             qb = Api(config["qbittorrent"])
             deadline = time.monotonic() + 180

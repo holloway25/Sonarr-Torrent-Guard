@@ -16,10 +16,11 @@ import time
 import urllib.parse
 import urllib.request
 
-from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, grab_timestamp,
+from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
                    records, recheck_candidate, run, select_latest_grabs, torrent_hash,
-                   torrent_hash_ownership, torrents_by_hash, unique_client_name, verify_client_binding)
+                   torrent_hash_ownership, torrents_by_hash, unique_client_name, verified_hashes,
+                   verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -297,10 +298,11 @@ def capture_context(config, api, report, approval_digest, now=None):
     return validate_context(context)
 
 
-def observed_torrent(torrents, context):
-    """Use the bulk identity snapshot. Missing alias evidence cannot prove absence."""
-    by_hash = torrents_by_hash(torrents)
-    claims, aliases_by_hash, errors = torrent_hash_ownership(by_hash, bulk_hashes)
+def observed_torrent(qb, context):
+    """Use the same identity evidence as assessment, under the caller's deadline."""
+    by_hash = torrents_by_hash(qb.call("/api/v2/torrents/info"))
+    claims, aliases_by_hash, errors = torrent_hash_ownership(
+        by_hash, lambda torrent: verified_hashes(qb, torrent))
     aliases = context.get("hash_aliases", [context["hash"]])
     matching = {key for alias in aliases for key in claims.get(alias, ())}
     canonical = next(iter(matching), None)
@@ -308,7 +310,30 @@ def observed_torrent(torrents, context):
         raise GuardError("ambiguous_torrent_hash_identity")
     if errors:
         raise GuardError("torrent_hash_identity_unavailable")
-    return by_hash.get(canonical)
+    return by_hash.get(canonical), aliases_by_hash.get(canonical, ())
+
+
+def blocklist_observation(api, context, not_before, max_pages, *, any_episode=False):
+    required = set(context["episode_ids"])
+    rows = records(api, "/api/v3/blocklist", {"seriesIds": context["series_id"]}, max_pages)
+    matched, ambiguous = set(), set()
+    for row in rows:
+        if not integer(row.get("seriesId")) or row["seriesId"] <= 0:
+            raise SafetyError("invalid_blocklist_identity")
+        if (row["id"] in context["baseline_blocklist_ids"] or row["seriesId"] != context["series_id"]
+                or row.get("indexer") != context["indexer"]
+                or digest(row.get("sourceTitle")) != context["release_title_digest"]):
+            continue
+        after = event_after(row, not_before)
+        if after is False:
+            continue
+        ids = row.get("episodeIds")
+        if not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
+            raise SafetyError("invalid_blocklist_identity")
+        (matched if after else ambiguous).update(required.intersection(ids))
+    if matched == required or (any_episode and matched):
+        return True
+    return None if ambiguous - matched else False
 
 
 class OutcomeVerifier:
@@ -332,9 +357,9 @@ class OutcomeVerifier:
         # APIs cannot prove download-side file deletion. Never infer this from absence.
         result = {k: None for k in ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")}
         current_torrent = None
+        current_aliases = ()
         try:
-            torrents = self.qb.call("/api/v2/torrents/info")
-            current_torrent = observed_torrent(torrents, c)
+            current_torrent, current_aliases = observed_torrent(self.qb, c)
             result["torrent_absent"] = current_torrent is None
             if current_torrent is not None and "download_added_on" in c and (
                     current_torrent.get("added_on") != c["download_added_on"]):
@@ -350,6 +375,7 @@ class OutcomeVerifier:
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
             aliases = set(c.get("hash_aliases", [c["hash"]]))
+            aliases.update(current_aliases)
             for r in new:
                 kind = history_event_type(r)
                 after = event_after(r, self.not_before)
@@ -363,19 +389,25 @@ class OutcomeVerifier:
                 try:
                     h = torrent_hash(r.get("downloadId"))
                 except GuardError:
-                    continue
-                added = current_torrent.get("added_on") if current_torrent else None
+                    h = None
                 confirmed = client_known and after is True
-                if (kind == "grabbed" and h in aliases and confirmed
-                        and "grab_ids" in c and r["id"] > max(c["grab_ids"])
-                        and integer(added) and added > max(c["download_added_on"], self.not_before)
-                        and abs(event_time(r) - added) <= 120):
-                    regrab.add(r["episodeId"])
-                if (kind == "downloadFailed" and h in aliases
-                        and digest(r.get("sourceTitle")) == c["release_title_digest"]):
-                    (failed if confirmed else ambiguous_failed).add(r["episodeId"])
-                if kind == "grabbed" and h not in aliases:
-                    (replacement if confirmed else ambiguous_replacement).add(r["episodeId"])
+                if kind == "downloadFailed":
+                    title = r.get("sourceTitle")
+                    title_known = isinstance(title, str) and bool(title.strip())
+                    if (h is not None and h not in aliases
+                            or title_known and digest(title) != c["release_title_digest"]):
+                        continue
+                    definite = confirmed and h is not None and title_known
+                    (failed if definite else ambiguous_failed).add(r["episodeId"])
+                elif kind == "grabbed" and h is not None:
+                    if h not in aliases:
+                        (replacement if confirmed else ambiguous_replacement).add(r["episodeId"])
+                        continue
+                    added = current_torrent.get("added_on") if current_torrent else None
+                    if (confirmed and "grab_ids" in c and r["id"] > max(c["grab_ids"])
+                            and integer(added) and added > max(c["download_added_on"], self.not_before)
+                            and abs(event_time(r) - added) <= 120):
+                        regrab.add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
             result["replacement_observed"] = True if replacement == required else (
@@ -386,24 +418,9 @@ class OutcomeVerifier:
         except Exception:
             pass
         try:
-            rows = records(api, "/api/v3/blocklist", {"seriesIds": c["series_id"]}, self.config.get("max_pages", 20))
-            matched, ambiguous = set(), set()
-            for r in rows:
-                if not integer(r.get("seriesId")) or r["seriesId"] <= 0:
-                    raise SafetyError("invalid_blocklist_identity")
-                if (r["id"] in c["baseline_blocklist_ids"] or r.get("seriesId") != c["series_id"]
-                        or r.get("indexer") != c["indexer"]
-                        or digest(r.get("sourceTitle")) != c["release_title_digest"]):
-                    continue
-                after = event_after(r, self.not_before)
-                if after is False:
-                    continue
-                ids = r.get("episodeIds")
-                if not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
-                    raise ValueError()
-                (matched if after else ambiguous).update(set(ids) & set(c["episode_ids"]))
-            result["blocklisted"] = True if matched == set(c["episode_ids"]) else (
-                None if ambiguous - matched else False)
+            result["blocklisted"] = blocklist_observation(
+                api, c, self.not_before, self.config.get("max_pages", 20),
+                any_episode=c.get("metadata_retry", {}).get("blocklist") is False)
         except Exception:
             pass
         return result
@@ -513,8 +530,8 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         require_connectivity(config, apis[c["instance"]], c["instance"])
         # The first absence observation is insufficient if another actor has
         # re-added the hash or queued a replacement while intent was committed.
-        torrents = qb.call("/api/v2/torrents/info")
-        if observed_torrent(torrents, c) is not None:
+        torrent, _ = observed_torrent(qb, c)
+        if torrent is not None:
             raise SafetyError("target_reappeared")
         queue = records(apis[c["instance"]], "/api/v3/queue",
                         {"includeUnknownSeriesItems": "true"}, config.get("max_pages", 20))
@@ -575,6 +592,10 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         if (binding_digest(config, c["instance"]) != c["binding_digest"] or
                 endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
             raise SafetyError("identity_or_manifest_changed")
+        blocklisted = blocklist_observation(
+            apis[c["instance"]], c, row["dispatched_at"], config.get("max_pages", 20), any_episode=True)
+        if blocklisted is not False:
+            raise SafetyError("replacement_blocklisted" if blocklisted else "replacement_blocklist_uncertain")
         validate()
         if METADATA_RETRY_RELEASE_ENABLED is not True:
             raise SafetyError("live_execution_disabled")

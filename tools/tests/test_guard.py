@@ -111,6 +111,13 @@ class WorkflowTests(unittest.TestCase):
     def check(self):
         return run(self.config, self.qb, {"HD": self.s}, now=1000)[0]
 
+    def test_queue_scan_keeps_unknown_series_without_expanding_resources(self):
+        self.check()
+        params = next(params for route, params in self.s.calls if route == "/api/v3/queue")
+        self.assertEqual(params["includeUnknownSeriesItems"], "true")
+        self.assertNotIn("includeSeries", params)
+        self.assertNotIn("includeEpisode", params)
+
     def test_ownership_category_is_bound_to_owning_instance(self):
         self.config["sonarr"]["UHD"] = copy.deepcopy(self.config["sonarr"]["HD"])
         self.config["sonarr"]["UHD"]["category"] = "tv-uhd"
@@ -631,6 +638,52 @@ class TransportTests(unittest.TestCase):
                 if handler:
                     handler.close()
                 os.umask(previous)
+
+    def test_dry_run_cli_rejects_state_paths_before_opening_logs(self):
+        import contextlib
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+
+        import guard
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "custom-connections.json"
+            original = b'{"dry_run": true}'
+            config.write_bytes(original)
+            hardlink = root / "linked.log"
+            os.link(config, hardlink)
+            for path, reason in (
+                    (config, "log_destination_reserved"),
+                    (root / "action-journal.sqlite3-wal", "log_destination_reserved"),
+                    (root / "routine-authorization.json", "log_destination_reserved"),
+                    (hardlink, "log_destination_not_private_file")):
+                with self.subTest(path=path.name), contextlib.redirect_stderr(io.StringIO()) as errors, patch(
+                        "sys.argv", ["guard.py", "--config", str(config), "--log-file", str(path)]), patch(
+                        "guard.load_config", return_value={"dry_run": True}), patch("guard.Api") as api:
+                    self.assertEqual(guard.main(), 1)
+                    self.assertEqual(json.loads(errors.getvalue())["error"], reason)
+                    api.assert_not_called()
+                self.assertEqual(config.read_bytes(), original)
+                if path not in (config, hardlink):
+                    self.assertFalse(path.exists())
+
+    def test_log_rotation_cannot_claim_explicit_configuration_path(self):
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "custom.log"
+            config = Path(folder) / "custom.log.2"
+            original = b'{"dry_run": true}'
+            config.write_bytes(original)
+            with self.assertRaisesRegex(GuardError, "log_destination_reserved"):
+                PrivateRotatingFileHandler(log, config_path=config)
+            self.assertFalse(log.exists())
+            self.assertEqual(config.read_bytes(), original)
 
     def test_equivalent_default_port_redirects_are_accepted(self):
         import urllib.request

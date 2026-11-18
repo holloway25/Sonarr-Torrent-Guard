@@ -50,8 +50,10 @@ mark the download failed or invoke native failed-download retry. Thus failure an
 blocklist observations may correctly be false; never invent positive evidence.
 `retry_removed` requires a CURRENT positive original-incarnation absence
 observation, not queue disappearance, HTTP success or historical confirmation.
-Unexpected positive blocklisting requires manual review. Data deletion stays
-unknown and remains Sonarr's responsibility.
+A newly matched blocklist record for any affected episode requires manual
+review. Ordinary file cleanup still requires a match for every affected episode
+to confirm blocklisting. Data deletion stays unknown and remains Sonarr's
+responsibility.
 
 If a new replacement grab has already been positively observed, mark
 `retry_superseded` and do not search again. Otherwise durably record
@@ -59,7 +61,9 @@ If a new replacement grab has already been positively observed, mark
 Sonarr-side connectivity, reviewed version and endpoint checks; reject a
 reappearing original hash or newly queued affected episode. After qBittorrent
 confirms absence, Guard ignores each stale original row whose queue ID, episode
-ID and normalized download hash match the saved pre-removal evidence.
+ID and normalized download hash match the saved pre-removal evidence. Just
+before dispatch, read the blocklist again. A new matching entry for any affected
+episode or uncertain blocklist evidence blocks the search.
 Refresh replacement grab history after the intent commit as well: queue
 visibility can lag history. A new post-removal-intent grab for ANY affected
 episode from the bound client (same hash or different hash) suppresses the entire

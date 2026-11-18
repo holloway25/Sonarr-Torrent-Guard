@@ -95,13 +95,18 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
             require_connectivity(config, api, label)
         qb.login()
         reports = run(config, qb, apis, batch_state=batch_state)
+    # Rotation is independent of assessment. Even an attempted verification
+    # that exhausts this phase gives the next candidate first turn next cycle.
+    candidates = sorted(((r["instance"], r["hash"]), r) for r in reports if r["decision"] == "would_fail")
+    after = tuple(batch_state.get("verification_after", ()))
+    candidates = [entry for entry in candidates if entry[0] > after] + [
+        entry for entry in candidates if entry[0] <= after]
     with limit_adapter_deadlines(adapters, verification_end):
-        for report in reports:
-            if report["decision"] != "would_fail":
-                continue
+        for key, report in candidates:
             try:
                 if time.monotonic() >= verification_end:
                     raise GuardError("run_time_limit_reached")
+                batch_state["verification_after"] = list(key)
                 fresh = recheck_candidate(report, config, qb, apis)
                 check_fresh(report, fresh)
                 check_prior_attempts(journal, report, config=config)

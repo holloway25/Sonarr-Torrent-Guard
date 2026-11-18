@@ -17,7 +17,8 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued",
                          "replacement_already_grabbed", "replacement_history_ambiguous", "replacement_client_unknown",
                          "replacement_history_identity_invalid", "replacement_history_event_invalid",
-                         "replacement_queue_identity_invalid", "run_time_limit_reached"}
+                         "replacement_queue_identity_invalid", "replacement_blocklisted",
+                         "replacement_blocklist_uncertain", "run_time_limit_reached"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000

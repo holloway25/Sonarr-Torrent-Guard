@@ -188,6 +188,47 @@ class PublicTests(unittest.TestCase):
         self.assertEqual(row["stop_reason"], "abandoned_before_dispatch")
         send.assert_not_called()
 
+    def test_verification_rotates_independently_when_slow_pack_fills_its_budget(self):
+        f = self.f
+        single = "b" * 40
+        queue = f.s.routes["/api/v3/queue"]
+        queue["records"].extend(dict(queue["records"][0], id=20 + i, episodeId=i) for i in range(4, 11))
+        queue["records"].append(dict(queue["records"][0], id=40, episodeId=11, downloadId=single))
+        queue["totalRecords"] = len(queue["records"])
+        history = f.s.routes["/api/v3/history"]
+        history["records"].extend(dict(f.grab, id=20 + i, episodeId=i) for i in range(4, 11))
+        history["records"].append(dict(f.grab, id=40, episodeId=11, downloadId=single))
+        history["totalRecords"] = len(history["records"])
+        f.qb.routes["/api/v2/torrents/info"].append(dict(f.qb.routes["/api/v2/torrents/info"][0], hash=single))
+        state_path = Path(f.folder.name) / "batch-state.json"
+        attempts = []
+        now = [100.0]
+        recheck = public.recheck_candidate
+
+        def verify(report, *args):
+            attempts.append(report["hash"])
+            if report["hash"] == f.hash:
+                now[0] = f.qb.deadline
+                raise production.GuardError("run_time_limit_reached")
+            return recheck(report, *args)
+
+        for cycle_number in range(3):
+            now[0] = 100.0
+            attempts.clear()
+            f.qb.deadline = f.s.deadline = 280.0
+            state = load_batch_state(state_path)
+            with patch("public.time.monotonic", side_effect=lambda: now[0]), patch(
+                    "public.require_connectivity", return_value={}), patch("public.recheck_candidate", side_effect=verify):
+                report = public.cycle(f.config, f.qb, f.apis, f.journal, state, reserve_dispatch=True)
+            self.assertEqual([r["decision"] for r in report["assessment"]], ["would_fail", "would_fail"])
+            self.assertEqual(attempts, [f.hash] if cycle_number == 0 else [single, f.hash])
+            self.assertEqual(state["after"], ["HD", single])
+            self.assertEqual(state["verification_after"], ["HD", f.hash])
+            by_hash = {r["hash"]: r for r in report["assessment"]}
+            self.assertEqual(by_hash[single]["safeguards"]["status"],
+                             "held" if cycle_number == 0 else "fresh_attempt_verified")
+            save_batch_state(state_path, state)
+
     def test_recovery_budget_caps_each_observation_and_restores_adapter_deadlines(self):
         f = self.f
         keys = self.pending_records(8)
@@ -391,6 +432,23 @@ class PublicTests(unittest.TestCase):
         verifier = production.OutcomeVerifier(f.config, f.qb, f.apis, row["context"], row["dispatched_at"])
         row = reconcile(f.journal, row["key"], verifier.observe)
         self.assertEqual(row["stage"], "cleanup_resolved")
+
+    def test_failure_missing_hash_or_title_remains_pending(self):
+        f = self.f
+        for n, field in enumerate(("downloadId", "sourceTitle"), 1):
+            with self.subTest(field=field):
+                context = dict(f.context, approval_digest=production.digest(n))
+                row = f.journal.prepare(f.report, mode="public_attempt", context=context)
+                row = f.journal.transition(row["key"], "prepared", "dispatch_recorded")
+                self.result()
+                del f.s.routes["/api/v3/history/since"][1][field]
+                verifier = production.OutcomeVerifier(f.config, f.qb, f.apis, context, row["dispatched_at"])
+                row = reconcile(f.journal, row["key"], verifier.observe)
+                self.assertEqual(row["stage"], "uncertain")
+                self.assertIsNone(row["current_observation"]["failed"])
+                f.s.routes["/api/v3/history/since"][1][field] = f.grab[field]
+                row = reconcile(f.journal, row["key"], verifier.observe)
+                self.assertEqual(row["stage"], "cleanup_resolved")
 
     def test_old_negative_does_not_end_recovery_when_current_failure_is_unknown(self):
         f = self.f

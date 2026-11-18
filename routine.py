@@ -83,7 +83,8 @@ def main():
         config = load_config(args.config)  # Ordinary CLI deliberately remains dry-run.
         if args.log_file.parent.resolve() != args.config.parent.resolve():
             raise SafetyError("routine_log_requires_private_config_directory")
-        handler = PrivateRotatingFileHandler(args.log_file)
+        handler = PrivateRotatingFileHandler(args.log_file, config_path=args.config,
+                                            authorization_path=args.authorization)
         authority = (ContainerAuthorization(config, args.config) if args.container_mode
                      else RoutineAuthorization.load(args.authorization, config, config_path=args.config))
         deadline = time.monotonic() + 180
@@ -118,7 +119,8 @@ def main():
             "routine_authorization_revoked_or_changed",
             "explicit_live_mode_required", "live_execution_disabled",
             "container_live_scope_confirmation_required",
-            "routine_log_requires_private_config_directory", "run_time_limit_reached"}
+            "routine_log_requires_private_config_directory", "run_time_limit_reached",
+            "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.
