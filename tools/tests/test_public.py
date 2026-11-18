@@ -229,6 +229,27 @@ class PublicTests(unittest.TestCase):
                              "held" if cycle_number == 0 else "fresh_attempt_verified")
             save_batch_state(state_path, state)
 
+    def test_busy_dry_run_still_recovers_an_abandoned_preparation(self):
+        f = self.f
+        prepared = f.journal.prepare(f.report, mode="public_attempt", context=f.context)
+        now = [100.0]
+        f.qb.deadline = f.s.deadline = 280.0
+
+        def slow_verification(*args):
+            now[0] = f.qb.deadline
+            raise production.GuardError("run_time_limit_reached")
+
+        with patch("public.time.monotonic", side_effect=lambda: now[0]), patch(
+                "public.require_connectivity", return_value={}), patch(
+                "public.recheck_candidate", side_effect=slow_verification) as verify:
+            result = public.cycle(f.config, f.qb, f.apis, f.journal)
+        verify.assert_called_once()
+        self.assertEqual(result["assessment"][0]["safeguards"]["reason"], "run_time_limit_reached")
+        self.assertEqual(len(result["recovery"]), 1)
+        self.assertEqual(result["recovery"][0]["key"], prepared["key"])
+        self.assertEqual(result["recovery"][0]["stage"], "cancelled")
+        self.assertEqual(result["recovery"][0]["stop_reason"], "abandoned_before_dispatch")
+
     def test_recovery_budget_caps_each_observation_and_restores_adapter_deadlines(self):
         f = self.f
         keys = self.pending_records(8)

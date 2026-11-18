@@ -60,9 +60,12 @@ def hard_deadline(deadline):
 def endpoint_key(url, origin_only=False):
     """Conservative origin + base-path identity with normalized default ports."""
     try:
+        # urlsplit strips some controls before exposing the hostname.
+        if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url):
+            raise ValueError()
         value = urllib.parse.urlsplit(url)
         if (value.scheme not in ("http", "https") or not value.hostname
-                or value.username or value.password
+                or value.username is not None or value.password is not None
                 or (not origin_only and (value.query or value.fragment))):
             raise ValueError()
         port = value.port if value.port is not None else (443 if value.scheme == "https" else 80)
@@ -348,6 +351,10 @@ def records(api, route, params=None, max_pages=20, *, since=None):
     raise GuardError("pagination_limit_reached")
 
 
+def private_source_key(name):
+    return name.strip().casefold()
+
+
 def source_policy_key(policy):
     """Validate and canonicalize the explicit per-owner source policy."""
     if not isinstance(policy, dict):
@@ -361,7 +368,8 @@ def source_policy_key(policy):
         if not isinstance(values, list) or any(not isinstance(x, str) or not x.strip() for x in values):
             raise GuardError("invalid_source_lists")
         result[kind] = sorted(values)
-    if mode == "public_allowlist" and set(result["public"]) & set(result["private"]):
+    if {private_source_key(name) for name in result["public"]} & {
+            private_source_key(name) for name in result["private"]}:
         raise GuardError("overlapping_source_lists")
     return result
 
@@ -370,13 +378,11 @@ def classify_source(policy, source):
     policy = source_policy_key(policy)
     if not isinstance(source, str) or not source.strip():
         return "unknown"
-    if policy["mode"] == "private_exclusions":
-        if source.strip().casefold() in {name.strip().casefold() for name in policy["private"]}:
-            return "private"
-        return "public"
-    if source in policy["private"]:
+    if private_source_key(source) in {private_source_key(name) for name in policy["private"]}:
         return "private"
-    return "public" if source in policy["public"] else "unknown"
+    if policy["mode"] == "private_exclusions" or source in policy["public"]:
+        return "public"
+    return "unknown"
 
 
 def verified_hashes(qb, torrent):

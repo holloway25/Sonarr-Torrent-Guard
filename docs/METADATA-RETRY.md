@@ -58,7 +58,10 @@ responsibility.
 A positively observed replacement for any affected episode is persisted as
 `any_replacement_observed` and marks the retry `retry_superseded`. A later
 history read cannot erase that veto. The separate `replacement_observed` result
-requires coverage of every affected episode. With no observed replacement,
+requires coverage of every affected episode. A newer, positively matched Sonarr
+grab also vetoes another search, even if qBittorrent has yet to confirm a
+replacement download under that hash. Guard persists this separately as
+`replacement_grab_observed`. If neither kind of observation vetoes the search,
 record `retry_search_recorded` durably before the second request. After this commit, repeat
 Sonarr-side connectivity, reviewed version and endpoint checks; reject a
 reappearing original hash or newly queued affected episode. After qBittorrent

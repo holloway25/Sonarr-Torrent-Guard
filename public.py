@@ -16,6 +16,7 @@ from safety import Journal, SafetyError, check_fresh, reconcile
 RECOVERY_LIMIT = 5
 RECOVERY_SECONDS = 30
 RECOVERY_ITEM_SECONDS = 5
+PERSIST_SECONDS = 2
 
 
 @contextmanager
@@ -41,7 +42,7 @@ def recover_pending(config, qb, apis, journal, batch_state, deadline):
         "OR (stage = 'prepared' AND dispatched_at IS NULL))").fetchall())
     after = batch_state.get("recovery_after", "")
     keys = [k for k in keys if k > after] + [k for k in keys if k <= after]
-    end = min(deadline - 2, time.monotonic() + RECOVERY_SECONDS)
+    end = min(deadline - PERSIST_SECONDS, time.monotonic() + RECOVERY_SECONDS)
     recovered = []
     adapters = [qb, *apis.values()]
     for key in keys[:RECOVERY_LIMIT]:
@@ -86,8 +87,12 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
     deadline = min([d for d in deadlines if d is not None] + [started + 180])
     budget = deadline - started
     assessment_end = started + budget / 2
-    verification_end = started + budget * 2 / 3 if reserve_dispatch else deadline
-    recovery_end = started + budget * 3 / 4 if reserve_dispatch else deadline
+    if reserve_dispatch:
+        verification_end = started + budget * 2 / 3
+        recovery_end = started + budget * 3 / 4
+    else:
+        recovery_end = deadline
+        verification_end = deadline - min(RECOVERY_SECONDS + PERSIST_SECONDS, budget / 4)
     # Validate both owners before contacting the downloader. The shorter scan
     # deadline reserves time even when a large queue exhausts assessment.
     with limit_adapter_deadlines(adapters, assessment_end):
@@ -107,9 +112,10 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
                 if time.monotonic() >= verification_end:
                     raise GuardError("run_time_limit_reached")
                 batch_state["verification_after"] = list(key)
-                fresh = recheck_candidate(report, config, qb, apis)
-                check_fresh(report, fresh)
-                check_prior_attempts(journal, report, config=config)
+                with hard_deadline(verification_end):
+                    fresh = recheck_candidate(report, config, qb, apis)
+                    check_fresh(report, fresh)
+                    check_prior_attempts(journal, report, config=config)
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}

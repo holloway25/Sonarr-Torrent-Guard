@@ -43,11 +43,26 @@ class SourcePolicyTests(unittest.TestCase):
                 self.assertEqual(report.get("reason"), "private_source_protected")
                 self.assertFalse(any(route.endswith("/files") for route, _ in self.f.qb.calls))
 
-    def test_private_exception_wins_over_obsolete_public_list(self):
+    def test_private_exclusions_ignore_a_non_overlapping_obsolete_public_list(self):
         policy = self.f.config["sonarr"]["HD"]["indexers"]
-        policy["public"] = ["Private Source"]
+        policy["public"] = ["Obsolete Public Source"]
+        self.source("New Public Source")
+        self.assertEqual(self.f.check()["decision"], "would_fail")
         self.source("Private Source")
         self.assertEqual(self.f.check()["reason"], "private_source_protected")
+
+    def test_overlapping_source_lists_are_rejected_after_normalization(self):
+        for mode in ("public_allowlist", "private_exclusions"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(GuardError, "overlapping_source_lists"):
+                source_policy_key({"mode": mode, "public": [" PRIVATE SOURCE "], "private": ["Private Source"]})
+
+    def test_legacy_allowlist_normalizes_only_the_private_veto(self):
+        policy = {"public": ["Public Source"], "private": ["Private Source"]}
+        self.assertEqual(classify_source(policy, "Public Source"), "public")
+        self.assertEqual(classify_source(policy, " PUBLIC SOURCE "), "unknown")
+        for source in ("Private Source", "PRIVATE SOURCE", "  Private Source  "):
+            with self.subTest(source=source):
+                self.assertEqual(classify_source(policy, source), "private")
 
     def test_missing_malformed_or_blank_source_is_not_assumed_public(self):
         for name in (None, "", " \t ", 7, {}, []):

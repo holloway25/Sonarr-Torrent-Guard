@@ -277,13 +277,17 @@ class ProductionTests(unittest.TestCase):
 
     def test_private_indexer_on_any_matching_queue_row_vetoes_public_history(self):
         queue = self.s.routes["/api/v3/queue"]
-        queue["records"].append(dict(queue["records"][0], id=8, indexer="Private Source"))
+        extra = dict(queue["records"][0], id=8)
+        queue["records"].append(extra)
         queue["totalRecords"] = 2
-        self.qb.calls.clear()
-        report = run(self.config, self.qb, self.apis)[0]
-        self.assertEqual(report["decision"], "skip")
-        self.assertEqual(report["reason"], "private_queue_source_protected")
-        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+        for source in ("Private Source", "PRIVATE SOURCE", "  Private Source  "):
+            with self.subTest(source=source):
+                extra["indexer"] = source
+                self.qb.calls.clear()
+                report = run(self.config, self.qb, self.apis)[0]
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], "private_queue_source_protected")
+                self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
 
     def test_private_queue_source_appearing_at_final_recheck_blocks_removal(self):
         queue_row = self.s.routes["/api/v3/queue"]["records"][0]
@@ -294,7 +298,7 @@ class ProductionTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 3:
-                queue_row["indexer"] = "Private Source"
+                queue_row["indexer"] = "  PRIVATE SOURCE  "
             return refresh(*args, **kwargs)
 
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(

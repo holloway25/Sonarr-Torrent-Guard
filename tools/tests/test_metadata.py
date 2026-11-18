@@ -467,6 +467,35 @@ class MetadataSenderTests(unittest.TestCase):
         delete.assert_called_once()
         search.assert_not_called()
 
+    def test_same_hash_grab_suppresses_search_when_download_is_still_absent(self):
+        f = self.f
+        original_history = f.s.routes["/api/v3/history/since"][:]
+        transition = f.journal.transition
+
+        def remove(*args, **kwargs):
+            self.removed()
+            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+            grabbed = dict(f.grab, id=9, date=stamp.isoformat())
+            f.s.routes["/api/v3/history/since"] = [*original_history, grabbed]
+
+        def discard_grab_after_observation(*args, **kwargs):
+            row = transition(*args, **kwargs)
+            if args[2] == "retry_removed":
+                f.s.routes["/api/v3/history/since"] = original_history
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove), patch.object(
+                f.journal, "transition", side_effect=discard_grab_after_observation), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_superseded")
+        self.assertIs(row["current_observation"]["replacement_observed"], False)
+        self.assertIs(row["current_observation"]["any_replacement_observed"], False)
+        self.assertIs(row["current_observation"]["replacement_grab_observed"], True)
+        self.assertIs(f.journal.get(row["key"])["confirmed"]["replacement_grab_observed"], True)
+        search.assert_not_called()
+
     def assert_coordinator_restart_does_not_replay(self, crash_stage):
         f = self.f
         original_finish = production.finish_metadata_retry

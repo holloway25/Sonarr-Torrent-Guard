@@ -37,8 +37,10 @@ operator confirms the new scope. See [container setup](CONTAINER.md#live-mode-an
 
 ## Existing configurations and migration
 
-- Existing files without `indexers.mode` retain `public_allowlist` behavior: only
-  their explicit public names are eligible, and unlisted names remain protected.
+- Existing files without `indexers.mode` retain `public_allowlist` behavior. The
+  public list uses exact names, and private exceptions ignore case and surrounding
+  whitespace in both modes. The configuration rejects public and private entries
+  that overlap after those private-name comparisons.
 - Old environment templates with public-indexer variables but no explicit source
   policy retain allowlist mode, even with the new worker.
 - New templates explicitly select `private_exclusions` and omit public-list
@@ -46,8 +48,8 @@ operator confirms the new scope. See [container setup](CONTAINER.md#live-mode-an
   implicit default: set the new policy explicitly to acknowledge migration.
 - `STGUARD_CONFIG_SOURCE=file` preserves the private file instead of interpreting
   template policy variables. Change the file deliberately when using that mode.
-- New private-exception mode ignores any obsolete public list; a private match
-  always wins. Invalid policy modes/lists fail closed.
+- Private-exception mode classifies sources from the private list alone. Remove
+  obsolete public entries that overlap with a private exception.
 
 Before running with a changed policy, review the exact private exceptions for
 both Sonarr owners and retain the complete journal. Standalone workers need a

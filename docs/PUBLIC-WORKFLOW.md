@@ -326,6 +326,7 @@ deadline, a separate cursor hint starts the next cycle after that torrent. The
 timed-out torrent stays unassessed and can be retried on a later pass. Fresh
 proposal verification has its own rotation cursor, so a slow candidate cannot
 take first turn every cycle when the initial scan finishes the whole queue.
+Both dry-run and live cycles reserve time for recovery after verification.
 Recovery is limited to five records per cycle,
 five seconds per observation and thirty seconds overall, capped by the remaining
 run deadline with two seconds left for persistence. Each adapter temporarily

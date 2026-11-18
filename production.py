@@ -399,6 +399,7 @@ class OutcomeVerifier:
         metadata_retry = c.get("metadata_retry", {}).get("blocklist") is False
         if metadata_retry:
             result["any_replacement_observed"] = None
+            result["replacement_grab_observed"] = None
         current_torrent = None
         current_aliases = ()
         identity_available = False
@@ -422,6 +423,7 @@ class OutcomeVerifier:
             aliases = set(c.get("hash_aliases", [c["hash"]]))
             aliases.update(current_aliases)
             latest_grab_id = max(c.get("grab_ids", ()), default=None)
+            uncertain_grab = False
             for r in new:
                 kind = history_event_type(r)
                 after = event_after(r, self.not_before)
@@ -437,6 +439,13 @@ class OutcomeVerifier:
                 except GuardError:
                     h = None
                 confirmed = client_known and after is True
+                if metadata_retry and kind == "grabbed":
+                    # A verified Sonarr grab can veto a search before qBittorrent
+                    # can confirm that it is downloading a replacement.
+                    if confirmed and h is not None:
+                        result["replacement_grab_observed"] = True
+                    else:
+                        uncertain_grab = True
                 if kind == "downloadFailed":
                     title = r.get("sourceTitle")
                     title_known = isinstance(title, str) and bool(title.strip())
@@ -465,6 +474,8 @@ class OutcomeVerifier:
             if metadata_retry:
                 result["any_replacement_observed"] = True if covered else (
                     None if ambiguous_replacement else False)
+                if result["replacement_grab_observed"] is not True and not uncertain_grab:
+                    result["replacement_grab_observed"] = False
             if regrab == required:
                 result["torrent_absent"] = True  # Original incarnation, not all copies of this hash.
         except Exception:

@@ -39,14 +39,14 @@ ACTION_ADDITIONS = {
 
 def replacement_already_observed(row):
     return any(row[view].get(field) is True for view in ("current_observation", "confirmed")
-               for field in ("any_replacement_observed", "replacement_observed"))
+               for field in ("replacement_grab_observed", "any_replacement_observed", "replacement_observed"))
 
 
 def clean_observation(observation):
     if not isinstance(observation, dict):
         raise SafetyError("invalid_observation")
     safe = {}
-    for field in (*OBSERVATION_FIELDS, "any_replacement_observed"):
+    for field in (*OBSERVATION_FIELDS, "any_replacement_observed", "replacement_grab_observed"):
         val = observation.get(field)
         if val is not None and not isinstance(val, bool):
             raise SafetyError("invalid_observation")

@@ -256,6 +256,23 @@ class ContainerTests(unittest.TestCase):
                 self.assertNotIn(env["STGUARD_SONARR_HD_URL"], errors)
                 cycle.assert_not_called()
 
+    def test_check_config_rejects_whitespace_in_sonarr_hostname(self):
+        for separator in (" ", "\t", "\n"):
+            with self.subTest(separator=separator):
+                url = f"http://sonarr{separator}hd.example.invalid:8989"
+                env = dict(self.env, STGUARD_SONARR_HD_URL=url)
+                result, cycle, errors = self.run_mode(env, "--check-config")
+                self.assertEqual(result, 1)
+                cycle.assert_not_called()
+                self.assertNotIn(url, errors)
+
+    def test_check_config_rejects_empty_embedded_endpoint_credentials(self):
+        url = "http://@sonarr-hd.example.invalid:8989"
+        result, cycle, errors = self.run_mode(dict(self.env, STGUARD_SONARR_HD_URL=url), "--check-config")
+        self.assertEqual(result, 1)
+        cycle.assert_not_called()
+        self.assertNotIn(url, errors)
+
     def test_fresh_check_creates_neither_config_nor_scope_record(self):
         for mode in ("dry-run", "live"):
             with self.subTest(mode=mode):
