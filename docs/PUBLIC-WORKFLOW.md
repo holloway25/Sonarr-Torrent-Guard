@@ -31,9 +31,10 @@ rule out a collision and holds cleanup.
 Fresh checks bind the verified identities into the ownership fingerprint and
 retain them in the action context. Prior-attempt lookup checks overlapping
 hashes for both active and archived records. A legacy record contributes
-only its stored hash. Recovery uses qBittorrent's bulk torrent list to check
-the aliases. If a row lacks the identity fields needed to rule out a match,
-torrent absence remains unknown. Hybrid aliases also count as the same
+only its stored hash. Recovery and the final metadata retry check use
+qBittorrent's bulk torrent list to check every advertised hash, even for legacy
+single-hash records. If a row lacks the identity fields needed to rule out a
+match, torrent absence remains unknown. Hybrid aliases also count as the same
 torrent when Guard checks failure and replacement history.
 
 Fresh read-only assessment and a private SQLite journal are now implemented.
@@ -200,7 +201,9 @@ incarnation is corroborated by a later qBittorrent addition and new matching Son
 grab IDs for all affected episodes, positively after dispatch. Changed addition
 time alone leaves original absence unknown. Legacy contexts lacking incarnation
 evidence retain hash-absence checks. Client-name
-digests bind matching history records to the configured downloader.
+digests bind matching history records to the configured downloader. A matching
+failure with a missing or malformed downloader name leaves failure unknown, so
+read-only recovery can check again. A known different downloader can be excluded.
 
 Dispatch time is stored with intent, and matching result events must be at or
 after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's
@@ -306,7 +309,10 @@ Existing single-test/manual-review rows and their evidence are not reset.
 
 The always-dry-run `public.py` CLI performs connectivity checks and candidate
 assessment/fresh proposals BEFORE pending recovery, in a bounded, locked cycle
-with the existing fair cursor. Recovery is limited to five records per cycle,
+with the existing fair cursor. If the first torrent stalls until the assessment
+deadline, a separate cursor hint starts the next cycle after that torrent. The
+timed-out torrent stays unassessed and can be retried on a later pass. Recovery
+is limited to five records per cycle,
 five seconds per observation and thirty seconds overall, capped by the remaining
 run deadline with two seconds left for persistence. Each adapter temporarily
 inherits the observation deadline too, preventing caught timeouts from starting

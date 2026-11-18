@@ -771,6 +771,18 @@ class ProductionTests(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertFalse(self.observe()["blocklisted" if mutation == "indexer" else "failed"])
 
+    def test_missing_downloader_identity_differs_from_a_known_different_client(self):
+        for data, expected in ((None, None), ({}, None), ({"downloadClientName": " "}, None),
+                               ({"downloadClientName": True}, None), ({"downloadClientName": "Other"}, False)):
+            with self.subTest(data=data):
+                self.results()
+                history = self.s.routes["/api/v3/history/since"]
+                history[1]["data"] = data
+                observed = self.observe()
+                self.assertIs(observed["failed"], expected)
+                self.assertIs(observed["replacement_observed"], True)
+                self.assertIs(observed["blocklisted"], True)
+
     def test_partial_outage_does_not_erase_other_verified_results(self):
         self.results()
         self.s.routes["/api/v3/history/since"] = TimeoutError()

@@ -27,13 +27,18 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
 }
 
 
-def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None):
+def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None, *, summary=None):
     authority.validate(config)
     if proposal is None:
         proposal = public.cycle(config, qb, apis, journal, batch_state, reserve_dispatch=True)
     runtime = copy.deepcopy(config)
     runtime["dry_run"] = False
+    if summary is None:
+        summary = {}
     actions = []
+    summary.update(mode="routine", live_authorized=True, status="interrupted", retry_after_seconds=600,
+                   grant_expires_at=authority.expires_at, grant_authorization_mode=authority.mode,
+                   assessment=proposal["assessment"], recovery=proposal["recovery"], actions=actions)
     # Snapshot this pass only. Never loop over replacements created by it.
     for report in proposal["assessment"]:
         if report.get("safeguards", {}).get("status") != "fresh_attempt_verified":
@@ -47,17 +52,18 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
                 "metadata_retry": row["context"].get("metadata_retry"),
                 "search_command_id": row["search_command_id"]})
         except (GuardError, SafetyError) as error:
+            if str(error) == "run_time_limit_reached":
+                raise
             # Only exact known codes may reach logs; exception text can contain secrets.
             reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
             actions.append({"instance": report["instance"], "hash": report["hash"], "stage": "held",
                 "stop_reason": reason, "routine_grant_digest": authority.identifier})
         if on_action is not None:
             on_action(actions[-1])
-    return {"mode": "routine", "live_authorized": True, "status": "completed", "retry_after_seconds": 600,
-            "grant_expires_at": authority.expires_at,
-            "grant_authorization_mode": authority.mode,
-            "assessment": proposal["assessment"],
-            "recovery": proposal["recovery"], "actions": actions}
+        if actions[-1]["stop_reason"] == "run_time_limit_reached":
+            raise GuardError("run_time_limit_reached")
+    summary["status"] = "completed"
+    return summary
 
 
 def main():
@@ -103,7 +109,7 @@ def main():
                 text = json.dumps({"event": "routine_action", **action})
                 handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
             with hard_deadline(deadline):
-                result = cycle(config, qb, apis, journal, authority, state, proposal, log_action)
+                cycle(config, qb, apis, journal, authority, state, proposal, log_action, summary=result)
         finally:
             journal.close()
     except (SafetyError, GuardError) as error:
@@ -112,7 +118,7 @@ def main():
             "routine_authorization_revoked_or_changed",
             "explicit_live_mode_required", "live_execution_disabled",
             "container_live_scope_confirmation_required",
-            "routine_log_requires_private_config_directory"}
+            "routine_log_requires_private_config_directory", "run_time_limit_reached"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

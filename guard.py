@@ -124,14 +124,16 @@ def load_batch_state(path):
         if not path.exists():
             return {}
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or set(state) - {"after", "recovery_after"}:
+        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "recovery_after"}:
             raise ValueError()
-        if "after" in state:
-            after = state["after"]
-            if (not isinstance(after, list) or len(after) != 2
-                    or not isinstance(after[0], str) or not after[0]):
+        for key in ("after", "timed_out"):
+            if key not in state:
+                continue
+            cursor = state[key]
+            if (not isinstance(cursor, list) or len(cursor) != 2
+                    or not isinstance(cursor[0], str) or not cursor[0]):
                 raise ValueError()
-            torrent_hash(after[1])
+            torrent_hash(cursor[1])
         if "recovery_after" in state:
             from safety import valid_digest
             if not valid_digest(state["recovery_after"]):
@@ -388,13 +390,22 @@ def bulk_hashes(torrent):
     return sorted(aliases)
 
 
-def torrent_hash_ownership(qb, torrents):
+def torrents_by_hash(torrents):
+    if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
+        raise GuardError("invalid_torrent_response")
+    indexed = {torrent_hash(t.get("hash")): t for t in torrents}
+    if len(indexed) != len(torrents):
+        raise GuardError("duplicate_torrent_hash")
+    return indexed
+
+
+def torrent_hash_ownership(torrents, read_hashes):
     claims = collections.defaultdict(set)
     aliases_by_hash, errors = {}, {}
     for canonical, torrent in torrents.items():
         claims[canonical].add(canonical)
         try:
-            aliases = verified_hashes(qb, torrent)
+            aliases = read_hashes(torrent)
         except GuardError as error:
             if str(error) == "run_time_limit_reached":
                 raise
@@ -524,15 +535,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     deadlines = (getattr(api, "deadline", None) for api in (qb, *sonarr_apis.values()))
     deadline = min((stamp for stamp in deadlines if stamp is not None), default=float("inf"))
     reports, queues, clients = [], {}, {}
-    torrents = qb.call("/api/v2/torrents/info")
-    if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
-        raise GuardError("invalid_torrent_response")
-    by_hash = {}
-    for t in torrents:
-        h = torrent_hash(t.get("hash"))
-        if h in by_hash:
-            raise GuardError("duplicate_torrent_hash")
-        by_hash[h] = t
+    by_hash = torrents_by_hash(qb.call("/api/v2/torrents/info"))
     owners = collections.defaultdict(set)
     for label, api in sonarr_apis.items():
         queues[label] = records(api, "/api/v3/queue", {
@@ -595,7 +598,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     # Only scoped ownership candidates consume work. A durable key cursor rotates
     # fairly across both instances and survives restarts and queue reordering.
     candidates.sort(key=lambda entry: entry[:2])
-    after = tuple((batch_state or {}).get("after", ()))
+    cursor = batch_state or {}
+    after = tuple(cursor.get("timed_out", cursor.get("after", ())))
     if after:
         candidates = ([x for x in candidates if x[:2] > after]
                       + [x for x in candidates if x[:2] <= after])
@@ -606,14 +610,15 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             reports.append(report)
             continue
         api, instance = sonarr_apis[label], config["sonarr"][label]
+        started = time.monotonic() < deadline
         try:
-            if time.monotonic() >= deadline:
+            if not started:
                 raise GuardError("run_time_limit_reached")
             added = t.get("added_on")
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
             if hash_ownership is None:
-                hash_ownership = torrent_hash_ownership(qb, by_hash)
+                hash_ownership = torrent_hash_ownership(by_hash, lambda torrent: verified_hashes(qb, torrent))
             claims, aliases_by_hash, hash_errors = hash_ownership
             if h in hash_errors:
                 raise GuardError(hash_errors[h])
@@ -711,12 +716,17 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                 report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
         except GuardError as e:
             if str(e) == "run_time_limit_reached" or time.monotonic() >= deadline:
+                # Move past a stalled first candidate next cycle without
+                # advancing the cursor that records completed assessments.
+                if started and number == 0 and batch_state is not None:
+                    batch_state["timed_out"] = [label, h]
                 reports.append({"instance": label, "hash": h, "dry_run": True,
                                 "decision": "skip", "reason": "run_time_limit_reached"})
                 break
             report.update(decision="skip", reason=str(e))
         if batch_state is not None:
             batch_state["after"] = [label, h]
+            batch_state.pop("timed_out", None)
         reports.append(report)
     return reports
 

@@ -136,8 +136,9 @@ paths into source. Public dry-run units remain separate.
 
 The worker logs each finished/held action immediately and a cycle summary to
 owner-private rotating `routine.log` beside the configuration. It also prints a
-sanitized summary for the service journal. This preserves evidence of earlier
-actions even if the shared three-minute deadline interrupts a later action.
+sanitized summary for the service journal. If the shared three-minute deadline
+or a handled error interrupts the live pass, the summary says `interrupted`
+and includes the actions already reported.
 Waiting, grant expiry/code mismatch and held results are visible; no credentials,
 raw endpoints or file paths are logged. No application file deletion is added.
 

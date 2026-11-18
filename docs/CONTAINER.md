@@ -116,7 +116,8 @@ The Python PID1 scheduler runs one cycle, then waits600 seconds after completion
 No overlapping cycles or catch-up bursts. Dry-run uses existing public assessment
 and read-only recovery, including Sonarr's non-saving connection diagnostic; no
 removal, blocklisting or searches. Maintenance waits retry on later cycles.
-`--once` runs one cycle; `--check-config` validates only, with no API requests.
+`--once` runs one cycle. `--check-config` validates the candidate configuration
+and live scope without sending API requests or saving the configuration or scope.
 A lifetime lock prevents another container using the SAME appdata; it cannot
 detect independent workers using different copies elsewhere.
 

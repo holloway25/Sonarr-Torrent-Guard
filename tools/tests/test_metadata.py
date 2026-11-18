@@ -287,7 +287,8 @@ class MetadataSenderTests(unittest.TestCase):
         def transition(*args, **kwargs):
             row = original(*args, **kwargs)
             if args[2] == "retry_search_recorded":
-                self.f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                self.f.qb.routes["/api/v2/torrents/info"] = [
+                    dict(self.t, infohash_v1=self.f.hash, infohash_v2="")]
             return row
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=self.removed), patch.object(
@@ -295,6 +296,44 @@ class MetadataSenderTests(unittest.TestCase):
             row = self.execute()
         self.assertEqual(row["stop_reason"], "target_reappeared")
         self.assertEqual(row["stage"], "retry_search_blocked")
+        search.assert_not_called()
+
+    def test_original_present_under_an_alternate_hash_stops_retry(self):
+        f = self.f
+        hybrid = dict(self.t, hash="b" * 40, infohash_v1=f.hash, infohash_v2="b" * 64)
+
+        def remove_from_queue_only(*args, **kwargs):
+            self.removed()
+            f.qb.routes["/api/v2/torrents/info"] = [hybrid]
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_from_queue_only) as remove, patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertNotIn("hash_aliases", row["context"])
+        self.assertIs(row["current_observation"]["torrent_absent"], False)
+        self.assertEqual(row["stage"], "uncertain")
+        remove.assert_called_once()
+        search.assert_not_called()
+
+    def test_alternate_hash_reappearing_after_removal_blocks_search(self):
+        f = self.f
+        original = f.journal.transition
+        hybrid = dict(self.t, hash="b" * 40, infohash_v1=f.hash, infohash_v2="b" * 64)
+
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                f.qb.routes["/api/v2/torrents/info"] = [hybrid]
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch.object(
+                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+            row = self.execute()
+        self.assertNotIn("hash_aliases", row["context"])
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "target_reappeared")
         search.assert_not_called()
 
     def test_new_queued_replacement_blocks_extra_search(self):

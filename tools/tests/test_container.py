@@ -185,6 +185,40 @@ class ContainerTests(unittest.TestCase):
                 self.assertNotIn(env["STGUARD_SONARR_HD_URL"], errors)
                 cycle.assert_not_called()
 
+    def test_fresh_check_creates_neither_config_nor_scope_record(self):
+        for mode in ("dry-run", "live"):
+            with self.subTest(mode=mode):
+                result, cycle, _ = self.run_mode(dict(self.env, STGUARD_MODE=mode), "--check-config")
+                self.assertEqual(result, 0)
+                cycle.assert_not_called()
+                self.assertFalse((self.path / "connections.json").exists())
+                self.assertFalse((self.path / worker.CONTAINER_SCOPE_FILE).exists())
+
+    def test_config_checks_never_replace_existing_credentials(self):
+        path = worker.configure(self.env)
+        before = path.read_bytes()
+        changed = dict(self.env, STGUARD_MODE="live", STGUARD_QBIT_PASSWORD="rotated-placeholder")
+        for command in ("--check-config", "--once"):
+            with self.subTest(command=command):
+                result, cycle, errors = self.run_mode(changed, command)
+                self.assertEqual(result, 1)
+                self.assertIn("container_live_scope_confirmation_required", errors)
+                cycle.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+
+        self.assertEqual(self.run_mode(dict(self.env, STGUARD_MODE="live"), "--approve-live-scope")[0], 0)
+        scope = self.path / worker.CONTAINER_SCOPE_FILE
+        approved = scope.read_bytes()
+        for mode in ("dry-run", "live"):
+            with self.subTest(mode=mode):
+                result, cycle, _ = self.run_mode(dict(changed, STGUARD_MODE=mode), "--check-config")
+                self.assertEqual(result, 0)
+                cycle.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(scope.read_bytes(), approved)
+        self.assertEqual(self.run_mode(changed, "--once")[0], 0)
+        self.assertEqual(json.loads(path.read_text())["qbittorrent"]["password"], "rotated-placeholder")
+
     def test_invalid_modes_fail_before_configuration_or_api_work(self):
         for mode in ("LIVE", "false", "unknown"):
             output = io.StringIO()
@@ -234,7 +268,7 @@ class ContainerTests(unittest.TestCase):
 
     def test_scope_change_requires_confirmation_even_after_restart(self):
         env = dict(self.env, STGUARD_MODE="live")
-        self.assertEqual(self.run_mode(env, "--check-config")[0], 0)
+        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
         path = self.path / "connections.json"
         changed = json.loads(path.read_text())
         changed["sonarr"]["Sonarr-HD"]["indexers"]["private"] = ["Private Source"]

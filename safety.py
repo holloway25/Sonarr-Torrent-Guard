@@ -473,7 +473,7 @@ def reconcile(journal, key, observe):
     elif all(observation.get(k) is True for k in OBSERVATION_FIELDS):
         stage = "complete"
     elif known.get("torrent_absent") is True and (
-            known.get("failed") is False or known.get("blocklisted") is False):
+            observation.get("failed") is False or observation.get("blocklisted") is False):
         stage = "manual_review"
     elif all(known.get(k) is True for k in ("torrent_absent", "failed", "blocklisted")):
         stage = "replacement_pending"

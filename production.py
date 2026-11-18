@@ -19,7 +19,7 @@ import urllib.request
 from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
                    records, recheck_candidate, run, select_latest_grabs, torrent_hash,
-                   unique_client_name, verify_client_binding)
+                   torrent_hash_ownership, torrents_by_hash, unique_client_name, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -299,18 +299,16 @@ def capture_context(config, api, report, approval_digest, now=None):
 
 def observed_torrent(torrents, context):
     """Use the bulk identity snapshot. Missing alias evidence cannot prove absence."""
-    if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
-        raise GuardError("invalid_torrent_response")
-    by_hash = {torrent_hash(t.get("hash")): t for t in torrents}
-    if len(by_hash) != len(torrents):
-        raise GuardError("duplicate_torrent_hash")
-    if "hash_aliases" not in context:
-        return by_hash.get(context["hash"])
-    aliases = set(context["hash_aliases"])
-    matching = [t for key, t in by_hash.items() if key in aliases or aliases.intersection(bulk_hashes(t))]
-    if len(matching) > 1:
+    by_hash = torrents_by_hash(torrents)
+    claims, aliases_by_hash, errors = torrent_hash_ownership(by_hash, bulk_hashes)
+    aliases = context.get("hash_aliases", [context["hash"]])
+    matching = {key for alias in aliases for key in claims.get(alias, ())}
+    canonical = next(iter(matching), None)
+    if len(matching) > 1 or any(claims[alias] != {canonical} for alias in aliases_by_hash.get(canonical, ())):
         raise GuardError("ambiguous_torrent_hash_identity")
-    return matching[0] if matching else None
+    if errors:
+        raise GuardError("torrent_hash_identity_unavailable")
+    return by_hash.get(canonical)
 
 
 class OutcomeVerifier:
@@ -351,29 +349,33 @@ class OutcomeVerifier:
             new = [r for r in rows if r["id"] not in c["baseline_history_ids"]]
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
+            aliases = set(c.get("hash_aliases", [c["hash"]]))
             for r in new:
                 kind = history_event_type(r)
                 after = event_after(r, self.not_before)
                 if after is False:
                     continue
                 data = r.get("data")
-                if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
+                name = data.get("downloadClientName") if isinstance(data, dict) else None
+                client_known = isinstance(name, str) and bool(name.strip())
+                if client_known and digest(name) != c["client_name_digest"]:
                     continue
                 try:
                     h = torrent_hash(r.get("downloadId"))
                 except GuardError:
                     continue
                 added = current_torrent.get("added_on") if current_torrent else None
-                if (kind == "grabbed" and h in c.get("hash_aliases", [c["hash"]]) and after is True
+                confirmed = client_known and after is True
+                if (kind == "grabbed" and h in aliases and confirmed
                         and "grab_ids" in c and r["id"] > max(c["grab_ids"])
                         and integer(added) and added > max(c["download_added_on"], self.not_before)
                         and abs(event_time(r) - added) <= 120):
                     regrab.add(r["episodeId"])
-                if (kind == "downloadFailed" and h in c.get("hash_aliases", [c["hash"]])
+                if (kind == "downloadFailed" and h in aliases
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
-                    (failed if after else ambiguous_failed).add(r["episodeId"])
-                if kind == "grabbed" and h not in c.get("hash_aliases", [c["hash"]]):
-                    (replacement if after else ambiguous_replacement).add(r["episodeId"])
+                    (failed if confirmed else ambiguous_failed).add(r["episodeId"])
+                if kind == "grabbed" and h not in aliases:
+                    (replacement if confirmed else ambiguous_replacement).add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
             result["replacement_observed"] = True if replacement == required else (

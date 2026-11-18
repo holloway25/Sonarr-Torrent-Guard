@@ -403,6 +403,42 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(files_requests, [finished, interrupted])
                 self.assertEqual(state["after"], ["HD", finished])
 
+    def test_slow_first_candidate_cannot_starve_later_torrents_across_restarts(self):
+        import tempfile
+        from pathlib import Path
+
+        later = "b" * 40
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
+            self.row, dict(self.row, id=2, downloadId=later)]}
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [
+            self.grab, dict(self.grab, id=5, downloadId=later)]}
+        self.qb.routes["/api/v2/torrents/info"].append(dict(self.t, hash=later))
+        call = self.qb.call
+
+        def slow_first(route, params=None):
+            if route.endswith("/files") and params["hash"] == self.h:
+                raise GuardError("run_time_limit_reached")
+            return call(route, params)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(self.qb, "call", side_effect=slow_first):
+            path = Path(folder) / "batch-state.json"
+            assessed = []
+            for pass_number in range(4):
+                state = load_batch_state(path)
+                result = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+                assessed.extend(r["hash"] for r in result if r["decision"] == "would_fail")
+                self.assertEqual([r["hash"] for r in result if r.get("reason") == "run_time_limit_reached"],
+                                 [self.h])
+                if pass_number % 2 == 0:
+                    self.assertEqual(state["timed_out"], ["HD", self.h])
+                else:
+                    self.assertNotIn("timed_out", state)
+                    self.assertEqual(state["after"], ["HD", later])
+                if pass_number == 0:
+                    self.assertNotIn("after", state)
+                save_batch_state(path, state)
+        self.assertEqual(assessed, [later, later])
+
     def test_rotation_across_instances(self):
         other = "b" * 40
         uhd = copy.deepcopy(self.s)

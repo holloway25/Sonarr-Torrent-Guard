@@ -175,6 +175,46 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(result["assessment"][-1]["reason"], "run_time_limit_reached")
         self.assertEqual(result["actions"][0]["stage"], "cleanup_resolved")
 
+    def test_interrupted_cli_summary_retains_completed_live_actions(self):
+        import contextlib
+        import io
+
+        f = self.f
+        directory = Path(f.folder.name)
+        log_path = directory / "routine.log"
+        args = ["routine.py", "--live", "--config", str(directory / "connections.json"),
+                "--authorization", str(directory / "routine-authorization.json"), "--log-file", str(log_path)]
+        first = dict(f.report, safeguards={"status": "fresh_attempt_verified"})
+        second = dict(first, hash="b" * 40)
+        proposal = {"assessment": [first, second], "recovery": []}
+        execute = production.execute_routine_attempt
+
+        def interrupt_after_first(config, qb, apis, journal, report, authority):
+            if report["hash"] == second["hash"]:
+                raise production.GuardError("run_time_limit_reached")
+            return execute(config, qb, apis, journal, report, authority)
+
+        with contextlib.ExitStack() as stack:
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(patch("sys.argv", args))
+            stack.enter_context(patch("routine.load_config", return_value=f.config))
+            stack.enter_context(patch("routine.RoutineAuthorization.load", return_value=self.authority))
+            stack.enter_context(patch("routine.Api", side_effect=[f.qb, f.s]))
+            stack.enter_context(patch("routine.public.cycle", return_value=proposal))
+            stack.enter_context(patch("production.execute_routine_attempt", side_effect=interrupt_after_first))
+            send = stack.enter_context(patch("production._send_queue_delete", side_effect=lambda *args: f.results()))
+            self.assertEqual(routine.main(), 0)
+
+        send.assert_called_once_with(f.s, 7)
+        summary = json.loads(output.getvalue())
+        self.assertEqual(summary["status"], "interrupted")
+        self.assertIs(summary["live_authorized"], True)
+        self.assertEqual(summary["reason"], "run_time_limit_reached")
+        self.assertEqual([(action["hash"], action["stage"]) for action in summary["actions"]],
+                         [(f.hash, "cleanup_resolved")])
+        lines = [json.loads(line) for line in log_path.read_text().splitlines()]
+        self.assertEqual(lines, [{"event": "routine_action", **summary["actions"][0]}, summary])
+
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
                 "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:

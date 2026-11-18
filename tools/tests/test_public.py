@@ -373,13 +373,47 @@ class PublicTests(unittest.TestCase):
             self.assertEqual(send.call_count, 2)
             self.assertEqual(f.journal.get(first["key"]), first)
 
+    def test_matching_failure_with_missing_downloader_remains_recoverable(self):
+        f = self.f
+
+        def report_unattributed_failure(*args):
+            self.result()
+            f.s.routes["/api/v3/history/since"][1]["data"] = {}
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=report_unattributed_failure) as send:
+            row = self.execute()
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertIsNone(row["current_observation"]["failed"])
+        self.assertIs(row["current_observation"]["blocklisted"], True)
+        send.assert_called_once()
+        f.s.routes["/api/v3/history/since"][1]["data"] = f.grab["data"]
+        verifier = production.OutcomeVerifier(f.config, f.qb, f.apis, row["context"], row["dispatched_at"])
+        row = reconcile(f.journal, row["key"], verifier.observe)
+        self.assertEqual(row["stage"], "cleanup_resolved")
+
+    def test_old_negative_does_not_end_recovery_when_current_failure_is_unknown(self):
+        f = self.f
+        row = f.journal.prepare(f.report, mode="public_attempt", context=f.context)
+        f.journal.transition(row["key"], "prepared", "dispatch_recorded")
+        row = reconcile(f.journal, row["key"], lambda: {
+            "torrent_absent": False, "failed": False, "blocklisted": True,
+        })
+        self.assertEqual(row["stage"], "uncertain")
+        row = reconcile(f.journal, row["key"], lambda: {
+            "torrent_absent": True, "failed": None, "blocklisted": True,
+        })
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertIsNone(row["current_observation"]["failed"])
+
     def test_original_absence_can_be_distinguished_from_correlated_same_hash_regrab(self):
         f = self.f
         self.result()
         added = int(time.time()) + 10
         grab = dict(f.grab, id=20, date=datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat())
         f.s.routes["/api/v3/history/since"].append(grab)
-        f.qb.routes["/api/v2/torrents/info"] = [{"hash": f.hash, "added_on": added}]
+        f.qb.routes["/api/v2/torrents/info"] = [
+            {"hash": f.hash, "added_on": added, "infohash_v1": f.hash, "infohash_v2": ""}]
         result = production.OutcomeVerifier(f.config, f.qb, f.apis, f.context, time.time()).observe()
         self.assertTrue(result["torrent_absent"])
         self.assertTrue(result["replacement_observed"])

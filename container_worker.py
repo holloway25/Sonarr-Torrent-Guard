@@ -88,8 +88,10 @@ def atomic_json(path, value):
             temporary.unlink()
 
 
-def configure(env):
+def configure(env, *, check_only=False, validate=None):
     path = CONFIG_DIR / "connections.json"
+    if path.is_symlink():
+        raise GuardError("container_private_appdata_required")
     source = env.get("STGUARD_CONFIG_SOURCE", "env")
     if source == "env":
         candidate = runtime_config(env)
@@ -99,8 +101,6 @@ def configure(env):
             atomic_json(temporary, candidate)
             candidate = load_config(temporary)
             if path.exists():
-                if path.is_symlink():
-                    raise GuardError("container_private_appdata_required")
                 previous = load_config(path)
                 from production import binding_digest
                 # Labels are durable journal identities, not display names. Match
@@ -122,16 +122,18 @@ def configure(env):
             elif (CONFIG_DIR / "action-journal.sqlite3").exists():
                 # Do not guess the identities of orphaned migrated appdata.
                 raise GuardError("container_identity_migration_required")
-            validate_journal_identity(candidate)
-            atomic_json(path, candidate)
         finally:
             if temporary.exists() and not temporary.is_symlink():
                 temporary.unlink()
-    elif source != "file":
+    elif source == "file":
+        candidate = load_config(path)
+    else:
         raise GuardError("container_configuration_invalid")
-    if path.is_symlink() or path.stat().st_mode & 0o077:
-        raise GuardError("container_private_appdata_required")
-    validate_journal_identity(load_config(path))
+    validate_journal_identity(candidate)
+    if validate is not None:
+        validate(candidate)
+    if source == "env" and not check_only:
+        atomic_json(path, candidate)
     return path
 
 
@@ -250,28 +252,40 @@ def main():
         with open(lock_path, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fresh = all(entry.name == lock_path.name for entry in CONFIG_DIR.iterdir())
-            path = configure(os.environ)
             scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
-            if fresh:
-                atomic_json(scope_path, {"rule": RULE, "scope_digest": None})
-            if mode == "live":
-                config = load_config(path)
+            scope_update = {"rule": RULE, "scope_digest": None} if fresh else None
+
+            def validate_scope(config):
+                nonlocal scope_update
+                if mode == "dry-run":
+                    if args.approve_live_scope:
+                        raise SafetyError("live_execution_disabled")
+                    return
                 if config.get("minimum_age_seconds", 120) < 120:
                     raise SafetyError("routine_authorization_expired_or_scope_changed")
-                if args.approve_live_scope:
-                    atomic_json(scope_path, container_scope_record(config))
-                    print(json.dumps({"event": "container_live_scope_confirmed", "actions_sent": False}))
-                    return 0
+                if scope_path.is_symlink():
+                    raise SafetyError("container_live_scope_confirmation_required")
+                expected = container_scope_record(config)
+                if args.approve_live_scope or fresh:
+                    scope_update = expected
+                    return
                 approved = read_container_scope(scope_path)
-                if approved["scope_digest"] is None and not args.check_config:
-                    atomic_json(scope_path, container_scope_record(config))
-                if not args.check_config or approved["scope_digest"] is not None:
-                    ContainerAuthorization(config, path)
-            elif args.approve_live_scope:
-                raise SafetyError("live_execution_disabled")
+                if approved["scope_digest"] is None:
+                    scope_update = expected
+                elif approved != expected:
+                    raise SafetyError("container_live_scope_confirmation_required")
+
+            path = configure(os.environ, check_only=args.check_config, validate=validate_scope)
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0
+            if scope_update is not None:
+                atomic_json(scope_path, scope_update)
+            if args.approve_live_scope:
+                print(json.dumps({"event": "container_live_scope_confirmed", "actions_sent": False}))
+                return 0
+            if mode == "live":
+                ContainerAuthorization(load_config(path), path)
             signal.signal(signal.SIGTERM, stop_worker)
             signal.signal(signal.SIGINT, stop_worker)
             while not STOP.is_set():
