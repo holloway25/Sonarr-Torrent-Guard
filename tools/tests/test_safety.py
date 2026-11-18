@@ -290,8 +290,10 @@ class SafetyTests(unittest.TestCase):
                 "legacy-key", "simulation", "replacement_pending", json.dumps(evidence(self.original)),
                 json.dumps(positives), 1000))
         db.close()
-        for _ in range(2):
-            journal = Journal(legacy)
+        legacy.chmod(0o600)
+        before = legacy.read_bytes()
+        for read_only in (True, False, False):
+            journal = Journal(legacy, read_only=read_only)
             try:
                 row = journal.get("legacy-key")
                 self.assertEqual(row["stage"], "replacement_pending")
@@ -300,6 +302,8 @@ class SafetyTests(unittest.TestCase):
                 self.assertFalse(row["observation_available"])
             finally:
                 journal.close()
+            if read_only:
+                self.assertEqual(legacy.read_bytes(), before)
 
     def test_duplicates_and_concurrent_stage_changes_cannot_send_twice(self):
         row = self.journal.prepare(self.original, mode="simulation")

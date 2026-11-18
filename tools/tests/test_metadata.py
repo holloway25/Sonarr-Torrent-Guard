@@ -432,6 +432,41 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(row["stage"], "retry_superseded")
         search.assert_not_called()
 
+    def test_partial_pack_replacement_veto_survives_a_later_empty_history_read(self):
+        f = self.f
+        self.assess_season_pack()
+        initial_history = f.s.routes["/api/v3/history/since"][:]
+        transition = f.journal.transition
+
+        def remove(*args, **kwargs):
+            self.removed()
+            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+            grabbed = dict(f.grab, id=9, episodeId=4, downloadId="b" * 40, date=stamp.isoformat())
+            f.s.routes["/api/v3/history/since"] = [*initial_history, grabbed]
+
+        def disappear_after_observation(*args, **kwargs):
+            row = transition(*args, **kwargs)
+            if args[2] == "retry_removed":
+                f.s.routes["/api/v3/history/since"] = initial_history
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove) as delete, patch.object(
+                f.journal, "transition", side_effect=disappear_after_observation), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_superseded")
+        self.assertIs(row["current_observation"]["replacement_observed"], False)
+        self.assertIs(row["current_observation"]["any_replacement_observed"], True)
+        self.assertIs(row["confirmed"]["any_replacement_observed"], True)
+        reopened = Journal(f.journal.path, read_only=True)
+        try:
+            self.assertEqual(reopened.get(row["key"]), row)
+        finally:
+            reopened.close()
+        delete.assert_called_once()
+        search.assert_not_called()
+
     def assert_coordinator_restart_does_not_replay(self, crash_stage):
         f = self.f
         original_finish = production.finish_metadata_retry

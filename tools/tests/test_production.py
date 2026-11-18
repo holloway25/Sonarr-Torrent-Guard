@@ -812,6 +812,19 @@ class ProductionTests(unittest.TestCase):
         self.assertIsNone(observed["replacement_observed"])
         self.assertIs(observed["failed"], True)
 
+    def test_qb_outage_leaves_a_new_same_hash_grab_unverified(self):
+        self.results()
+        added = int(time.time()) + 10
+        date = datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat()
+        self.qb.routes["/api/v2/torrents/info"] = [
+            {"hash": self.hash, "infohash_v1": self.hash, "infohash_v2": "", "added_on": added}]
+        self.s.routes["/api/v3/history/since"] = [dict(self.grab, id=20, date=date)]
+        self.assertIs(self.observe()["replacement_observed"], True)
+        self.qb.routes["/api/v2/torrents/info"] = TimeoutError()
+        result = self.observe()
+        self.assertIsNone(result["replacement_observed"])
+        self.assertIsNone(result["torrent_absent"])
+
     def test_qb_outage_cannot_exclude_failure_with_a_possible_alias(self):
         self.results()
         self.s.routes["/api/v3/history/since"][1]["downloadId"] = "b" * 40

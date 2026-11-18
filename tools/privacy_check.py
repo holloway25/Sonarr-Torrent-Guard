@@ -6,6 +6,10 @@ import re
 import subprocess
 import sys
 import urllib.parse
+import xml.etree.ElementTree as ET
+
+
+GUARD_SETTING = r"STGUARD_(?:QBIT|SONARR_[A-Z0-9_]+)_(URL|API_KEY|USERNAME|PASSWORD)"
 
 
 def is_example_endpoint(url):
@@ -15,6 +19,26 @@ def is_example_endpoint(url):
                 and endpoint.username is None and endpoint.password is None)
     except ValueError:
         return False
+
+
+def template_issues(text):
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return ["invalid XML template"]
+    issues = []
+    for item in root.iter("Config"):
+        setting = re.fullmatch(GUARD_SETTING, item.get("Target", ""))
+        if setting is None:
+            continue
+        default = item.get("Default", "")
+        value = "".join(item.itertext()).strip()
+        if setting[1] == "URL":
+            if not is_example_endpoint(default) or (value and not is_example_endpoint(value)):
+                issues.append("non-placeholder endpoint")
+        elif default != "REPLACE_ME" or value not in ("", "REPLACE_ME"):
+            issues.append("non-placeholder credential")
+    return issues
 
 
 def git(*args):
@@ -66,9 +90,9 @@ def main():
                 for key in ("api_key", "username", "password"):
                     if key in item and item[key] != "REPLACE_ME":
                         issues.append((name, "non-placeholder credential"))
-        for field, value in re.findall(
-                r"(?m)^[ \t]*(?:export[ \t]+)?STGUARD_(?:QBIT|SONARR_[A-Z0-9_]+)"
-                r"_(URL|API_KEY|USERNAME|PASSWORD)[ \t]*=(.*)$", text):
+        if leaf.endswith(".xml"):
+            issues.extend((name, reason) for reason in template_issues(text))
+        for field, value in re.findall(rf"(?m)^[ \t]*(?:export[ \t]+)?{GUARD_SETTING}[ \t]*=(.*)$", text):
             if field == "URL":
                 if not is_example_endpoint(value.strip()):
                     issues.append((name, "non-placeholder endpoint"))

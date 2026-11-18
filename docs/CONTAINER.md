@@ -63,7 +63,8 @@ enabled. `/tmp` may be a tmpfs. Image updates must preserve persistent appdata.
 Use Unraid environment fields or a private environment file. Generic examples are
 in `deploy/container.env.example`. Keep deployment values in private files.
 Git ignores `*.env` files, and the privacy check rejects actual Guard credential
-assignments even in files with other names. Runtime
+assignments even in files with other names. It also checks the values and
+defaults in Unraid template XML. Runtime
 environment variables are visible to Docker/Unraid administrators, as accepted
 by the operator; they are not claimed to be hidden from root.
 
@@ -101,8 +102,9 @@ ambiguous bindings, extra/missing owners, or a journal without its connection
 config require an explicit identity migration; startup refuses to guess and does
 not replace the config. File mode preserves existing labels and settings.
 Both modes check active and archived journal owner identities and recorded live
-bindings read-only before scheduling. Mismatched or unreadable evidence blocks
-startup, never resets holds. Retain the original config with the entire appdata;
+bindings read-only before scheduling. The check can read an older journal with
+missing optional columns. The worker adds those columns when it opens the journal
+for normal use. Mismatched or unreadable identity evidence blocks startup. Retain the original config with the entire appdata;
 do not edit labels or delete evidence to work around a refusal.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values

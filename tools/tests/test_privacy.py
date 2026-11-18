@@ -74,6 +74,28 @@ class PrivacyFilenameTests(unittest.TestCase):
                     self.assertIn("non-placeholder " + reason, result.stdout)
                     self.assertNotIn(value, result.stdout + result.stderr)
 
+    def test_unraid_settings_are_screened_in_both_default_attribute_and_element_text(self):
+        credential = "a" * 32
+        endpoint = "https://private-service.invalid"
+        for target, default, body, reason, rejected in (
+                ("STGUARD_SONARR_HD_API_KEY", "REPLACE_ME", credential, "credential", credential),
+                ("STGUARD_SONARR_UHD_API_KEY", "REPLACE_ME", "&#x61;" * 32, "credential", credential),
+                ("STGUARD_QBIT_USERNAME", credential, "", "credential", credential),
+                ("STGUARD_QBIT_URL", "https://downloader.example.invalid", endpoint, "endpoint", endpoint)):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                subprocess.run(["git", "init", "-q", directory], check=True)
+                template = root / "guard-template.xml"
+                template.write_text(f'<Container><Config Target="{target}" Default="{default}">'
+                                    f'{body}</Config></Container>', encoding="utf-8")
+                subprocess.run(["git", "-C", directory, "add", "--", template.name], check=True)
+                for flags in ([], ["--all"]):
+                    result = subprocess.run([sys.executable, str(CHECKER), *flags],
+                                            cwd=directory, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("non-placeholder " + reason, result.stdout)
+                    self.assertNotIn(rejected, result.stdout + result.stderr)
+
     def test_generic_configuration_example_remains_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             subprocess.run(["git", "init", "-q", directory], check=True)

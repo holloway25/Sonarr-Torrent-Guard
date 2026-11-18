@@ -26,13 +26,27 @@ RELATED_RECORD_LIMIT = 1000
 ARCHIVE_MINIMUM_AGE = 30 * 24 * 60 * 60
 ACTION_FIELDS = ("mode", "stage", "evidence", "observation", "confirmed", "current_observation",
                  "observation_available", "context", "dispatched_at", "stop_reason", "search_command_id")
+ACTION_ADDITIONS = {
+    "confirmed": ("TEXT NOT NULL", "'{}'"),
+    "current_observation": ("TEXT NOT NULL", "'{}'"),
+    "observation_available": ("INTEGER NOT NULL", "0"),
+    "context": ("TEXT NOT NULL", "'{}'"),
+    "dispatched_at": ("REAL", "NULL"),
+    "stop_reason": ("TEXT", "NULL"),
+    "search_command_id": ("INTEGER", "NULL"),
+}
+
+
+def replacement_already_observed(row):
+    return any(row[view].get(field) is True for view in ("current_observation", "confirmed")
+               for field in ("any_replacement_observed", "replacement_observed"))
 
 
 def clean_observation(observation):
     if not isinstance(observation, dict):
         raise SafetyError("invalid_observation")
     safe = {}
-    for field in OBSERVATION_FIELDS:
+    for field in (*OBSERVATION_FIELDS, "any_replacement_observed"):
         val = observation.get(field)
         if val is not None and not isinstance(val, bool):
             raise SafetyError("invalid_observation")
@@ -95,6 +109,8 @@ class Journal:
                  allow_archive=False, read_only=False):
         self.path = Path(path)
         self.read_only = read_only is True
+        self._action_projection = ",".join(ACTION_FIELDS)
+        self._legacy_confirmed = False
         if self.path.is_symlink() or self.path.parent.stat().st_mode & 0o077:
             raise SafetyError("journal_requires_private_directory")
         if self.read_only:
@@ -103,8 +119,19 @@ class Journal:
             self.limit = limit
             self.allow_single_test = self.allow_public_attempt = self.allow_archive = False
             self.db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
-            self.has_archive = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                                               "AND name='actions_archive'").fetchone() is not None
+            try:
+                self.has_archive = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                                   "AND name='actions_archive'").fetchone() is not None
+                columns = {row[1] for row in self.db.execute("PRAGMA table_info(actions)")}
+                missing = ACTION_ADDITIONS.keys() - columns
+                # Let read-only consumers inspect valid old rows without migrating them.
+                self._action_projection = ",".join(
+                    f"{ACTION_ADDITIONS[field][1]} AS {field}" if field in missing else field
+                    for field in ACTION_FIELDS)
+                self._legacy_confirmed = "confirmed" in missing
+            except BaseException:
+                self.db.close()
+                raise
             return
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.fchmod(fd, 0o600)
@@ -138,18 +165,9 @@ class Journal:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             columns = {r[1] for r in self.db.execute("PRAGMA table_info(actions)")}
-            additions = {
-                "confirmed": "TEXT NOT NULL DEFAULT '{}'",
-                "current_observation": "TEXT NOT NULL DEFAULT '{}'",
-                "observation_available": "INTEGER NOT NULL DEFAULT 0",
-                "context": "TEXT NOT NULL DEFAULT '{}'",
-                "dispatched_at": "REAL",
-                "stop_reason": "TEXT",
-                "search_command_id": "INTEGER",
-            }
-            for name, declaration in additions.items():
+            for name, (declaration, default) in ACTION_ADDITIONS.items():
                 if name not in columns:
-                    self.db.execute("ALTER TABLE actions ADD COLUMN " + name + " " + declaration)
+                    self.db.execute(f"ALTER TABLE actions ADD COLUMN {name} {declaration} DEFAULT {default}")
             if "confirmed" not in columns:
                 for key, raw in self.db.execute("SELECT key,observation FROM actions").fetchall():
                     old = clean_observation(json.loads(raw))
@@ -164,7 +182,7 @@ class Journal:
         self.db.close()
 
     def get(self, key):
-        row = self.db.execute("SELECT " + ",".join(ACTION_FIELDS) + " FROM actions WHERE key=?", (key,)).fetchone()
+        row = self.db.execute("SELECT " + self._action_projection + " FROM actions WHERE key=?", (key,)).fetchone()
         cold = self.db.execute("SELECT instance,hash,mode,payload FROM actions_archive WHERE key=?", (key,)).fetchone() if self.has_archive else None
         if row is not None and cold is not None:
             raise SafetyError("journal_duplicate_archive_key")
@@ -178,11 +196,16 @@ class Journal:
             if identity.get("instance") != cold[0] or identity.get("hash") != cold[1]:
                 raise SafetyError("invalid_archive_evidence")
             row = tuple(raw[field] for field in ACTION_FIELDS)
-        return None if row is None else {"key": key, "mode": row[0], "stage": row[1],
-                                        "evidence": json.loads(row[2]), "observation": json.loads(row[3]),
-                                        "confirmed": json.loads(row[4]), "current_observation": json.loads(row[5]),
-                                        "observation_available": bool(row[6]), "context": json.loads(row[7]),
-                                        "dispatched_at": row[8], "stop_reason": row[9], "search_command_id": row[10]}
+        if row is None:
+            return None
+        observation = json.loads(row[3])
+        confirmed = ({k: True for k, v in clean_observation(observation).items() if v is True}
+                     if cold is None and self._legacy_confirmed else json.loads(row[4]))
+        return {"key": key, "mode": row[0], "stage": row[1],
+                "evidence": json.loads(row[2]), "observation": observation,
+                "confirmed": confirmed, "current_observation": json.loads(row[5]),
+                "observation_available": bool(row[6]), "context": json.loads(row[7]),
+                "dispatched_at": row[8], "stop_reason": row[9], "search_command_id": row[10]}
 
     def prepare(self, report, mode="preview", context=None):
         if mode not in ("preview", "simulation") and not (
@@ -277,7 +300,7 @@ class Journal:
             if stage == "retry_removed" and (current.get("torrent_absent") is not True
                     or current.get("blocklisted") is True):
                 raise SafetyError("cleanup_not_verified")
-            if stage == "retry_superseded" and row["current_observation"].get("replacement_observed") is not True:
+            if stage == "retry_superseded" and not replacement_already_observed(row):
                 raise SafetyError("replacement_not_observed")
             last_known = dict(row["observation"])
             confirmed = dict(row["confirmed"])

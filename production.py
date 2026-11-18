@@ -22,7 +22,7 @@ from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    torrent_hash_ownership, torrents_by_hash, unique_client_name, verified_hashes,
                    verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
-                    check_fresh, evidence, reconcile, valid_digest)
+                    check_fresh, evidence, reconcile, replacement_already_observed, valid_digest)
 from maintenance import require_connectivity
 
 
@@ -396,6 +396,9 @@ class OutcomeVerifier:
             raise SafetyError("observation_client_changed")
         # APIs cannot prove download-side file deletion. Never infer this from absence.
         result = {k: None for k in ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")}
+        metadata_retry = c.get("metadata_retry", {}).get("blocklist") is False
+        if metadata_retry:
+            result["any_replacement_observed"] = None
         current_torrent = None
         current_aliases = ()
         identity_available = False
@@ -418,6 +421,7 @@ class OutcomeVerifier:
             regrab = set()
             aliases = set(c.get("hash_aliases", [c["hash"]]))
             aliases.update(current_aliases)
+            latest_grab_id = max(c.get("grab_ids", ()), default=None)
             for r in new:
                 kind = history_event_type(r)
                 after = event_after(r, self.not_before)
@@ -445,16 +449,22 @@ class OutcomeVerifier:
                     if h not in aliases:
                         (replacement if confirmed and identity_available else ambiguous_replacement).add(r["episodeId"])
                         continue
+                    if latest_grab_id is None or r["id"] <= latest_grab_id:
+                        continue
                     added = current_torrent.get("added_on") if current_torrent else None
-                    if (confirmed and "grab_ids" in c and r["id"] > max(c["grab_ids"])
-                            and integer(added) and added > max(c["download_added_on"], self.not_before)
-                            and abs(event_time(r) - added) <= 120):
-                        regrab.add(r["episodeId"])
+                    if not identity_available or (current_torrent is not None and not integer(added)):
+                        ambiguous_replacement.add(r["episodeId"])
+                    elif (integer(added) and added > max(c["download_added_on"], self.not_before)
+                          and abs(event_time(r) - added) <= 120):
+                        (regrab if confirmed else ambiguous_replacement).add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
             covered = replacement | regrab
             result["replacement_observed"] = True if covered == required else (
                 None if ambiguous_replacement - covered else False)
+            if metadata_retry:
+                result["any_replacement_observed"] = True if covered else (
+                    None if ambiguous_replacement else False)
             if regrab == required:
                 result["torrent_absent"] = True  # Original incarnation, not all copies of this hash.
         except Exception:
@@ -462,7 +472,7 @@ class OutcomeVerifier:
         try:
             rows = blocklist_records(api, c["series_id"], self.not_before, self.config.get("max_pages", 20))
             result["blocklisted"] = blocklist_observation(
-                rows, c, self.not_before, any_episode=c.get("metadata_retry", {}).get("blocklist") is False)
+                rows, c, self.not_before, any_episode=metadata_retry)
         except Exception:
             pass
         return result
@@ -597,7 +607,7 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
     """Only the original coordinator can request a search; recovery stays read-only."""
     if row["stage"] != "retry_removed":
         return row
-    if row["current_observation"].get("replacement_observed") is True:
+    if replacement_already_observed(row):
         return journal.transition(row["key"], "retry_removed", "retry_superseded")
     row = journal.transition(row["key"], "retry_removed", "retry_search_recorded")
     c = row["context"]

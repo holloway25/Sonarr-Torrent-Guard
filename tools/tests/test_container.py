@@ -148,6 +148,55 @@ class ContainerTests(unittest.TestCase):
                 journal.close()
         self.assertEqual(journal_path.read_bytes(), before)
 
+    def test_older_populated_journal_passes_identity_check_before_writable_migration(self):
+        import sqlite3
+        from contextlib import closing
+
+        from safety import Journal
+
+        config, _ = self.legacy_hold()
+        path = self.path / "action-journal.sqlite3"
+        with closing(Journal(path, read_only=True)) as journal:
+            key, = journal.db.execute("SELECT key FROM actions").fetchone()
+            row = journal.get(key)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("ALTER TABLE actions DROP COLUMN search_command_id")
+            db.execute("DROP TABLE actions_archive")
+        before = path.read_bytes()
+
+        for env in ({"STGUARD_CONFIG_SOURCE": "file"}, self.env):
+            with self.subTest(source=env.get("STGUARD_CONFIG_SOURCE", "env")):
+                result, cycle, _ = self.run_mode(env, "--check-config")
+                self.assertEqual(result, 0)
+                cycle.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.get(key), row)
+
+        config_path = self.path / "connections.json"
+        original_config = json.loads(config_path.read_text())
+        config["sonarr"]["HD"]["category"] = "different-category"
+        worker.atomic_json(config_path, config)
+        result, cycle, _ = self.run_mode({"STGUARD_CONFIG_SOURCE": "file"}, "--check-config")
+        self.assertEqual(result, 1)
+        cycle.assert_not_called()
+        self.assertEqual(path.read_bytes(), before)
+        worker.atomic_json(config_path, original_config)
+
+        def start_dry_run(mode, config_path):
+            self.assertEqual(mode, "dry-run")
+            with closing(Journal(path)) as journal:
+                columns = {column[1] for column in journal.db.execute("PRAGMA table_info(actions)")}
+                self.assertIn("search_command_id", columns)
+                self.assertEqual(journal.get(key), row)
+            return 0
+
+        with patch.dict(os.environ, self.env, clear=True), patch(
+                "sys.argv", ["container_worker.py", "--once"]), patch("signal.signal"), patch.object(
+                worker, "run_cycle", side_effect=start_dry_run) as cycle, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(worker.main(), 0)
+        cycle.assert_called_once()
+
     def test_binding_changes_and_orphaned_appdata_require_explicit_migration(self):
         self.legacy_hold()
         path = self.path / "connections.json"
@@ -543,6 +592,7 @@ class ContainerTests(unittest.TestCase):
             if any(x in item.get("Target") for x in ("API_KEY", "PASSWORD", "USERNAME")):
                 self.assertEqual(item.get("Mask"), "true")
                 self.assertEqual(item.get("Default"), "REPLACE_ME")
+                self.assertIn("".join(item.itertext()).strip(), ("", "REPLACE_ME"))
 
     def test_unraid_template_limits_mounts_privilege_and_shutdown(self):
         import xml.etree.ElementTree as ET

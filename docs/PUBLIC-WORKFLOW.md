@@ -214,6 +214,8 @@ title leaves failure unknown. Read-only recovery can then check again.
 Without a usable qBittorrent identity lookup, an unfamiliar hash may be an
 alias of the original torrent. That uncertainty blocks confirmation of a new
 replacement and keeps a matching failure under the unfamiliar hash unresolved.
+A newer same-hash grab also leaves replacement unknown when qBittorrent cannot
+verify the torrent's addition time.
 
 Dispatch time is stored with intent, and matching result events must be at or
 after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's
