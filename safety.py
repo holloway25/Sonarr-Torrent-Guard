@@ -307,16 +307,27 @@ class Journal:
                             (command_id, time.time(), key))
         return self.get(key)
 
-    def related(self, instance, hash_value):
-        """Bounded active scan plus indexed archive lookup; never forget old holds."""
+    def related(self, instance, hash_value, aliases=()):
+        """Find holds for the same owner and any overlapping recorded identity."""
+        from guard import torrent_hash
+
+        hashes = sorted({torrent_hash(h) for h in (*aliases, hash_value)})
         result = []
-        for (key,) in self.db.execute("SELECT key FROM actions WHERE mode IN ('single_test','public_attempt')").fetchall():
+        for (key,) in self.db.execute(
+                "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt')").fetchall():
             row = self.get(key)
-            if row["evidence"]["instance"] == instance and row["evidence"]["hash"] == hash_value:
+            if row["evidence"]["instance"] != instance:
+                continue
+            recorded = {row["evidence"]["hash"], *row["context"].get("hash_aliases", ())}
+            if recorded.intersection(hashes):
                 result.append(row)
-        keys = self.db.execute("SELECT key FROM actions_archive WHERE instance=? AND hash=? "
-                               "AND mode IN ('single_test','public_attempt') LIMIT ?",
-                               (instance, hash_value, RELATED_RECORD_LIMIT + 1)).fetchall() if self.has_archive else []
+        keys = self.db.execute(
+            "SELECT key FROM actions_archive WHERE instance=? AND mode IN ('single_test','public_attempt') "
+            "AND (hash IN (SELECT value FROM json_each(?)) OR EXISTS ("
+            "SELECT 1 FROM json_each(json_extract(payload, '$.context'), '$.hash_aliases') AS alias "
+            "WHERE alias.value IN (SELECT value FROM json_each(?)))) LIMIT ?",
+            (instance, json.dumps(hashes), json.dumps(hashes), RELATED_RECORD_LIMIT + 1),
+        ).fetchall() if self.has_archive else []
         if len(result) + len(keys) > RELATED_RECORD_LIMIT:
             raise SafetyError("journal_history_limit_reached")
         result.extend(self.get(key) for (key,) in keys)

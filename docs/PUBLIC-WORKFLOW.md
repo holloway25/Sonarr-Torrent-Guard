@@ -10,19 +10,22 @@ remain future work. Docker packaging is implemented, with separately approved
 deployment described in [container setup](CONTAINER.md). Existing seeding/removal
 policies stay intact.
 
-For a queue item whose hash matches qBittorrent's torrent ID, Guard reads
-qBittorrent's properties to verify the v1 and full v2 infohashes, including the
-shortened v2 ID used by qBittorrent. Sonarr grab records can use any of these
-verified identities. Guard combines their histories before choosing the newest
-grab for each episode. Titles alone never establish ownership. Conflicting
-history records, another instance owning an alias, malformed properties or an
-alias matching another listed torrent block assessment.
+For a queue item whose hash matches qBittorrent's torrent ID, Guard verifies
+the reported v1 and full v2 infohashes, including the shortened v2 ID. For a
+hybrid torrent it reads each affected episode's paginated grab history back
+to two minutes before the torrent was added. It compares hashes without
+regard to case and selects the newest matching grab for each episode. A
+second queue group under a verified alias holds the whole torrent, even
+when both groups belong to the same Sonarr instance. An alias that matches
+another listed torrent also blocks assessment.
 
-The verified identities are included in the ownership fingerprint and retained
-in the action context. Fresh rechecks bind the same mapping before removal.
-Failure and replacement observations use the mapping too, so another hash for
-the same hybrid torrent cannot masquerade as a replacement. Legacy journal
-contexts without a mapping retain their exact-hash behavior.
+Fresh checks bind the verified identities into the ownership fingerprint and
+retain them in the action context. Prior-attempt lookup checks overlapping
+hashes for both active and archived records. A legacy record contributes
+only its stored hash. Recovery uses qBittorrent's bulk torrent list to check
+the aliases. If a row lacks the identity fields needed to rule out a match,
+torrent absence remains unknown. Hybrid aliases also count as the same
+torrent when Guard checks failure and replacement history.
 
 Fresh read-only assessment and a private SQLite journal are now implemented.
 Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):

@@ -16,9 +16,9 @@ import time
 import urllib.parse
 import urllib.request
 
-from guard import (Api, GuardError, endpoint_key, grab_indexer, hard_deadline, history_event_type,
+from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, hard_deadline, history_event_type,
                    integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verified_hashes, verify_client_binding)
+                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -205,9 +205,8 @@ def capture_context(config, api, report, approval_digest, now=None):
         raise SafetyError("invalid_history_download_id")
     identities = {(series[0], episode) for episode in episodes}
     try:
-        grabs = latest_history_grabs(api, aliases, report["download_id_spelling"],
-                                     identities,
-                                     config.get("max_pages", 20))
+        grabs = latest_history_grabs(api, aliases, report["download_id_spelling"], identities,
+                                     config.get("max_pages", 20), report.get("download_added_on"))
         sources = {grab_indexer(grab) for grab in grabs}
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
@@ -260,6 +259,22 @@ def capture_context(config, api, report, approval_digest, now=None):
     return validate_context(context)
 
 
+def observed_torrent(torrents, context):
+    """Use the bulk identity snapshot. Missing alias evidence cannot prove absence."""
+    if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
+        raise GuardError("invalid_torrent_response")
+    by_hash = {torrent_hash(t.get("hash")): t for t in torrents}
+    if len(by_hash) != len(torrents):
+        raise GuardError("duplicate_torrent_hash")
+    if "hash_aliases" not in context:
+        return by_hash.get(context["hash"])
+    aliases = set(context["hash_aliases"])
+    matching = [t for key, t in by_hash.items() if key in aliases or aliases.intersection(bulk_hashes(t))]
+    if len(matching) > 1:
+        raise GuardError("ambiguous_torrent_hash_identity")
+    return matching[0] if matching else None
+
+
 class OutcomeVerifier:
     def __init__(self, config, qb, apis, context, not_before=None):
         self.config, self.qb, self.apis = config, qb, apis
@@ -283,18 +298,7 @@ class OutcomeVerifier:
         current_torrent = None
         try:
             torrents = self.qb.call("/api/v2/torrents/info")
-            if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
-                raise ValueError()
-            hashes = [torrent_hash(t.get("hash")) for t in torrents]
-            if len(hashes) != len(set(hashes)):
-                raise ValueError()
-            if "hash_aliases" in c:
-                matching = [t for t in torrents if set(verified_hashes(self.qb, t)) & set(c["hash_aliases"])]
-                if len(matching) > 1:
-                    raise ValueError()
-                current_torrent = matching[0] if matching else None
-            else:
-                current_torrent = next((t for t in torrents if torrent_hash(t["hash"]) == c["hash"]), None)
+            current_torrent = observed_torrent(torrents, c)
             result["torrent_absent"] = current_torrent is None
             if current_torrent is not None and "download_added_on" in c and (
                     current_torrent.get("added_on") != c["download_added_on"]):
@@ -472,12 +476,7 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         # The first absence observation is insufficient if another actor has
         # re-added the hash or queued a replacement while intent was committed.
         torrents = qb.call("/api/v2/torrents/info")
-        if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
-            raise SafetyError("dispatch_validation_failed")
-        if "hash_aliases" in c:
-            if any(set(verified_hashes(qb, t)) & set(c["hash_aliases"]) for t in torrents):
-                raise SafetyError("target_reappeared")
-        elif c["hash"] in [torrent_hash(t.get("hash")) for t in torrents]:
+        if observed_torrent(torrents, c) is not None:
             raise SafetyError("target_reappeared")
         queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
         for queued in queue:
@@ -600,7 +599,7 @@ def confirmed_successor(previous, report, config):
 
 
 def check_prior_attempts(journal, report, approval_digest=None, config=None):
-    for previous in journal.related(report["instance"], report["hash"]):
+    for previous in journal.related(report["instance"], report["hash"], report.get("hash_aliases", ())):
         if previous["stage"] in ("cancelled", "dispatch_blocked"):
             if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
                 raise SafetyError("approval_already_consumed")

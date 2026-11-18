@@ -84,7 +84,6 @@ def main():
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
         state_path = args.config.parent / "batch-state.json"
-        state = load_batch_state(state_path)
         journal = Journal(args.config.parent / "action-journal.sqlite3", allow_public_attempt=True)
         try:
             # Assessment/recovery and each sender use the same lock. Release it
@@ -92,9 +91,12 @@ def main():
             # second process can at most cause a hold, never duplicate sending.
             with open(args.config.parent / "guard.lock", "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with hard_deadline(deadline):
-                    proposal = public.cycle(config, qb, apis, journal, state)
-                save_batch_state(state_path, state)
+                state = load_batch_state(state_path)
+                try:
+                    with hard_deadline(deadline):
+                        proposal = public.cycle(config, qb, apis, journal, state)
+                finally:
+                    save_batch_state(state_path, state)
             production.ROUTINE_RELEASE_ENABLED = True
             # Reuse exactly the assessed snapshot, not another full pass.
             def log_action(action):
@@ -104,7 +106,6 @@ def main():
                 result = cycle(config, qb, apis, journal, authority, state, proposal, log_action)
         finally:
             journal.close()
-            save_batch_state(state_path, state)
     except (SafetyError, GuardError) as error:
         allowed = {"routine_authorization_invalid", "routine_authorization_unavailable",
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",

@@ -201,15 +201,60 @@ class ProductionTests(unittest.TestCase):
         self.grab["data"]["indexer"] = "Public Source"
         private = dict(self.grab, id=6, downloadId=self.hash,
                        data={**self.grab["data"], "indexer": "Private Source"})
-        valid = copy.deepcopy(self.s.routes["/api/v3/history"])
-        def by_hash(route, params=None):
-            if route == "/api/v3/history" and params["downloadId"].lower() == self.hash:
-                return {"records": [private], "totalRecords": 1}
-            if route == "/api/v3/history":
-                return copy.deepcopy(valid)
-            return copy.deepcopy(self.s.routes[route])
-        with patch.object(self.s, "call", side_effect=by_hash):
-            self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
+        self.s.routes["/api/v3/history"] = {"records": [private, self.grab], "totalRecords": 2}
+        self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
+
+    def test_hybrid_history_is_case_independent_and_bounded_to_the_grab(self):
+        self.hybrid_report()
+        lower = dict(self.grab, downloadId="b" * 40)
+        old_date = datetime.datetime.fromtimestamp(
+            self.report["download_added_on"] - 121, datetime.timezone.utc).isoformat()
+        old = dict(self.grab, id=2, date=old_date)
+        original_call = self.s.call
+
+        def call(route, params=None):
+            if route != "/api/v3/history":
+                return original_call(route, params)
+            self.assertEqual(params["episodeId"], self.grab["episodeId"])
+            self.assertEqual(params["seriesIds"], self.grab["seriesId"])
+            self.assertEqual(params["page"], 1)
+            self.assertNotIn("downloadId", params)
+            earlier = [dict(old, id=100 + n) for n in range(99)]
+            return {"records": [lower, *earlier], "totalRecords": 201}
+
+        with patch.object(self.s, "call", side_effect=call):
+            report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "would_fail")
+        self.assertEqual(report["grab_ids"], [self.grab["id"]])
+
+    def test_hybrid_same_instance_secondary_queue_group_blocks_proposal(self):
+        self.hybrid_report()
+        queue = self.s.routes["/api/v3/queue"]
+        queue["records"].append(dict(queue["records"][0], id=8, episodeId=4, downloadId="b" * 40))
+        queue["totalRecords"] = 2
+        self.qb.calls.clear()
+        reports = run(self.config, self.qb, self.apis)
+        canonical = next(report for report in reports if report["hash"] == self.hash)
+        self.assertEqual(canonical["reason"], "ambiguous_alias_queue_ownership")
+        self.assertFalse(any(report["decision"] == "would_fail" for report in reports))
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_hybrid_recovery_uses_bulk_info_and_holds_on_incomplete_evidence(self):
+        report = self.hybrid_report()
+        self.context = production.capture_context(self.config, self.s, report,
+                                                  production.digest(self.approval["nonce"]))
+        self.results()
+        listed = [{"hash": format(n, "040x"), "infohash_v1": format(n, "040x"),
+                   "infohash_v2": ""} for n in range(1, 201)]
+        self.qb.routes["/api/v2/torrents/info"] = listed
+        self.qb.calls.clear()
+        self.assertIs(self.observe()["torrent_absent"], True)
+        self.assertEqual([route for route, _ in self.qb.calls], ["/api/v2/torrents/info"])
+        listed.append({"hash": "d" * 40, "infohash_v1": "b" * 40,
+                       "infohash_v2": "d" * 64, "added_on": report["download_added_on"]})
+        self.assertIs(self.observe()["torrent_absent"], False)
+        del listed[-1]["infohash_v2"]
+        self.assertIsNone(self.observe()["torrent_absent"])
 
     def test_hybrid_mapping_changes_invalidate_pre_dispatch_evidence(self):
         report = self.hybrid_report()

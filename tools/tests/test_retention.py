@@ -96,6 +96,25 @@ class RetentionTests(unittest.TestCase):
                 production.execute_single_test(f.config, f.qb, f.apis, self.journal, f.report, f.approval)
         send.assert_not_called()
 
+    def test_hybrid_attempt_is_related_through_aliases_before_and_after_archive(self):
+        f = self.f
+        report = f.hybrid_report()
+        context = production.capture_context(f.config, f.s, report, production.digest(f.approval["nonce"]))
+        row = self.journal.prepare(report, mode="public_attempt", context=context)
+        self.journal.transition(row["key"], "prepared", "dispatch_recorded")
+        alias = "b" * 40
+        overlapping = dict(report, hash="d" * 40, hash_aliases=[alias, "d" * 40])
+        self.assertEqual([r["key"] for r in self.journal.related("HD", alias)], [row["key"]])
+        with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
+            production.check_prior_attempts(self.journal, overlapping, config=f.config)
+        self.journal.transition(row["key"], "dispatch_recorded", "cleanup_resolved",
+                               {key: True for key in ("torrent_absent", "failed", "blocklisted")})
+        self.assertEqual(self.journal.archive_resolved(now=self.later, preview=False)["archived"], 1)
+        self.assertEqual([r["key"] for r in self.journal.related("HD", alias)], [row["key"]])
+        self.assertEqual(self.journal.related("UHD", alias), [])
+        with self.assertRaisesRegex(SafetyError, "new_attempt_not_confirmed"):
+            production.check_prior_attempts(self.journal, overlapping, config=f.config)
+
     def test_same_key_prepare_never_recreates_archived_operation(self):
         report, context, row = self.make_row()
         self.journal.archive_resolved(now=self.later, preview=False)

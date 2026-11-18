@@ -243,6 +243,12 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         cycle.assert_called_once()
 
+    def test_once_returns_child_timeout(self):
+        with patch.dict(os.environ, dict(self.env, STGUARD_MODE="dry-run"), clear=True), patch(
+                "sys.argv", ["container_worker.py", "--once"]), patch("signal.signal"), patch.object(
+                worker, "run_cycle", return_value=124), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(worker.main(), 124)
+
     def test_live_scheduler_passes_mode_but_no_credentials_or_grant(self):
         process = Mock()
         process.wait.return_value = 0

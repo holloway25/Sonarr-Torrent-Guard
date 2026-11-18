@@ -279,10 +279,14 @@ def main():
                 code = run_cycle(mode, path)
                 if STOP.is_set():
                     # Do not start another appdata fsync while the array stops.
+                    if args.once:
+                        return code
                     break
                 atomic_json(CONFIG_DIR / "container-status.json", {"updated_at": time.time(), "mode": mode, "stage": "waiting", "exit_code": code})
                 print(json.dumps({"event": "container_cycle", "mode": mode, "exit_code": code}), flush=True)
-                if args.once or STOP.wait(INTERVAL_SECONDS):
+                if args.once:
+                    return code
+                if STOP.wait(INTERVAL_SECONDS):
                     break
         return 0
     except BlockingIOError:

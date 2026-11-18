@@ -289,8 +289,9 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def records(api, route, params=None, max_pages=20):
+def records(api, route, params=None, max_pages=20, *, since=None):
     result, expected = [], None
+    previous_date = None
     params = dict(params or {})
     for page in range(1, max_pages + 1):
         payload = api.call(route, dict(params, page=page, pageSize=100))
@@ -305,13 +306,21 @@ def records(api, route, params=None, max_pages=20):
         if expected != total:
             raise GuardError("response_changed_during_pagination")
         result.extend(rows)
-        if len(result) == total:
+        if len(result) > total or (not rows and len(result) != total):
+            raise GuardError("incomplete_paginated_response")
+        if since is not None and len(result) < total and len(rows) != 100:
+            raise GuardError("incomplete_paginated_response")
+        if since is not None:
+            for row in rows:
+                stamp = grab_timestamp(row)
+                if previous_date is not None and stamp > previous_date:
+                    raise GuardError("response_changed_during_pagination")
+                previous_date = stamp
+        if len(result) == total or (since is not None and previous_date is not None and previous_date < since):
             ids = [r.get("id") for r in result]
             if any(not integer(i) for i in ids) or len(set(ids)) != len(ids):
                 raise GuardError("duplicate_or_invalid_response_ids")
-            return result
-        if len(result) > total or not rows:
-            raise GuardError("incomplete_paginated_response")
+            return result if since is None else [r for r in result if grab_timestamp(r) >= since]
     raise GuardError("pagination_limit_reached")
 
 
@@ -348,9 +357,23 @@ def classify_source(policy, source):
 
 def verified_hashes(qb, torrent):
     canonical = torrent_hash(torrent.get("hash"))
+    if {"infohash_v1", "infohash_v2"} <= torrent.keys():
+        return bulk_hashes(torrent)
     properties = qb.call("/api/v2/torrents/properties", {"hash": canonical})
     if not isinstance(properties, dict) or torrent_hash(properties.get("hash")) != canonical:
         raise GuardError("torrent_hash_identity_unavailable")
+    return parse_hashes(properties)
+
+
+def bulk_hashes(torrent):
+    values = (torrent.get("infohash_v1"), torrent.get("infohash_v2"))
+    if not all(isinstance(value, str) for value in values) or not any(values):
+        raise GuardError("torrent_hash_identity_unavailable")
+    return parse_hashes(torrent)
+
+
+def parse_hashes(properties):
+    canonical = torrent_hash(properties.get("hash"))
     aliases = {canonical}
     identities = set()
     for field, length in (("infohash_v1", 40), ("infohash_v2", 64)):
@@ -370,24 +393,38 @@ def verified_hashes(qb, torrent):
     return sorted(aliases)
 
 
-def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
-    aliases = {hash_value} if isinstance(hash_value, str) else set(hash_value)
-    history = {}
-    spellings = [spelling, *(h.upper() for h in sorted(aliases) if h != torrent_hash(spelling))]
-    for query in spellings:
-        rows = records(api, "/api/v3/history", {
-            "eventType": 1, "downloadId": query,
-            "sortKey": "date", "sortDirection": "descending",
-        }, max_pages)
-        for row in rows:
-            if row["id"] in history and history[row["id"]] != row:
-                raise GuardError("conflicting_history_identity")
-            history[row["id"]] = row
-    return select_latest_grabs(list(history.values()), aliases, identities)
+def grab_timestamp(row):
+    try:
+        stamp = datetime.datetime.fromisoformat(row["date"].replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError()
+        return stamp.timestamp()
+    except (KeyError, TypeError, AttributeError, ValueError, OverflowError, OSError):
+        raise GuardError("grab_not_bound_to_current_download") from None
 
 
-def select_latest_grabs(history, hash_value, identities, require_all=True):
-    aliases = {hash_value} if isinstance(hash_value, str) else set(hash_value)
+def latest_history_grabs(api, hashes, spelling, identities, max_pages, added):
+    query = {"eventType": 1, "sortKey": "date", "sortDirection": "descending"}
+    if len(hashes) == 1:
+        history = records(api, "/api/v3/history", dict(query, downloadId=spelling), max_pages)
+    else:
+        if not integer(added) or added <= 0:
+            raise GuardError("grab_not_bound_to_current_download")
+        history = []
+        for series, episode in sorted(identities):
+            rows = records(api, "/api/v3/history", dict(query, seriesIds=series, episodeId=episode),
+                           max_pages, since=added - 120)
+            if any(not integer(row.get("seriesId")) or not integer(row.get("episodeId"))
+                   or (row["seriesId"], row["episodeId"]) != (series, episode) for row in rows):
+                raise GuardError("unknown_content_identity")
+            history.extend(rows)
+        if len({row["id"] for row in history}) != len(history):
+            raise GuardError("duplicate_or_invalid_response_ids")
+    return select_latest_grabs(history, hashes, identities)
+
+
+def select_latest_grabs(history, hashes, identities, require_all=True):
+    aliases = set(hashes)
     latest = {}
     has_matching_hash = False
     for grab in history:
@@ -423,24 +460,21 @@ def grab_indexer(grab):
     return data["indexer"]
 
 
-def source_for(api, hash_value, rows, max_pages, added=None):
+def source_for(api, hashes, rows, max_pages, added):
     identities = set()
     for row in rows:
         identity = (row.get("seriesId"), row.get("episodeId"))
         if any(not integer(value) or value <= 0 for value in identity):
             raise GuardError("unknown_content_identity")
         identities.add(identity)
-    grabs = latest_history_grabs(api, hash_value, rows[0]["downloadId"], identities, max_pages)
+    grabs = latest_history_grabs(api, hashes, rows[0]["downloadId"], identities, max_pages, added)
     sources, grab_ids, grab_times = set(), set(), []
     for grab in grabs:
-        try:
-            stamp = datetime.datetime.fromisoformat(grab["date"].replace("Z", "+00:00"))
-            if stamp.tzinfo is None or added is None or abs(stamp.timestamp() - added) > 120:
-                raise ValueError()
-        except (KeyError, TypeError, AttributeError, ValueError):
-            raise GuardError("grab_not_bound_to_current_download") from None
+        stamp = grab_timestamp(grab)
+        if added is None or abs(stamp - added) > 120:
+            raise GuardError("grab_not_bound_to_current_download")
         grab_ids.add(grab["id"])
-        grab_times.append(stamp.timestamp())
+        grab_times.append(stamp)
         sources.add(grab_indexer(grab))
     if len(sources) != 1:
         raise GuardError("ambiguous_indexer_identity")
@@ -542,8 +576,10 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             for alias in aliases:
                 if owners.get(alias, set()) - {label}:
                     raise GuardError("ambiguous_instance_ownership")
-                if alias in by_hash and alias != h:
+                if alias != h and alias in by_hash:
                     raise GuardError("ambiguous_torrent_hash_identity")
+                if alias != h and label in owners.get(alias, ()):
+                    raise GuardError("ambiguous_alias_queue_ownership")
             if len(aliases) > 1:
                 report["hash_aliases"] = aliases
             source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added)

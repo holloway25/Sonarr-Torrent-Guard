@@ -97,6 +97,38 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(row["stage"], "dispatch_blocked")
         self.assertEqual(row["stop_reason"], "container_live_scope_confirmation_required")
 
+    def test_assessment_cursor_is_accessed_only_under_the_lock(self):
+        import contextlib
+        import io
+
+        directory = Path(self.f.folder.name)
+        args = ["routine.py", "--live", "--config", str(directory / "connections.json"),
+                "--authorization", str(directory / "routine-authorization.json"),
+                "--log-file", str(directory / "routine.log")]
+        state = {}
+        for busy in (True, False):
+            with self.subTest(busy=busy), contextlib.ExitStack() as stack:
+                stack.enter_context(patch("sys.argv", args))
+                stack.enter_context(patch("routine.load_config", return_value=self.f.config))
+                stack.enter_context(patch("routine.RoutineAuthorization.load", return_value=self.authority))
+                stack.enter_context(patch("routine.Api"))
+                stack.enter_context(patch("routine.Journal", return_value=Mock()))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                calls = Mock()
+                calls.load.return_value = state
+                calls.assess.side_effect = RuntimeError("assessment interrupted")
+                stack.enter_context(patch("routine.fcntl.flock", calls.lock))
+                stack.enter_context(patch("routine.load_batch_state", calls.load))
+                stack.enter_context(patch("routine.public.cycle", calls.assess))
+                stack.enter_context(patch("routine.save_batch_state", calls.save))
+                if busy:
+                    calls.lock.side_effect = BlockingIOError()
+                routine.main()
+                self.assertEqual([call[0] for call in calls.mock_calls],
+                                 ["lock"] if busy else ["lock", "load", "assess", "save"])
+                if not busy:
+                    calls.save.assert_called_once_with(directory / "batch-state.json", state)
+
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
                 "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
