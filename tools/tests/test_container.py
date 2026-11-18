@@ -175,6 +175,16 @@ class ContainerTests(unittest.TestCase):
         self.assertNotIn("private-marker", output.getvalue())
         self.assertIs(json.loads(output.getvalue())["actions_sent"], False)
 
+    def test_check_config_rejects_invalid_sonarr_ports(self):
+        for port in ("notaport", "0", "65536"):
+            with self.subTest(port=port):
+                env = dict(self.env, STGUARD_SONARR_HD_URL=f"http://sonarr-hd.example.invalid:{port}")
+                result, cycle, errors = self.run_mode(env, "--check-config")
+                self.assertEqual(result, 1)
+                self.assertIn("container_configuration_or_startup_unavailable", errors)
+                self.assertNotIn(env["STGUARD_SONARR_HD_URL"], errors)
+                cycle.assert_not_called()
+
     def test_invalid_modes_fail_before_configuration_or_api_work(self):
         for mode in ("LIVE", "false", "unknown"):
             output = io.StringIO()

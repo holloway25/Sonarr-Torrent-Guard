@@ -23,8 +23,10 @@ A private indexer on any matching queue row also blocks cleanup, even when grab
 history says the source is public. A public queue value alone cannot establish
 that a torrent is eligible. Fresh assessment repeats the queue check.
 A second queue group under a verified alias holds the whole torrent, even
-when both groups belong to the same Sonarr instance. An alias that matches
-another listed torrent also blocks assessment.
+when both groups belong to the same Sonarr instance. Guard maps all verified
+hashes to the torrents that claim them. Any hash claimed by multiple torrents
+blocks cleanup. If a listed torrent's identity cannot be verified, Guard cannot
+rule out a collision and holds cleanup.
 
 Fresh checks bind the verified identities into the ownership fingerprint and
 retain them in the action context. Prior-attempt lookup checks overlapping
@@ -187,7 +189,10 @@ the migration.
 retry settings and reviewed-version/client binding, and captures baseline IDs.
 Its read-only verifier independently checks qBittorrent torrent absence, new
 Sonarr failure history, new blocklist records and newer replacement grabs for
-the affected episodes. It does not infer results from queue disappearance.
+the affected episodes. Recovery reads bounded, paginated history for each
+affected episode, including the whole second containing dispatch. An incomplete
+history read leaves the history outcomes unknown. Queue disappearance alone
+cannot establish outcomes.
 The blocklist API has no download hash; correlation uses a release-title digest,
 indexer, series/episodes and newly added record IDs. Failure history additionally
 must match the original hash. Replacement hashes differ unless a newer same-hash
@@ -239,9 +244,11 @@ captures baselines and performs a final fresh check before recording dispatch.
 `production.py` has no live CLI mode or approval generator. The separately granted
 `routine.py` worker is described in [unattended trial](UNATTENDED-TRIAL.md).
 Request redirects and
-retries are refused. Existing prepared/uncertain single-test records only recover
-through observations, never automatic dispatch. `--observe INSTANCE HASH` exposes
-that read-only recovery route using the stored operation context.
+retries are refused. Under the worker lock, recovery cancels an abandoned
+`prepared` production record that has no dispatch timestamp and records
+`abandoned_before_dispatch`. Its original approval remains consumed. Once
+dispatch intent is recorded, recovery only observes outcomes. The read-only
+`--observe INSTANCE HASH` command uses the stored operation context.
 
 ### Repeated hashes and download attempts
 

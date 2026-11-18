@@ -148,6 +148,46 @@ class PublicTests(unittest.TestCase):
         self.assertEqual(len(set(visited)), 12)
         self.assertTrue(all(f.journal.get(k)["stage"] == "uncertain" for k in keys))
 
+    def test_restart_cancels_abandoned_prepare_without_waiving_dispatch_hold(self):
+        import fcntl
+
+        f = self.f
+        abandoned = f.journal.prepare(f.report, mode="public_attempt", context=f.context)
+        preview = f.journal.prepare(f.report, mode="preview")
+        dispatched, = self.pending_records(1)
+        f.journal.close()
+        f.journal = Journal(f.journal.path, allow_public_attempt=True)
+        with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
+            production.check_prior_attempts(f.journal, f.report, config=f.config)
+        with (Path(f.folder.name) / "guard.lock").open("a") as lock, patch(
+                "public.OutcomeVerifier") as verifier, patch("production._send_queue_delete") as send:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            verifier.return_value.observe.side_effect = TimeoutError()
+            recovered = public.recover_pending(f.config, f.qb, f.apis, f.journal, {}, time.monotonic() + 30)
+        verifier.assert_called_once()
+        send.assert_not_called()
+        rows = {row["key"]: row for row in recovered}
+        self.assertEqual(set(rows), {abandoned["key"], dispatched})
+        self.assertEqual(rows[abandoned["key"]]["stage"], "cancelled")
+        self.assertEqual(rows[abandoned["key"]]["stop_reason"], "abandoned_before_dispatch")
+        self.assertIsNone(f.journal.get(abandoned["key"])["dispatched_at"])
+        self.assertEqual(rows[dispatched]["stage"], "uncertain")
+        self.assertEqual(f.journal.get(preview["key"])["stage"], "prepared")
+        production.check_prior_attempts(f.journal, f.report, config=f.config)
+        with self.assertRaisesRegex(SafetyError, "approval_already_consumed"):
+            production.check_prior_attempts(f.journal, f.report, f.context["approval_digest"], config=f.config)
+
+    def test_exact_abandoned_approval_is_cancelled_without_resend(self):
+        f = self.f
+        f.journal.prepare(f.report, mode="public_attempt", context=f.context)
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete") as send:
+            row = self.execute()
+            self.assertEqual(self.execute(), row)
+        self.assertEqual(row["stage"], "cancelled")
+        self.assertEqual(row["stop_reason"], "abandoned_before_dispatch")
+        send.assert_not_called()
+
     def test_recovery_budget_caps_each_observation_and_restores_adapter_deadlines(self):
         f = self.f
         keys = self.pending_records(8)

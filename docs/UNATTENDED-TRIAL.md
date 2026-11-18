@@ -60,8 +60,12 @@ Explicit `--live` and a valid grant are both required. The CLI enables only its
 process-local routine gate, restoring it on exit; manual/test gates stay disabled.
 Normal stored connection configuration stays dry-run. The cycle first locks and
 checks Sonarr-side connectivity, assesses a bounded fair batch, and performs
-bounded rotating read-only recovery. It then releases that assessment lock and
-uses the existing locked coordinator for each eligible snapshot. Concurrent
+bounded rotating recovery. The first half of the three-minute cycle is available
+for connectivity and assessment. Fresh proposal checks can run through the
+two-thirds mark, and recovery stops before the three-quarter mark. At least
+the final quarter is reserved for the coordinator's mandatory fresh checks and
+dispatch. After recovery, the worker releases the assessment lock and uses the
+existing locked coordinator for each eligible snapshot. Concurrent
 workers may cause a hold, but cannot bypass fresh checks or duplicate dispatch.
 
 Only the current pass's assessed attempts are handled. Replacements are checked

@@ -132,6 +132,49 @@ class RoutineTests(unittest.TestCase):
                 if not busy:
                     calls.save.assert_called_once_with(directory / "batch-state.json", state)
 
+    def test_busy_assessment_reserves_time_for_the_real_coordinator(self):
+        f = self.f
+        second = "b" * 40
+        qb_info = f.qb.routes["/api/v2/torrents/info"]
+        qb_info.append(dict(qb_info[0], hash=second))
+        queue = f.s.routes["/api/v3/queue"]
+        queue["records"].append(dict(queue["records"][0], id=8, downloadId=second))
+        queue["totalRecords"] = 2
+        history = f.s.routes["/api/v3/history"]
+        history["records"].append(dict(f.grab, id=6, downloadId=second))
+        history["totalRecords"] = 2
+        now = [100.0]
+        state = {}
+        f.qb.deadline = f.s.deadline = 280.0
+        call = f.qb.call
+        deadlines = []
+
+        def busy_downloader(route, params=None):
+            if route.endswith("/files"):
+                deadlines.append(f.qb.deadline)
+                if params["hash"] == second:
+                    now[0] = f.qb.deadline
+                    raise production.GuardError("run_time_limit_reached")
+            if now[0] >= f.qb.deadline:
+                raise production.GuardError("run_time_limit_reached")
+            return call(route, params)
+
+        def send_removal(*args):
+            self.assertEqual(f.s.deadline, 280.0)
+            f.results()
+
+        with patch("public.time.monotonic", side_effect=lambda: now[0]), patch(
+                "public.require_connectivity", return_value={}), patch.object(
+                f.qb, "call", side_effect=busy_downloader), patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=send_removal) as send:
+            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, state)
+        send.assert_called_once_with(f.s, 7)
+        self.assertEqual(deadlines[:3], [190.0, 190.0, 220.0])
+        self.assertEqual(deadlines[3:], [280.0, 280.0, 280.0])
+        self.assertEqual(state["after"], ["HD", f.hash])
+        self.assertEqual(result["assessment"][-1]["reason"], "run_time_limit_reached")
+        self.assertEqual(result["actions"][0]["stage"], "cleanup_resolved")
+
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
                 "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:

@@ -420,6 +420,39 @@ class ProductionTests(unittest.TestCase):
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["reason"], "ambiguous_torrent_hash_identity")
 
+    def test_a_second_torrent_cannot_claim_the_candidates_primary_or_alternate_hash(self):
+        torrents = self.qb.routes["/api/v2/torrents/info"]
+        original = torrents[0]
+        other = "d" * 40
+        other_torrent = dict(original, hash=other, infohash_v1=self.hash, infohash_v2=other + "e" * 24)
+        for hybrid in (False, True):
+            with self.subTest(hybrid=hybrid):
+                torrents[:] = [original]
+                if hybrid:
+                    self.hybrid_report()
+                    other_torrent["infohash_v1"] = "b" * 40
+                torrents.append(other_torrent)
+                self.qb.calls.clear()
+                report = run(self.config, self.qb, self.apis)[0]
+                self.assertEqual(report["decision"], "skip")
+                self.assertEqual(report["reason"], "ambiguous_torrent_hash_identity")
+                self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_final_recheck_holds_when_another_torrent_claims_the_primary_hash(self):
+        torrents = self.qb.routes["/api/v2/torrents/info"]
+        other = "d" * 40
+
+        def add_collision(*args):
+            torrents.append(dict(torrents[0], hash=other, infohash_v1=self.hash, infohash_v2=other + "e" * 24))
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.wait_for_event_boundary", side_effect=add_collision), patch(
+                "production._send_queue_delete") as send:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        send.assert_not_called()
+
     def test_hybrid_context_final_baseline_checks_all_verified_hashes(self):
         report = self.hybrid_report()
         approval = {**self.approval, **{key: report[key] for key in (
@@ -623,6 +656,33 @@ class ProductionTests(unittest.TestCase):
         for field in ("torrent_absent", "failed", "blocklisted", "replacement_observed"):
             self.assertIs(result[field], True)
         self.assertIsNone(result["data_deleted"])
+
+    def test_recovery_history_ignores_more_than_ten_thousand_unrelated_events(self):
+        self.results()
+        history = self.s.routes["/api/v3/history/since"]
+        history.extend(dict(self.grab, id=100 + i, episodeId=99, date=history[1]["date"])
+                       for i in range(10001))
+        self.s.calls.clear()
+        result = self.observe()
+        self.assertIs(result["failed"], True)
+        self.assertIs(result["replacement_observed"], True)
+        calls = [(route, params) for route, params in self.s.calls if route.startswith("/api/v3/history")]
+        self.assertEqual(len(calls), 1)
+        route, params = calls[0]
+        self.assertEqual(route, "/api/v3/history")
+        self.assertEqual((params["seriesIds"], params["episodeId"]), (2, 3))
+
+    def test_incomplete_scoped_history_preserves_uncertainty(self):
+        self.results()
+        history = self.s.routes["/api/v3/history/since"]
+        # Even established evidence cannot be confirmed from a partial read.
+        history.extend(dict(self.grab, id=100 + i, date=history[1]["date"]) for i in range(100))
+        self.config["max_pages"] = 1
+        result = self.observe()
+        self.assertIsNone(result["failed"])
+        self.assertIsNone(result["replacement_observed"])
+        self.assertIs(result["torrent_absent"], True)
+        self.assertIs(result["blocklisted"], True)
 
     def test_queue_disappearance_alone_does_not_prove_failure_or_replacement(self):
         self.qb.routes["/api/v2/torrents/info"] = []

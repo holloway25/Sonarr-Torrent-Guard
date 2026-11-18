@@ -1,9 +1,20 @@
 """Repository content checks. Never print matched sensitive values."""
 import argparse
+import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import urllib.parse
+
+
+def is_example_endpoint(url):
+    try:
+        endpoint = urllib.parse.urlsplit(url)
+        return ((endpoint.hostname or "").endswith(".example.invalid")
+                and endpoint.username is None and endpoint.password is None)
+    except ValueError:
+        return False
 
 
 def git(*args):
@@ -45,18 +56,29 @@ def main():
             if re.search(pattern, text):
                 issues.append((name, reason))
         if name == "config.example.json":
-            import json, urllib.parse
             config = json.loads(text)
             examples = [config["qbittorrent"], *config["sonarr"].values()]
             examples.extend({"url": item["download_client_binding"]["endpoint"]}
                             for item in config["sonarr"].values())
             for item in examples:
-                host = urllib.parse.urlsplit(item["url"]).hostname or ""
-                if not host.endswith(".example.invalid"):
+                if not is_example_endpoint(item["url"]):
                     issues.append((name, "non-placeholder endpoint"))
                 for key in ("api_key", "username", "password"):
                     if key in item and item[key] != "REPLACE_ME":
                         issues.append((name, "non-placeholder credential"))
+        if name == "deploy/container.env.example":
+            for line in text.splitlines():
+                assignment = re.fullmatch(
+                    r"\s*(?:export\s+)?STGUARD_(?:QBIT|SONARR_[A-Z0-9_]+)_(URL|API_KEY|USERNAME|PASSWORD)\s*=(.*)",
+                    line)
+                if assignment is None:
+                    continue
+                field, value = assignment.groups()
+                if field == "URL":
+                    if not is_example_endpoint(value.strip()):
+                        issues.append((name, "non-placeholder endpoint"))
+                elif value.strip() != "REPLACE_ME":
+                    issues.append((name, "non-placeholder credential"))
     for name, reason in issues:
         print(f"BLOCKED: {name}: {reason}")
     if not issues:

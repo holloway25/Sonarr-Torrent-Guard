@@ -30,7 +30,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
 def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None):
     authority.validate(config)
     if proposal is None:
-        proposal = public.cycle(config, qb, apis, journal, batch_state)
+        proposal = public.cycle(config, qb, apis, journal, batch_state, reserve_dispatch=True)
     runtime = copy.deepcopy(config)
     runtime["dry_run"] = False
     actions = []
@@ -94,7 +94,7 @@ def main():
                 state = load_batch_state(state_path)
                 try:
                     with hard_deadline(deadline):
-                        proposal = public.cycle(config, qb, apis, journal, state)
+                        proposal = public.cycle(config, qb, apis, journal, state, reserve_dispatch=True)
                 finally:
                     save_batch_state(state_path, state)
             production.ROUTINE_RELEASE_ENABLED = True

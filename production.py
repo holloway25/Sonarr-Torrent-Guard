@@ -146,6 +146,23 @@ def history_since(api, start):
     return rows
 
 
+def outcome_history(api, series, episodes, start, max_pages):
+    rows = []
+    ids = set()
+    for episode in episodes:
+        relevant = records(api, "/api/v3/history", {
+            "seriesIds": series, "episodeId": episode, "sortKey": "date", "sortDirection": "descending",
+        }, max_pages, since=start)
+        for row in relevant:
+            if (not all(integer(row.get(key)) and row[key] == expected
+                        for key, expected in (("seriesId", series), ("episodeId", episode)))
+                    or row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000):
+                raise SafetyError("invalid_history_response")
+            ids.add(row["id"])
+        rows.extend(relevant)
+    return rows
+
+
 def event_time(row):
     value = row.get("date")
     if not isinstance(value, str):
@@ -328,16 +345,14 @@ class OutcomeVerifier:
         except Exception:
             pass
         try:
-            rows = history_since(api, c["window_start"])
+            # Keep the entire dispatch second for timestamps with truncated precision.
+            rows = outcome_history(api, c["series_id"], c["episode_ids"], math.floor(self.not_before),
+                                   self.config.get("max_pages", 20))
             new = [r for r in rows if r["id"] not in c["baseline_history_ids"]]
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
             for r in new:
                 kind = history_event_type(r)
-                if any(not integer(r.get(field)) or r[field] <= 0 for field in ("seriesId", "episodeId")):
-                    raise SafetyError("invalid_history_identity")
-                if r.get("seriesId") != c["series_id"] or r.get("episodeId") not in c["episode_ids"]:
-                    continue
                 after = event_after(r, self.not_before)
                 if after is False:
                     continue
@@ -674,6 +689,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
         key = digest(identity)
         old = journal.get(key)
         if old is not None:
+            if old["stage"] == "prepared":
+                return journal.transition(key, "prepared", "cancelled", stop_reason="abandoned_before_dispatch")
             verifier = OutcomeVerifier(config, qb, apis, old["context"], old["dispatched_at"])
             return reconcile(journal, key, verifier.observe)
         # Both sender modes share related-record holds. A single-test approval

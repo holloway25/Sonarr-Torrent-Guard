@@ -33,6 +33,26 @@ class PrivacyFilenameTests(unittest.TestCase):
                     self.assertIn("prohibited runtime or handoff artifact", result.stdout)
                     self.assertNotIn("opaque-value", result.stdout + result.stderr)
 
+    def test_container_environment_example_requires_placeholders(self):
+        for field, value, reason in (
+                ("STGUARD_SONARR_HD_API_KEY", "a" * 32, "credential"),
+                ("STGUARD_SONARR_UHD_API_KEY", "b" * 32, "credential"),
+                ("STGUARD_QBIT_USERNAME", "opaque-user", "credential"),
+                ("STGUARD_QBIT_PASSWORD", "opaque-password", "credential"),
+                ("STGUARD_QBIT_URL", "https://downloader.example.invalid.other.invalid", "endpoint")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                subprocess.run(["git", "init", "-q", directory], check=True)
+                example = Path(directory) / "deploy" / "container.env.example"
+                example.parent.mkdir()
+                example.write_text(f"export {field} = {value}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", directory, "add", "."], check=True)
+                for flags in ([], ["--all"]):
+                    result = subprocess.run([sys.executable, str(CHECKER), *flags],
+                                            cwd=directory, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("non-placeholder " + reason, result.stdout)
+                    self.assertNotIn(value, result.stdout + result.stderr)
+
     def test_generic_configuration_example_remains_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             subprocess.run(["git", "init", "-q", directory], check=True)

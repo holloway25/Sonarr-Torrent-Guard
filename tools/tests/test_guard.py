@@ -60,17 +60,24 @@ class FakeApi:
         self.calls.append((route, params))
         if route == "/api/v2/torrents/properties" and route not in self.routes:
             return {"hash": params["hash"], "infohash_v1": params["hash"], "infohash_v2": ""}
-        result = self.routes[route]
+        scoped_history = route == "/api/v3/history" and params and "episodeId" in params
+        if scoped_history and "eventType" not in params and "/api/v3/history/since" in self.routes:
+            rows = self.routes["/api/v3/history/since"]
+            result = rows if isinstance(rows, Exception) else {"records": rows, "totalRecords": len(rows)}
+        else:
+            result = self.routes[route]
         if isinstance(result, Exception):
             raise result
-        if route == "/api/v3/history" and params and "episodeId" in params:
+        if scoped_history:
             # Model the server filter for known IDs but let malformed fixtures
             # reach the validator, which must reject them independently.
             rows = [row for row in result["records"] if all(
                 type(row.get(field)) is not int or row[field] <= 0 or row[field] == params[key]
                 for field, key in (("seriesId", "seriesIds"), ("episodeId", "episodeId")))]
             rows.sort(key=lambda row: str(row.get("date")), reverse=True)
-            result = {"records": rows, "totalRecords": len(rows)}
+            size = params.get("pageSize", 100)
+            start = (params.get("page", 1) - 1) * size
+            result = {"records": rows[start:start + size], "totalRecords": len(rows)}
         return copy.deepcopy(result)
 
 

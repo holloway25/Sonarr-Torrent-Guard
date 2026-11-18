@@ -388,6 +388,24 @@ def bulk_hashes(torrent):
     return sorted(aliases)
 
 
+def torrent_hash_ownership(qb, torrents):
+    claims = collections.defaultdict(set)
+    aliases_by_hash, errors = {}, {}
+    for canonical, torrent in torrents.items():
+        claims[canonical].add(canonical)
+        try:
+            aliases = verified_hashes(qb, torrent)
+        except GuardError as error:
+            if str(error) == "run_time_limit_reached":
+                raise
+            errors[canonical] = str(error)
+            continue
+        aliases_by_hash[canonical] = aliases
+        for alias in aliases:
+            claims[alias].add(canonical)
+    return claims, aliases_by_hash, errors
+
+
 def grab_timestamp(row):
     try:
         stamp = datetime.datetime.fromisoformat(row["date"].replace("Z", "+00:00"))
@@ -581,6 +599,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     if after:
         candidates = ([x for x in candidates if x[:2] > after]
                       + [x for x in candidates if x[:2] <= after])
+    hash_ownership = None
     for number, (label, h, rows, t, report, client_name) in enumerate(candidates):
         if number >= maximum:
             report.update(decision="skip", reason="work_limit_reached")
@@ -593,14 +612,21 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             added = t.get("added_on")
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
-            aliases = verified_hashes(qb, t)
+            if hash_ownership is None:
+                hash_ownership = torrent_hash_ownership(qb, by_hash)
+            claims, aliases_by_hash, hash_errors = hash_ownership
+            if h in hash_errors:
+                raise GuardError(hash_errors[h])
+            aliases = aliases_by_hash[h]
             for alias in aliases:
                 if owners.get(alias, set()) - {label}:
                     raise GuardError("ambiguous_instance_ownership")
-                if alias != h and alias in by_hash:
+                if claims[alias] != {h}:
                     raise GuardError("ambiguous_torrent_hash_identity")
                 if alias != h and label in owners.get(alias, ()):
                     raise GuardError("ambiguous_alias_queue_ownership")
+            if hash_errors:
+                raise GuardError("torrent_hash_identity_unavailable")
             policy = instance["indexers"]
             if any(classify_source(policy, row.get("indexer")) == "private" for row in rows):
                 raise GuardError("private_queue_source_protected")
@@ -743,9 +769,7 @@ def load_config(path):
             if endpoint_key(binding.get("endpoint")) != endpoint_key(config["qbittorrent"]["url"]):
                 raise GuardError("monitored_downloader_binding_mismatch")
         for item in [config["qbittorrent"], *config["sonarr"].values()]:
-            url = urllib.parse.urlsplit(item["url"])
-            if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-                raise GuardError("invalid_endpoint")
+            endpoint_key(item["url"])
         if not config["qbittorrent"].get("username") or not config["qbittorrent"].get("password"):
             raise GuardError("missing_qbittorrent_credentials")
         return config

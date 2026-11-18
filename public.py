@@ -1,6 +1,7 @@
 """One bounded public dry-run cycle. Scheduling never grants live approval."""
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import json
 from pathlib import Path
@@ -17,11 +18,27 @@ RECOVERY_SECONDS = 30
 RECOVERY_ITEM_SECONDS = 5
 
 
+@contextmanager
+def limit_adapter_deadlines(adapters, deadline):
+    previous = [(api, hasattr(api, "deadline"), getattr(api, "deadline", None)) for api in adapters]
+    try:
+        for api, _, old in previous:
+            api.deadline = deadline if old is None else min(old, deadline)
+        yield
+    finally:
+        for api, existed, old in previous:
+            if existed:
+                api.deadline = old
+            else:
+                del api.deadline
+
+
 def recover_pending(config, qb, apis, journal, batch_state, deadline):
-    """Small rotating slice, after assessment; never spend its reserved time."""
+    """Recover a bounded, rotating slice while the caller holds guard.lock."""
     keys = sorted(r[0] for r in journal.db.execute(
         "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt') "
-        "AND stage IN ('dispatch_recorded','uncertain','replacement_pending')").fetchall())
+        "AND (stage IN ('dispatch_recorded','uncertain','replacement_pending') "
+        "OR (stage = 'prepared' AND dispatched_at IS NULL))").fetchall())
     after = batch_state.get("recovery_after", "")
     keys = [k for k in keys if k > after] + [k for k in keys if k <= after]
     end = min(deadline - 2, time.monotonic() + RECOVERY_SECONDS)
@@ -31,61 +48,67 @@ def recover_pending(config, qb, apis, journal, batch_state, deadline):
         if time.monotonic() >= end:
             break
         item_end = min(end, time.monotonic() + RECOVERY_ITEM_SECONDS)
-        old_deadlines = [(api, hasattr(api, "deadline"), getattr(api, "deadline", None)) for api in adapters]
         try:
-            # Some observation branches deliberately catch failures. Propagate
-            # the sub-deadline into every adapter too, so a caught alarm cannot
-            # let the next branch start another long request.
-            for api, _, old in old_deadlines:
-                api.deadline = min(old, item_end) if old is not None else item_end
             row = journal.get(key)
-            try:
-                with hard_deadline(item_end):
-                    verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
-                    observation = verifier.observe()
-            except Exception:
-                observation = None
-            # Commit uncertainty outside the observation alarm's scope.
-            def observe():
-                if observation is None:
-                    raise SafetyError("recovery_observation_unavailable")
-                return observation
-            row = reconcile(journal, key, observe)
-            recovered.append({"key": key, "stage": row["stage"], "confirmed": row["confirmed"]})
+            if row["stage"] == "prepared":
+                row = journal.transition(key, "prepared", "cancelled", stop_reason="abandoned_before_dispatch")
+            else:
+                # An observation branch can catch an alarm. Each subsequent
+                # request still has to respect the same recovery deadline.
+                try:
+                    with limit_adapter_deadlines(adapters, item_end), hard_deadline(item_end):
+                        verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
+                        observation = verifier.observe()
+                except Exception:
+                    observation = None
+
+                def observe():
+                    if observation is None:
+                        raise SafetyError("recovery_observation_unavailable")
+                    return observation
+
+                row = reconcile(journal, key, observe)
+            result = {"key": key, "stage": row["stage"], "confirmed": row["confirmed"]}
+            if row["stop_reason"] is not None:
+                result["stop_reason"] = row["stop_reason"]
+            recovered.append(result)
         finally:
             batch_state["recovery_after"] = key
-            for api, existed, old in old_deadlines:
-                if existed:
-                    api.deadline = old
-                else:
-                    del api.deadline
     return recovered
 
 
-def cycle(config, qb, apis, journal, batch_state=None):
+def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False):
     if batch_state is None:
         batch_state = {}
-    deadlines = [getattr(api, "deadline", None) for api in [qb, *apis.values()]]
-    deadline = min([d for d in deadlines if d is not None] + [time.monotonic() + 180])
-    # Fail closed across both owners. Do not fall back to downloader-only work
-    # when either ownership queue or Sonarr-side connectivity is unavailable.
-    for label, api in apis.items():
-        require_connectivity(config, api, label)
-    qb.login()
-    # Reserve assessment's opportunity by doing it first. Recovery backlog is
-    # never allowed to consume the cycle before the candidate cursor advances.
-    reports = run(config, qb, apis, batch_state=batch_state)
-    for report in reports:
-        if report["decision"] != "would_fail":
-            continue
-        try:
-            fresh = recheck_candidate(report, config, qb, apis)
-            check_fresh(report, fresh)
-            check_prior_attempts(journal, report, config=config)
-            report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
-        except (SafetyError, GuardError) as error:
-            report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
-    recovered = recover_pending(config, qb, apis, journal, batch_state, deadline)
+    adapters = [qb, *apis.values()]
+    started = time.monotonic()
+    deadlines = [getattr(api, "deadline", None) for api in adapters]
+    deadline = min([d for d in deadlines if d is not None] + [started + 180])
+    budget = deadline - started
+    assessment_end = started + budget / 2
+    verification_end = started + budget * 2 / 3 if reserve_dispatch else deadline
+    recovery_end = started + budget * 3 / 4 if reserve_dispatch else deadline
+    # Validate both owners before contacting the downloader. The shorter scan
+    # deadline reserves time even when a large queue exhausts assessment.
+    with limit_adapter_deadlines(adapters, assessment_end):
+        for label, api in apis.items():
+            require_connectivity(config, api, label)
+        qb.login()
+        reports = run(config, qb, apis, batch_state=batch_state)
+    with limit_adapter_deadlines(adapters, verification_end):
+        for report in reports:
+            if report["decision"] != "would_fail":
+                continue
+            try:
+                if time.monotonic() >= verification_end:
+                    raise GuardError("run_time_limit_reached")
+                fresh = recheck_candidate(report, config, qb, apis)
+                check_fresh(report, fresh)
+                check_prior_attempts(journal, report, config=config)
+                report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
+            except (SafetyError, GuardError) as error:
+                report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
+    recovered = recover_pending(config, qb, apis, journal, batch_state, recovery_end)
     return {"dry_run": True, "status": "assessed", "retry_after_seconds": RETRY_AFTER_SECONDS,
             "live_sender_enabled": False, "recovery": recovered, "assessment": reports}
 
