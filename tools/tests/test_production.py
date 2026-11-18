@@ -172,6 +172,114 @@ class ProductionTests(unittest.TestCase):
                 finally:
                     journal.close()
 
+    def hybrid_report(self):
+        v1 = "b" * 40
+        v2 = self.hash + "c" * 24
+        self.qb.routes["/api/v2/torrents/properties"] = {
+            "hash": self.hash, "infohash_v1": v1, "infohash_v2": v2}
+        self.grab["downloadId"] = v1.upper()
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "would_fail")
+        return report
+
+    def test_hybrid_hashes_bind_history_and_send_only_through_sonarr(self):
+        report = self.hybrid_report()
+        approval = {**self.approval, **{key: report[key] for key in (
+            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
+        self.assertEqual(report["hash"], self.hash)
+        self.assertEqual(report["hash_aliases"], sorted([self.hash, "b" * 40, self.hash + "c" * 24]))
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete") as sender:
+            production.execute_single_test(self.config, self.qb, self.apis,
+                                           self.journal, report, approval)
+            sender.assert_called_once_with(self.s, 7)
+
+    def test_hybrid_private_source_and_newer_private_grab_are_protected(self):
+        self.hybrid_report()
+        self.grab["data"]["indexer"] = "Private Source"
+        self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
+        self.grab["data"]["indexer"] = "Public Source"
+        private = dict(self.grab, id=6, downloadId=self.hash,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        valid = copy.deepcopy(self.s.routes["/api/v3/history"])
+        def by_hash(route, params=None):
+            if route == "/api/v3/history" and params["downloadId"].lower() == self.hash:
+                return {"records": [private], "totalRecords": 1}
+            if route == "/api/v3/history":
+                return copy.deepcopy(valid)
+            return copy.deepcopy(self.s.routes[route])
+        with patch.object(self.s, "call", side_effect=by_hash):
+            self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
+
+    def test_hybrid_mapping_changes_invalidate_pre_dispatch_evidence(self):
+        report = self.hybrid_report()
+        approval = {**self.approval, **{key: report[key] for key in (
+            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
+        original = copy.deepcopy(self.qb.routes["/api/v2/torrents/properties"])
+        for field, value in (("infohash_v1", "d" * 40),
+                             ("infohash_v2", self.hash + "d" * 24)):
+            with self.subTest(field=field):
+                self.qb.routes["/api/v2/torrents/properties"] = {**original, field: value}
+                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete") as sender:
+                    with self.assertRaises(SafetyError):
+                        production.execute_single_test(self.config, self.qb, self.apis,
+                                                       self.journal, report, approval)
+                    sender.assert_not_called()
+
+    def test_hybrid_outcome_uses_alias_for_failure_not_replacement(self):
+        report = self.hybrid_report()
+        self.context = production.capture_context(self.config, self.s, report,
+                                                  production.digest(self.approval["nonce"]))
+        self.results()
+        self.s.routes["/api/v3/history/since"][2]["downloadId"] = self.hash + "c" * 24
+        outcome = self.observe()
+        self.assertIs(outcome["failed"], True)
+        self.assertIs(outcome["torrent_absent"], True)
+        self.assertIs(outcome["replacement_observed"], False)
+
+    def test_hybrid_other_instance_owner_blocks_cleanup(self):
+        self.hybrid_report()
+        other = copy.deepcopy(self.s)
+        other.routes["/api/v3/queue"]["records"][0]["downloadId"] = "b" * 40
+        other.routes["/api/v3/queue"]["records"][0]["id"] = 8
+        config = copy.deepcopy(self.config)
+        config["sonarr"]["UHD"] = copy.deepcopy(config["sonarr"]["HD"])
+        reports = run(config, self.qb, {"HD": self.s, "UHD": other})
+        hd = next(r for r in reports if r["instance"] == "HD")
+        self.assertEqual(hd["reason"], "ambiguous_instance_ownership")
+
+    def test_hybrid_invalid_or_colliding_identity_never_assesses_files(self):
+        self.hybrid_report()
+        original = copy.deepcopy(self.qb.routes["/api/v2/torrents/properties"])
+        for field, value in (("hash", "d" * 40), ("infohash_v1", 123),
+                             ("infohash_v2", "c" * 40), ("infohash_v1", "0" * 40)):
+            with self.subTest(field=field):
+                self.qb.routes["/api/v2/torrents/properties"] = {**original, field: value}
+                self.qb.calls.clear()
+                self.assertEqual(run(self.config, self.qb, self.apis)[0]["decision"], "skip")
+                self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+        self.qb.routes["/api/v2/torrents/properties"] = original
+        self.qb.routes["/api/v2/torrents/info"].append({
+            **self.qb.routes["/api/v2/torrents/info"][0], "hash": "b" * 40})
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["reason"], "ambiguous_torrent_hash_identity")
+
+    def test_hybrid_context_final_baseline_checks_all_verified_hashes(self):
+        report = self.hybrid_report()
+        approval = {**self.approval, **{key: report[key] for key in (
+            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
+        private = dict(self.grab, id=6, downloadId=self.hash,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.history_since", side_effect=[[self.grab], [self.grab, private]]), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, report, approval)
+            sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
     def digit_hash_report(self):
         self.hash = "1" * 40
         self.grab["downloadId"] = self.hash

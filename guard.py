@@ -346,16 +346,48 @@ def classify_source(policy, source):
     return "public" if source in policy["public"] else "unknown"
 
 
+def verified_hashes(qb, torrent):
+    canonical = torrent_hash(torrent.get("hash"))
+    properties = qb.call("/api/v2/torrents/properties", {"hash": canonical})
+    if not isinstance(properties, dict) or torrent_hash(properties.get("hash")) != canonical:
+        raise GuardError("torrent_hash_identity_unavailable")
+    aliases = {canonical}
+    identities = set()
+    for field, length in (("infohash_v1", 40), ("infohash_v2", 64)):
+        value = properties.get(field)
+        if value is None or value == "":
+            continue
+        value = torrent_hash(value)
+        if len(value) != length or set(value) == {"0"}:
+            raise GuardError("torrent_hash_identity_unavailable")
+        identities.add(value)
+        aliases.add(value)
+        if field == "infohash_v2":
+            identities.add(value[:40])
+            aliases.add(value[:40])
+    if identities and canonical not in identities:
+        raise GuardError("torrent_hash_identity_unavailable")
+    return sorted(aliases)
+
+
 def latest_history_grabs(api, hash_value, spelling, identities, max_pages):
-    history = records(api, "/api/v3/history", {
-        # Preserve Sonarr's original spelling for its case-sensitive DB filter.
-        "eventType": 1, "downloadId": spelling,
-        "sortKey": "date", "sortDirection": "descending",
-    }, max_pages)
-    return select_latest_grabs(history, hash_value, identities)
+    aliases = {hash_value} if isinstance(hash_value, str) else set(hash_value)
+    history = {}
+    spellings = [spelling, *(h.upper() for h in sorted(aliases) if h != torrent_hash(spelling))]
+    for query in spellings:
+        rows = records(api, "/api/v3/history", {
+            "eventType": 1, "downloadId": query,
+            "sortKey": "date", "sortDirection": "descending",
+        }, max_pages)
+        for row in rows:
+            if row["id"] in history and history[row["id"]] != row:
+                raise GuardError("conflicting_history_identity")
+            history[row["id"]] = row
+    return select_latest_grabs(list(history.values()), aliases, identities)
 
 
 def select_latest_grabs(history, hash_value, identities, require_all=True):
+    aliases = {hash_value} if isinstance(hash_value, str) else set(hash_value)
     latest = {}
     has_matching_hash = False
     for grab in history:
@@ -369,7 +401,7 @@ def select_latest_grabs(history, hash_value, identities, require_all=True):
             if (not valid_identity or identity in identities) and history_event_type(grab) == "grabbed":
                 raise GuardError("invalid_history_download_id") from None
             continue
-        if grab_hash != hash_value or history_event_type(grab) != "grabbed":
+        if grab_hash not in aliases or history_event_type(grab) != "grabbed":
             continue
         has_matching_hash = True
         if not valid_identity:
@@ -506,7 +538,15 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             added = t.get("added_on")
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
-            source, grab_ids, grab_time_floor = source_for(api, h, rows, max_pages, added)
+            aliases = verified_hashes(qb, t)
+            for alias in aliases:
+                if owners.get(alias, set()) - {label}:
+                    raise GuardError("ambiguous_instance_ownership")
+                if alias in by_hash and alias != h:
+                    raise GuardError("ambiguous_torrent_hash_identity")
+            if len(aliases) > 1:
+                report["hash_aliases"] = aliases
+            source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added)
             classification = classify_source(instance["indexers"], source)
             if classification == "private":
                 raise GuardError("private_source_protected")
@@ -554,6 +594,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "attempt": report["attempt_fingerprint"],
                          "grab_time_floor": grab_time_floor,
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
+            if "hash_aliases" in report:
+                ownership["hash_aliases"] = aliases
             manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
                         for f in sorted(files, key=lambda f: f["index"])]
             if metadata_pending:

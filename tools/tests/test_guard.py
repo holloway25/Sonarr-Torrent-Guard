@@ -58,6 +58,8 @@ class FakeApi:
 
     def call(self, route, params=None):
         self.calls.append((route, params))
+        if route == "/api/v2/torrents/properties" and route not in self.routes:
+            return {"hash": params["hash"]}
         result = self.routes[route]
         if isinstance(result, Exception):
             raise result
@@ -154,7 +156,7 @@ class WorkflowTests(unittest.TestCase):
         report = self.check()
         self.assertEqual(report["decision"], "would_fail")
         self.assertTrue(report["dry_run"])
-        allowed = {"/api/v2/torrents/info", "/api/v2/torrents/files", "/api/v3/queue",
+        allowed = {"/api/v2/torrents/info", "/api/v2/torrents/files", "/api/v2/torrents/properties", "/api/v3/queue",
                    "/api/v3/history", "/api/v3/downloadclient"}
         self.assertTrue(all(route in allowed for route, _ in self.qb.calls + self.s.calls))
 

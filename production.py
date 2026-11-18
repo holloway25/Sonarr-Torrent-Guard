@@ -18,7 +18,7 @@ import urllib.request
 
 from guard import (Api, GuardError, endpoint_key, grab_indexer, hard_deadline, history_event_type,
                    integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verify_client_binding)
+                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, verified_hashes, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -42,7 +42,7 @@ def digest(value):
 
 
 def validate_context(value):
-    optional = {"routine_grant_digest", "metadata_retry"}
+    optional = {"routine_grant_digest", "metadata_retry", "hash_aliases"}
     if (not isinstance(value, dict) or not set(value) <= CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | optional
             or set(value) - optional not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS)
             or (set(value) & optional and not ATTEMPT_CONTEXT_FIELDS <= set(value))):
@@ -50,6 +50,12 @@ def validate_context(value):
     try:
         if torrent_hash(value["hash"]) != value["hash"]:
             raise ValueError()
+        if "hash_aliases" in value:
+            aliases = value["hash_aliases"]
+            if (not isinstance(aliases, list) or not 2 <= len(aliases) <= 3
+                    or sorted(set(aliases)) != aliases or value["hash"] not in aliases
+                    or any(torrent_hash(h) != h for h in aliases)):
+                raise ValueError()
         for field in ("instance", "indexer"):
             if not isinstance(value[field], str) or not value[field]:
                 raise ValueError()
@@ -194,11 +200,12 @@ def capture_context(config, api, report, approval_digest, now=None):
     if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
         raise SafetyError("unreviewed_sonarr_version")
     client = bound_client(config, api, report["instance"])
-    if torrent_hash(report.get("download_id_spelling")) != report["hash"]:
+    aliases = report.get("hash_aliases", [report["hash"]])
+    if torrent_hash(report.get("download_id_spelling")) not in aliases:
         raise SafetyError("invalid_history_download_id")
     identities = {(series[0], episode) for episode in episodes}
     try:
-        grabs = latest_history_grabs(api, report["hash"], report["download_id_spelling"],
+        grabs = latest_history_grabs(api, aliases, report["download_id_spelling"],
                                      identities,
                                      config.get("max_pages", 20))
         sources = {grab_indexer(grab) for grab in grabs}
@@ -221,7 +228,7 @@ def capture_context(config, api, report, approval_digest, now=None):
             approved = approved_by_id.get(row["id"])
             if approved is None:
                 continue
-            if (torrent_hash(row.get("downloadId")) != report["hash"]
+            if (torrent_hash(row.get("downloadId")) not in aliases
                     or history_event_type(row) != "grabbed"
                     or any(not integer(row.get(key)) or row[key] != approved[key]
                            for key in ("seriesId", "episodeId"))
@@ -230,7 +237,7 @@ def capture_context(config, api, report, approval_digest, now=None):
                 raise SafetyError("identity_or_manifest_changed")
         recent_grabs = select_latest_grabs(
             (row for row in baseline_history if row["id"] >= oldest_approved_id),
-            report["hash"], identities, require_all=False)
+            aliases, identities, require_all=False)
         for grab in recent_grabs:
             approved_id = approved_ids[(grab["seriesId"], grab["episodeId"])]
             if grab["id"] > approved_id:
@@ -248,6 +255,8 @@ def capture_context(config, api, report, approval_digest, now=None):
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
+    if "hash_aliases" in report:
+        context["hash_aliases"] = aliases
     return validate_context(context)
 
 
@@ -279,8 +288,14 @@ class OutcomeVerifier:
             hashes = [torrent_hash(t.get("hash")) for t in torrents]
             if len(hashes) != len(set(hashes)):
                 raise ValueError()
-            result["torrent_absent"] = c["hash"] not in hashes
-            current_torrent = next((t for t in torrents if torrent_hash(t["hash"]) == c["hash"]), None)
+            if "hash_aliases" in c:
+                matching = [t for t in torrents if set(verified_hashes(self.qb, t)) & set(c["hash_aliases"])]
+                if len(matching) > 1:
+                    raise ValueError()
+                current_torrent = matching[0] if matching else None
+            else:
+                current_torrent = next((t for t in torrents if torrent_hash(t["hash"]) == c["hash"]), None)
+            result["torrent_absent"] = current_torrent is None
             if current_torrent is not None and "download_added_on" in c and (
                     current_torrent.get("added_on") != c["download_added_on"]):
                 # A different incarnation needs corroborating new Sonarr grabs.
@@ -309,15 +324,15 @@ class OutcomeVerifier:
                 except GuardError:
                     continue
                 added = current_torrent.get("added_on") if current_torrent else None
-                if (kind == "grabbed" and h == c["hash"] and after is True
+                if (kind == "grabbed" and h in c.get("hash_aliases", [c["hash"]]) and after is True
                         and "grab_ids" in c and r["id"] > max(c["grab_ids"])
                         and integer(added) and added > max(c["download_added_on"], self.not_before)
                         and abs(event_time(r) - added) <= 120):
                     regrab.add(r["episodeId"])
-                if (kind == "downloadFailed" and h == c["hash"]
+                if (kind == "downloadFailed" and h in c.get("hash_aliases", [c["hash"]])
                         and digest(r.get("sourceTitle")) == c["release_title_digest"]):
                     (failed if after else ambiguous_failed).add(r["episodeId"])
-                if kind == "grabbed" and h != c["hash"]:
+                if kind == "grabbed" and h not in c.get("hash_aliases", [c["hash"]]):
                     (replacement if after else ambiguous_replacement).add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
@@ -459,7 +474,10 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         torrents = qb.call("/api/v2/torrents/info")
         if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
             raise SafetyError("dispatch_validation_failed")
-        if c["hash"] in [torrent_hash(t.get("hash")) for t in torrents]:
+        if "hash_aliases" in c:
+            if any(set(verified_hashes(qb, t)) & set(c["hash_aliases"]) for t in torrents):
+                raise SafetyError("target_reappeared")
+        elif c["hash"] in [torrent_hash(t.get("hash")) for t in torrents]:
             raise SafetyError("target_reappeared")
         queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
         for queued in queue:

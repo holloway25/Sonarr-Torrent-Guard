@@ -10,6 +10,20 @@ remain future work. Docker packaging is implemented, with separately approved
 deployment described in [container setup](CONTAINER.md). Existing seeding/removal
 policies stay intact.
 
+For a queue item whose hash matches qBittorrent's torrent ID, Guard reads
+qBittorrent's properties to verify the v1 and full v2 infohashes, including the
+shortened v2 ID used by qBittorrent. Sonarr grab records can use any of these
+verified identities. Guard combines their histories before choosing the newest
+grab for each episode. Titles alone never establish ownership. Conflicting
+history records, another instance owning an alias, malformed properties or an
+alias matching another listed torrent block assessment.
+
+The verified identities are included in the ownership fingerprint and retained
+in the action context. Fresh rechecks bind the same mapping before removal.
+Failure and replacement observations use the mapping too, so another hash for
+the same hybrid torrent cannot masquerade as a replacement. Legacy journal
+contexts without a mapping retain their exact-hash behavior.
+
 Fresh read-only assessment and a private SQLite journal are now implemented.
 Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):
 new containers treat identified sources as public except private exclusions;
