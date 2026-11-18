@@ -171,6 +171,13 @@ def outcome_history(api, series, episodes, start, max_pages):
     return rows
 
 
+def blocklist_records(api, series_id, start, max_pages):
+    # Keep the entire boundary second so truncated Sonarr timestamps remain evidence.
+    return records(api, "/api/v3/blocklist",
+                   {"seriesIds": series_id, "sortKey": "date", "sortDirection": "descending"},
+                   max_pages, since=math.floor(start))
+
+
 def event_time(row):
     value = row.get("date")
     if not isinstance(value, str):
@@ -287,7 +294,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 raise SafetyError("identity_or_manifest_changed")
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
-    blocklist = records(api, "/api/v3/blocklist", {"seriesIds": series[0]}, config.get("max_pages", 20))
+    blocklist = blocklist_records(api, series[0], start, config.get("max_pages", 20))
     context = {
         "instance": report["instance"], "hash": report["hash"], "series_id": series[0],
         "episode_ids": report["episode_ids"], "queue_id": min(report["queue_ids"]),
@@ -339,6 +346,14 @@ def blocklist_observation(rows, context, not_before, *, any_episode=False):
             raise SafetyError("invalid_blocklist_identity")
         if row["id"] in context["baseline_blocklist_ids"] or row["seriesId"] != context["series_id"]:
             continue
+        protocol = row.get("protocol")
+        if isinstance(protocol, str):
+            protocol = protocol.casefold()
+        elif not integer(protocol):
+            protocol = None
+        if protocol in ("usenet", 1):
+            continue
+        torrent_protocol = protocol in ("torrent", 2)
         indexer, title = row.get("indexer"), row.get("sourceTitle")
         indexer_known = isinstance(indexer, str) and bool(indexer.strip())
         title_known = isinstance(title, str) and bool(title.strip())
@@ -349,9 +364,12 @@ def blocklist_observation(rows, context, not_before, *, any_episode=False):
         if after is False:
             continue
         ids = row.get("episodeIds")
-        if not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
+        if row["id"] <= 0 or not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
             raise SafetyError("invalid_blocklist_identity")
-        definite = after is True and indexer_known and title_known
+        if not ids:
+            ambiguous.update(required)
+            continue
+        definite = after is True and indexer_known and title_known and torrent_protocol
         (matched if definite else ambiguous).update(required.intersection(ids))
     if matched == required or (any_episode and matched):
         return True
@@ -380,8 +398,10 @@ class OutcomeVerifier:
         result = {k: None for k in ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")}
         current_torrent = None
         current_aliases = ()
+        identity_available = False
         try:
             current_torrent, current_aliases = observed_torrent(self.qb, c)
+            identity_available = True
             result["torrent_absent"] = current_torrent is None
             if current_torrent is not None and "download_added_on" in c and (
                     current_torrent.get("added_on") != c["download_added_on"]):
@@ -416,14 +436,14 @@ class OutcomeVerifier:
                 if kind == "downloadFailed":
                     title = r.get("sourceTitle")
                     title_known = isinstance(title, str) and bool(title.strip())
-                    if (h is not None and h not in aliases
-                            or title_known and digest(title) != c["release_title_digest"]):
+                    if ((identity_available and h is not None and h not in aliases)
+                            or (title_known and digest(title) != c["release_title_digest"])):
                         continue
-                    definite = confirmed and h is not None and title_known
+                    definite = confirmed and h in aliases and title_known
                     (failed if definite else ambiguous_failed).add(r["episodeId"])
                 elif kind == "grabbed" and h is not None:
                     if h not in aliases:
-                        (replacement if confirmed else ambiguous_replacement).add(r["episodeId"])
+                        (replacement if confirmed and identity_available else ambiguous_replacement).add(r["episodeId"])
                         continue
                     added = current_torrent.get("added_on") if current_torrent else None
                     if (confirmed and "grab_ids" in c and r["id"] > max(c["grab_ids"])
@@ -432,15 +452,15 @@ class OutcomeVerifier:
                         regrab.add(r["episodeId"])
             required = set(c["episode_ids"])
             result["failed"] = True if failed == required else (None if ambiguous_failed - failed else False)
-            result["replacement_observed"] = True if replacement == required else (
-                None if ambiguous_replacement - replacement else False)
+            covered = replacement | regrab
+            result["replacement_observed"] = True if covered == required else (
+                None if ambiguous_replacement - covered else False)
             if regrab == required:
                 result["torrent_absent"] = True  # Original incarnation, not all copies of this hash.
-                result["replacement_observed"] = True  # Observed is not verified safe/imported.
         except Exception:
             pass
         try:
-            rows = records(api, "/api/v3/blocklist", {"seriesIds": c["series_id"]}, self.config.get("max_pages", 20))
+            rows = blocklist_records(api, c["series_id"], self.not_before, self.config.get("max_pages", 20))
             result["blocklisted"] = blocklist_observation(
                 rows, c, self.not_before, any_episode=c.get("metadata_retry", {}).get("blocklist") is False)
         except Exception:
@@ -625,8 +645,8 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         if (binding_digest(config, c["instance"]) != c["binding_digest"] or
                 endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
             raise SafetyError("identity_or_manifest_changed")
-        blocks = records(apis[c["instance"]], "/api/v3/blocklist", {"seriesIds": c["series_id"]},
-                         config.get("max_pages", 20))
+        blocks = blocklist_records(apis[c["instance"]], c["series_id"], row["dispatched_at"],
+                                  config.get("max_pages", 20))
         check_metadata_blocklist(blocks, c, row["dispatched_at"])
         validate()
         if METADATA_RETRY_RELEASE_ENABLED is not True:

@@ -65,8 +65,18 @@ def compare(candidate, baseline):
 def git_inputs(revision):
     if re.fullmatch(r"[a-f0-9]{40}", revision) is None:
         raise ValueError("invalid_revision")
-    return {name: subprocess.run(["git", "show", revision + ":" + name], check=True,
-                                 capture_output=True).stdout for name in BUILD_INPUTS}
+    if subprocess.run(["git", "cat-file", "-t", revision], check=True,
+                      capture_output=True).stdout.strip() != b"commit":
+        raise ValueError("invalid_revision")
+    tree = subprocess.run(["git", "ls-tree", "-r", "-z", "--name-only", revision, "--", *BUILD_POLICY_FILES],
+                          check=True, capture_output=True).stdout
+    present = set(tree.decode().split("\0"))
+    files = {name: subprocess.run(["git", "show", revision + ":" + name], check=True,
+                                  capture_output=True).stdout
+             for name in BUILD_INPUTS if name not in BUILD_POLICY_FILES or name in present}
+    if set(BUILD_POLICY_FILES) - present:
+        raise DependencyReviewRequired("build_policy_evidence_requires_review")
+    return files
 
 
 def image_script():

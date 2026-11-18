@@ -63,8 +63,10 @@ reappearing original hash or newly queued affected episode. After qBittorrent
 confirms absence, Guard ignores each stale original row whose queue ID, episode
 ID and normalized download hash match the saved pre-removal evidence. Just
 before dispatch, read the blocklist again. A new matching entry for any affected
-episode or uncertain blocklist evidence blocks the search. A missing indexer
-or release title leaves an otherwise relevant blocklist entry uncertain.
+episode or uncertain blocklist evidence blocks the search. A missing indexer,
+release title, torrent protocol or nonempty episode list leaves an otherwise
+relevant blocklist entry uncertain. Entries explicitly marked Usenet or linked
+to known unrelated episodes can be excluded.
 Guard also retains any search veto seen after removal intent and before sending
 the removal, including a new grab or matching blocklist entry. Those rows stay
 in the outcome baseline and cannot establish a result of the removal.

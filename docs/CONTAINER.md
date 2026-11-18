@@ -61,7 +61,9 @@ The root filesystem may be read-only, capabilities dropped and no-new-privileges
 enabled. `/tmp` may be a tmpfs. Image updates must preserve persistent appdata.
 
 Use Unraid environment fields or a private environment file. Generic examples are
-in `deploy/container.env.example`; NEVER commit edited deployment values. Runtime
+in `deploy/container.env.example`. Keep deployment values in private files.
+Git ignores `*.env` files, and the privacy check rejects actual Guard credential
+assignments even in files with other names. Runtime
 environment variables are visible to Docker/Unraid administrators, as accepted
 by the operator; they are not claimed to be hidden from root.
 

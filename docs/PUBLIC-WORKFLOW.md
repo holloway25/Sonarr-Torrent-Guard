@@ -197,17 +197,23 @@ the affected episodes. Recovery reads bounded, paginated history for each
 affected episode, including the whole second containing dispatch. An incomplete
 history read leaves the history outcomes unknown. Queue disappearance alone
 cannot establish outcomes.
-The blocklist API has no download hash; correlation uses a release-title digest,
-indexer, series/episodes and newly added record IDs. Failure history additionally
-must match the original hash. Replacement hashes differ unless a newer same-hash
-incarnation is corroborated by a later qBittorrent addition and new matching Sonarr
-grab IDs for all affected episodes, positively after dispatch. Changed addition
-time alone leaves original absence unknown. Legacy contexts lacking incarnation
+Blocklist reads use Sonarr's descending date order and stop once they reach
+records older than the evidence window. Exceeding the page limit within that
+window leaves the evidence unknown. Guard correlates torrent blocklist entries
+using protocol, a release-title digest, indexer, series, episode IDs and newly
+added record IDs. Failure history must also match the original hash.
+For replacement reporting, Guard combines episode coverage from different-hash
+grabs and same-hash re-grabs verified by a later qBittorrent addition and newer
+matching Sonarr grab IDs after dispatch. Only same-hash re-grab evidence for
+every episode can prove original absence when that hash remains listed under a
+new addition time. Legacy contexts lacking incarnation
 evidence retain hash-absence checks. Client-name
 digests bind matching history records to the configured downloader. A plausible
 failure with a missing or malformed downloader name, download hash or release
-title leaves failure unknown. Read-only recovery can then check again. A known
-different downloader, hash or title can rule out the event.
+title leaves failure unknown. Read-only recovery can then check again.
+Without a usable qBittorrent identity lookup, an unfamiliar hash may be an
+alias of the original torrent. That uncertainty blocks confirmation of a new
+replacement and keeps a matching failure under the unfamiliar hash unresolved.
 
 Dispatch time is stored with intent, and matching result events must be at or
 after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's

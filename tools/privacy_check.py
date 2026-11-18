@@ -42,7 +42,7 @@ def main():
         name = raw.decode()
         parts = PurePosixPath(name).parts
         leaf = parts[-1].lower()
-        if (leaf.startswith("handoff") or leaf == ".env" or leaf.startswith(".env.")
+        if (leaf.startswith("handoff") or leaf.endswith(".env") or leaf.startswith(".env.")
                 or (leaf.startswith("connections") and leaf.endswith(".json"))
                 or leaf.startswith(".guard-") or leaf == ".connections-validation.json"
                 or leaf in ("config.json", "batch-state.json", "routine-authorization.json",
@@ -66,19 +66,14 @@ def main():
                 for key in ("api_key", "username", "password"):
                     if key in item and item[key] != "REPLACE_ME":
                         issues.append((name, "non-placeholder credential"))
-        if name == "deploy/container.env.example":
-            for line in text.splitlines():
-                assignment = re.fullmatch(
-                    r"\s*(?:export\s+)?STGUARD_(?:QBIT|SONARR_[A-Z0-9_]+)_(URL|API_KEY|USERNAME|PASSWORD)\s*=(.*)",
-                    line)
-                if assignment is None:
-                    continue
-                field, value = assignment.groups()
-                if field == "URL":
-                    if not is_example_endpoint(value.strip()):
-                        issues.append((name, "non-placeholder endpoint"))
-                elif value.strip() != "REPLACE_ME":
-                    issues.append((name, "non-placeholder credential"))
+        for field, value in re.findall(
+                r"(?m)^[ \t]*(?:export[ \t]+)?STGUARD_(?:QBIT|SONARR_[A-Z0-9_]+)"
+                r"_(URL|API_KEY|USERNAME|PASSWORD)[ \t]*=(.*)$", text):
+            if field == "URL":
+                if not is_example_endpoint(value.strip()):
+                    issues.append((name, "non-placeholder endpoint"))
+            elif value.strip() != "REPLACE_ME":
+                issues.append((name, "non-placeholder credential"))
     for name, reason in issues:
         print(f"BLOCKED: {name}: {reason}")
     if not issues:

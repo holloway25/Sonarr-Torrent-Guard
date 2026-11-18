@@ -47,6 +47,46 @@ class DependencyReleaseTests(unittest.TestCase):
             with self.assertRaises(policy.DependencyReviewRequired):
                 policy.compare(candidate, self.inputs)
 
+    @unittest.skipUnless(__import__("shutil").which("git"), "Repository release evidence requires Git")
+    def test_compare_cli_distinguishes_older_policy_from_unknown_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+
+            git("init", "-q")
+            missing = ".github/workflows/release-dependencies.yml"
+            for name, content in self.inputs.items():
+                if name == missing:
+                    continue
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            git("add", ".")
+            git("-c", "user.name=Project Automation", "-c", "user.email=local-test",
+                "commit", "-qm", "Legacy policy")
+            legacy = git("rev-parse", "HEAD")
+            path = root / missing
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.inputs[missing])
+            git("add", ".")
+            git("-c", "user.name=Project Automation", "-c", "user.email=local-test",
+                "commit", "-qm", "Current policy")
+            candidate = git("rev-parse", "HEAD")
+            git("rm", "--", "Dockerfile")
+            git("-c", "user.name=Project Automation", "-c", "user.email=local-test",
+                "commit", "-qm", "Missing application input")
+            incomplete = git("rev-parse", "HEAD")
+            for baseline, code, reason in (
+                    (legacy, 2, "build_policy_evidence_requires_review"),
+                    (incomplete, 1, "dependency_release_evidence_unavailable"),
+                    ("a" * 40, 1, "dependency_release_evidence_unavailable")):
+                result = subprocess.run([sys.executable, str(self.root / "tools/dependency_release.py"),
+                    "compare", "--candidate", candidate, "--baseline", baseline], cwd=root,
+                    capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stdout.strip()), (code, reason))
+
     def test_fingerprint_manifest_exactly_covers_actual_image_copy_sources(self):
         copied = [name for line in self.inputs["Dockerfile"].decode().splitlines() if line.startswith("COPY ")
                   for name in line.split()[1:-1]]

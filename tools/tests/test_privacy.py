@@ -33,6 +33,27 @@ class PrivacyFilenameTests(unittest.TestCase):
                     self.assertIn("prohibited runtime or handoff artifact", result.stdout)
                     self.assertNotIn("opaque-value", result.stdout + result.stderr)
 
+    def test_private_environment_file_is_ignored_and_forced_credential_assignments_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            source_ignore = (CHECKER.parent.parent / ".gitignore").read_text()
+            (root / ".gitignore").write_text(source_ignore)
+            credential = "a" * 32
+            for name in ("guard.env", "deployment.temporary"):
+                (root / name).write_text(f"STGUARD_SONARR_HD_API_KEY={credential}\n", encoding="utf-8")
+            ignored = subprocess.run(["git", "check-ignore", "--quiet", "--", "guard.env"], cwd=root)
+            self.assertEqual(ignored.returncode, 0)
+            subprocess.run(["git", "add", "--force", "--", "guard.env", "deployment.temporary"], cwd=root, check=True)
+            for flags in ([], ["--all"]):
+                result = subprocess.run([sys.executable, str(CHECKER), *flags],
+                                        cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("guard.env: prohibited runtime or handoff artifact", result.stdout)
+                for name in ("guard.env", "deployment.temporary"):
+                    self.assertIn(name + ": non-placeholder credential", result.stdout)
+                self.assertNotIn(credential, result.stdout + result.stderr)
+
     def test_container_environment_example_requires_placeholders(self):
         for field, value, reason in (
                 ("STGUARD_SONARR_HD_API_KEY", "a" * 32, "credential"),

@@ -790,7 +790,7 @@ class MetadataSenderTests(unittest.TestCase):
         f = self.f
         stamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).isoformat()
         f.s.routes["/api/v3/blocklist"] = {"totalRecords": 1, "records": [
-            {"id": 33, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source",
+            {"id": 33, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source", "protocol": "torrent",
              "sourceTitle": f.grab["sourceTitle"], "date": stamp}]}
 
     def test_pre_removal_grab_stays_a_search_veto_after_baseline_refresh(self):
@@ -879,6 +879,38 @@ class MetadataSenderTests(unittest.TestCase):
                 observation = production.OutcomeVerifier(
                     f.config, f.qb, f.apis, row["context"], row["dispatched_at"]).observe()
                 self.assertIsNone(observation["blocklisted"])
+
+    def test_missing_episode_evidence_holds_but_unrelated_and_usenet_rows_do_not(self):
+        import copy
+        import tempfile
+        from pathlib import Path
+        from contextlib import closing
+
+        f = self.f
+        self.assess_season_pack()
+        sonarr, downloader = copy.deepcopy(f.s.routes), copy.deepcopy(f.qb.routes)
+        for ids, protocol, held in (([], "torrent", True), ([99], "torrent", False), ([4], "usenet", False)):
+            with self.subTest(ids=ids, protocol=protocol), tempfile.TemporaryDirectory() as folder, closing(
+                    Journal(Path(folder) / "actions.sqlite3", allow_public_attempt=True)) as journal:
+                f.s.routes, f.qb.routes = copy.deepcopy(sonarr), copy.deepcopy(downloader)
+
+                def remove(*args, **kwargs):
+                    self.removed()
+                    self.blocklist_one_episode()
+                    f.s.routes["/api/v3/blocklist"]["records"][0].update(episodeIds=ids, protocol=protocol)
+
+                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete", side_effect=remove), patch(
+                        "production._send_episode_search", return_value=41) as search:
+                    row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+                if held:
+                    self.assertIsNone(row["current_observation"]["blocklisted"])
+                    self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
+                    search.assert_not_called()
+                else:
+                    self.assertIs(row["current_observation"]["blocklisted"], False)
+                    self.assertEqual(row["stage"], "retry_requested")
+                    search.assert_called_once_with(f.s, [3, 4])
 
     def test_metadata_partial_pack_blocklist_stops_retry(self):
         self.assess_season_pack()

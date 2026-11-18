@@ -67,7 +67,7 @@ class ProductionTests(unittest.TestCase):
         failed = dict(self.grab, id=6, eventType="downloadFailed", date=stamp)
         replacement = dict(self.grab, id=8, downloadId="b" * 40, date=stamp)
         self.s.routes["/api/v3/history/since"] = [self.grab, failed, replacement]
-        block = {"id": 9, "seriesId": 2, "episodeIds": [3], "indexer": "Public Source",
+        block = {"id": 9, "seriesId": 2, "episodeIds": [3], "indexer": "Public Source", "protocol": "torrent",
                  "sourceTitle": self.grab["sourceTitle"], "date": stamp}
         self.s.routes["/api/v3/blocklist"] = {"totalRecords": 1, "records": [block]}
 
@@ -798,6 +798,77 @@ class ProductionTests(unittest.TestCase):
         result = self.observe()
         self.assertIs(result["torrent_absent"], True)
         self.assertIs(result["replacement_observed"], True)
+
+    def test_failed_qb_alias_lookup_cannot_confirm_a_new_replacement(self):
+        self.results()
+        alias = "b" * 40
+        self.qb.routes["/api/v2/torrents/info"] = [
+            {"hash": alias, "infohash_v1": self.hash, "infohash_v2": alias + "c" * 24,
+             "added_on": self.context["download_added_on"]}]
+        self.assertIs(self.observe()["replacement_observed"], False)
+        self.qb.routes["/api/v2/torrents/info"] = TimeoutError()
+        observed = self.observe()
+        self.assertIsNone(observed["torrent_absent"])
+        self.assertIsNone(observed["replacement_observed"])
+        self.assertIs(observed["failed"], True)
+
+    def test_qb_outage_cannot_exclude_failure_with_a_possible_alias(self):
+        self.results()
+        self.s.routes["/api/v3/history/since"][1]["downloadId"] = "b" * 40
+        self.qb.routes["/api/v2/torrents/info"] = TimeoutError()
+        self.assertIsNone(self.observe()["failed"])
+
+    def test_pack_replacement_combines_same_hash_and_different_hash_evidence(self):
+        self.results()
+        added = int(time.time()) + 10
+        date = datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat()
+        self.qb.routes["/api/v2/torrents/info"] = [
+            {"hash": self.hash, "infohash_v1": self.hash, "infohash_v2": "", "added_on": added}]
+        self.s.routes["/api/v3/history/since"] = [
+            dict(self.grab, id=20, date=date),
+            dict(self.grab, id=21, episodeId=4, downloadId="b" * 40, date=date)]
+        context = dict(self.context, episode_ids=[3, 4])
+        observed = production.OutcomeVerifier(self.config, self.qb, self.apis, context).observe()
+        self.assertIs(observed["replacement_observed"], True)
+        self.assertIsNone(observed["torrent_absent"])
+
+    def test_usenet_blocklist_cannot_confirm_torrent_cleanup(self):
+        self.results()
+        block = self.s.routes["/api/v3/blocklist"]["records"][0]
+        for protocol, expected in (("usenet", False), (1, False), ("torrent", True), (2, True),
+                                   ("unknown", None), (None, None), (True, None)):
+            with self.subTest(protocol=protocol):
+                block["protocol"] = protocol
+                self.assertIs(self.observe()["blocklisted"], expected)
+        block.update(id=0, protocol="torrent")
+        self.assertIsNone(self.observe()["blocklisted"])
+
+    def test_blocklist_baseline_window_skips_old_pages_and_retains_recent_limit(self):
+        count = 2001
+        recent = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        rows = [{"id": i + 1, "seriesId": 2, "date": "2020-01-01T00:00:00Z"}
+                for i in range(count)]
+        rows[0]["date"] = recent
+        call = self.s.call
+
+        def paginated(route, params=None):
+            if route != "/api/v3/blocklist":
+                return call(route, params)
+            page = params["page"]
+            self.assertEqual((params.get("sortKey"), params.get("sortDirection")), ("date", "descending"))
+            return {"records": rows[(page - 1) * 100:page * 100], "totalRecords": count}
+
+        with patch.object(self.s, "call", side_effect=paginated) as wrapped:
+            context = production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+            self.assertEqual(context["baseline_blocklist_ids"], [1])
+            self.assertEqual([c.args[1]["page"] for c in wrapped.call_args_list
+                              if c.args[0] == "/api/v3/blocklist"], [1])
+            for row in rows:
+                row["date"] = recent
+            wrapped.reset_mock()
+            with self.assertRaisesRegex(GuardError, "pagination_limit_reached"):
+                production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+            self.assertEqual(sum(c.args[0] == "/api/v3/blocklist" for c in wrapped.call_args_list), 20)
 
     def test_file_cleanup_blocklist_evidence_still_requires_every_affected_episode(self):
         self.results()

@@ -116,7 +116,9 @@ lack the package-upgrade step; adding that exact step is allowed while everythin
 else remains unchanged. Removing the step or adding other commands is not allowed.
 Build-order labels reject older/repeated builds. Automatic and manual publishers
 share one release lock, so a queued old-code maintenance build cannot roll back a
-new manually reviewed application release. Missing evidence blocks release.
+new manually reviewed application release. A known older revision missing
+publication-policy files requires manual review. An unknown revision or
+unreadable release evidence fails the check.
 
 If the above checks pass, dependency-only images advance `latest` without a human
 approval or a host-side script. A change held for application/build review can
