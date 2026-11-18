@@ -79,7 +79,7 @@ def main():
             raise SafetyError("routine_log_requires_private_config_directory")
         handler = PrivateRotatingFileHandler(args.log_file)
         authority = (ContainerAuthorization(config, args.config) if args.container_mode
-                     else RoutineAuthorization.load(args.authorization, config))
+                     else RoutineAuthorization.load(args.authorization, config, config_path=args.config))
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}

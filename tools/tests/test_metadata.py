@@ -204,6 +204,67 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
         search.assert_not_called()
 
+    def test_downloader_renamed_after_removal_blocks_extra_search(self):
+        f = self.f
+        original = f.journal.transition
+
+        def transition(*args, **kwargs):
+            row = original(*args, **kwargs)
+            if args[2] == "retry_search_recorded":
+                client = f.s.routes["/api/v3/downloadclient"][0]
+                client["name"] = "Renamed Downloader"
+                event = dict(f.grab, id=8, downloadId="d" * 40,
+                             date=datetime.datetime.fromtimestamp(
+                                 row["dispatched_at"] + 1, datetime.timezone.utc).isoformat(),
+                             data={**f.grab["data"], "downloadClientName": client["name"]})
+                f.s.routes["/api/v3/history/since"].append(event)
+            return row
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed) as remove, patch.object(
+                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
+            row = self.execute()
+        remove.assert_called_once()
+        search.assert_not_called()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
+
+    def test_changed_standalone_disk_scope_after_removal_blocks_search(self):
+        import json
+        from pathlib import Path
+        from authorization import RoutineAuthorization, RULE, code_digest, scope_digest
+
+        f = self.f
+        directory = Path(f.folder.name)
+        path = directory / "connections.json"
+        config = dict(f.config, dry_run=True, qbittorrent={
+            **f.config["qbittorrent"], "username": "REPLACE_ME", "password": "REPLACE_ME"})
+        path.write_text(json.dumps(config))
+        path.chmod(0o600)
+        grant = directory / "routine-authorization.json"
+        now = time.time()
+        grant.write_text(json.dumps({"enabled": True, "rule": RULE, "grant_id": "c" * 64,
+            "issued_at": now - 1, "expires_at": now + 3600, "scope_digest": scope_digest(config),
+            "code_digest": code_digest()}))
+        grant.chmod(0o600)
+        authority = RoutineAuthorization.load(grant, f.config, config_path=path)
+
+        def removed(*args, **kwargs):
+            self.removed()
+            changed = json.loads(path.read_text())
+            changed["sonarr"]["HD"]["indexers"] = {
+                "mode": "private_exclusions", "private": ["Public Source"]}
+            path.write_text(json.dumps(changed))
+
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=removed) as remove, patch(
+                "production._send_episode_search") as search:
+            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+        remove.assert_called_once()
+        search.assert_not_called()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
+
     def test_reviewed_version_drift_before_search_blocks_search(self):
         def removed(*args, **kwargs):
             self.removed()

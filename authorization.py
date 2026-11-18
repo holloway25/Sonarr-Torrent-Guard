@@ -60,6 +60,15 @@ def read_grant(path):
         raise SafetyError("routine_authorization_unavailable") from None
 
 
+def read_config_scope(path, reason):
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise GuardError("invalid_or_missing_configuration")
+        return scope_digest(load_config(path))
+    except GuardError:
+        raise SafetyError(reason) from None
+
+
 class RoutineAuthorization:
     def __init__(self, value, config):
         fields = {"enabled", "rule", "grant_id", "issued_at", "expires_at", "scope_digest", "code_digest"}
@@ -73,6 +82,7 @@ class RoutineAuthorization:
         self.value = json.loads(json.dumps(value))
         self.identifier = digest(self.value)
         self._path = None
+        self._config_path = None
         if self.value.get("allow_code_updates") is not True and self.value["code_digest"] != code_digest():
             raise SafetyError("routine_code_not_authorized")
         self.validate(config)
@@ -86,6 +96,10 @@ class RoutineAuthorization:
             if digest(current) != self.identifier:
                 raise SafetyError("routine_authorization_revoked_or_changed")
         v = self.value
+        if self._config_path is not None:
+            reason = "routine_authorization_expired_or_scope_changed"
+            if read_config_scope(self._config_path, reason) != v["scope_digest"]:
+                raise SafetyError(reason)
         now = time.time()
         ongoing = v.get("authorization_mode") == "ongoing"
         times = (v["issued_at"],) if ongoing else (v["issued_at"], v["expires_at"])
@@ -120,10 +134,12 @@ class RoutineAuthorization:
         return expiry if self.value.get("authorization_mode") == "ongoing" else min(expiry, self.value["expires_at"])
 
     @classmethod
-    def load(cls, path, config):
+    def load(cls, path, config, *, config_path):
         path = Path(path).absolute()
         authority = cls(read_grant(path), config)
         authority._path = path
+        authority._config_path = Path(config_path).absolute()
+        authority.validate(config)
         return authority
 
 
@@ -170,14 +186,9 @@ class ContainerAuthorization:
             raise SafetyError("routine_authorization_expired_or_scope_changed")
         if container_scope_record(config) != self._scope or read_container_scope(self._path) != self._scope:
             raise SafetyError("container_live_scope_confirmation_required")
-        try:
-            if self._config_path.is_symlink() or not self._config_path.is_file():
-                raise GuardError("invalid_or_missing_configuration")
-            current = container_scope_record(load_config(self._config_path))
-        except GuardError:
-            raise SafetyError("container_live_scope_confirmation_required") from None
-        if current != self._scope:
-            raise SafetyError("container_live_scope_confirmation_required")
+        reason = "container_live_scope_confirmation_required"
+        if read_config_scope(self._config_path, reason) != self._scope["scope_digest"]:
+            raise SafetyError(reason)
         validate_candidate(config, report)
 
     def execution_expiry(self):

@@ -151,6 +151,10 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertIn("pull: true", workflow)
         self.assertIn("no-cache: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}", workflow)
         self.assertIn("github.event_name == 'schedule'", workflow)
+        publication = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)"
+        for step in ("Refresh compatible Python and Debian base for maintenance",
+                     "Publish tested maintenance or explicitly requested candidate"):
+            self.assertIn(f"- name: {step}\n        if: {publication}\n", workflow)
         self.assertIn("tools/release_evidence.py record", workflow)
         self.assertIn("actions/upload-artifact@", workflow)
         self.assertIn("${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", workflow)

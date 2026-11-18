@@ -44,6 +44,26 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):
             self.journal.prepare(self.original, mode="live")
 
+    def test_preview_revisions_preserve_old_evidence_for_the_same_attempt(self):
+        import hashlib
+
+        original = dict(self.original, attempt_fingerprint="e" * 64)
+        prior = self.journal.prepare(original)
+        legacy_identity = ["preview", original["instance"], original["hash"], original["attempt_fingerprint"]]
+        legacy_key = hashlib.sha256(json.dumps(legacy_identity).encode()).hexdigest()
+        with self.journal.db:
+            self.journal.db.execute("UPDATE actions SET key=? WHERE key=?", (legacy_key, prior["key"]))
+        self.assertEqual(self.journal.prepare(original)["key"], legacy_key)
+        revised = dict(original, ownership_fingerprint="d" * 64)
+        row = record_preview(self.journal, revised,
+                             lambda: {"assessment": revised, "readiness": self.ready}, now=1000)
+        self.assertNotEqual(row["key"], legacy_key)
+        self.assertEqual(row["stage"], "preview_verified")
+        self.assertEqual(self.journal.get(legacy_key)["evidence"], prior["evidence"])
+        self.assertEqual(self.journal.prepare(revised), row)
+        next_revision = self.journal.prepare(dict(revised, manifest_fingerprint="f" * 64))
+        self.assertNotEqual(next_revision["key"], row["key"])
+
     def test_rechecks_reject_identity_manifest_source_decision_and_staleness(self):
         changes = [("ownership_fingerprint", "d" * 64), ("manifest_fingerprint", "d" * 64),
                    ("hash", "d" * 40), ("instance", "UHD"), ("decision", "keep"),

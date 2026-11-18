@@ -274,6 +274,37 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(report["decision"], "skip")
         self.assertEqual(report["reason"], "private_source_protected")
 
+    def test_private_indexer_on_any_matching_queue_row_vetoes_public_history(self):
+        queue = self.s.routes["/api/v3/queue"]
+        queue["records"].append(dict(queue["records"][0], id=8, indexer="Private Source"))
+        queue["totalRecords"] = 2
+        self.qb.calls.clear()
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "private_queue_source_protected")
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+    def test_private_queue_source_appearing_at_final_recheck_blocks_removal(self):
+        queue_row = self.s.routes["/api/v3/queue"]["records"][0]
+        refresh = production.recheck_candidate
+        calls = 0
+
+        def recheck(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                queue_row["indexer"] = "Private Source"
+            return refresh(*args, **kwargs)
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                "production.recheck_candidate", side_effect=recheck), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                 self.journal, self.report, self.approval)
+            sender.assert_not_called()
+        self.assertEqual(calls, 3)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+
     def test_hash_only_torrent_properties_cannot_verify_identity(self):
         self.qb.routes["/api/v2/torrents/properties"] = {"hash": self.hash}
         self.qb.calls.clear()

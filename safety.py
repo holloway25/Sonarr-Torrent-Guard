@@ -206,9 +206,18 @@ class Journal:
             identity.append(value["attempt_fingerprint"])
         if mode == "public_attempt":
             identity.append(context["approval_digest"])
-        key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        original_key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+        key = original_key
+        if mode == "preview":
+            # A changed assessment gets its own revision. This never affects production keys.
+            identity.append(hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
+            key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            if mode == "preview":
+                legacy = self.get(original_key)
+                if legacy is not None and legacy["evidence"] == value:
+                    return legacy
             old = self.get(key)
             if old is not None:
                 if old["evidence"] != value:

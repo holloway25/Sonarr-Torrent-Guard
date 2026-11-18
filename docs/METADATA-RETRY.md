@@ -67,8 +67,10 @@ grabs do not qualify. Unavailable, malformed or ambiguous relevant history
 blocks the search rather than treating missing evidence as no replacement.
 For a new relevant grab, missing/non-object `data`, missing/non-string/blank
 `downloadClientName` blocks with `replacement_client_unknown`. Only a valid
-nonblank different client name may be excluded; unknown identity is not a
-different client. Pre-intent grabs remain excluded before that identity check.
+nonblank different client name may be excluded. Before applying that exclusion,
+Guard checks the current bound client ID and name against the removal context.
+A renamed or changed downloader blocks the search. Pre-intent grabs remain
+excluded before checking their client identity.
 Before classifying any new grab as unrelated, require positive integer
 `seriesId` and `episodeId` (not booleans, strings or floats). Missing or invalid
 content identity blocks with `replacement_history_identity_invalid`; only valid

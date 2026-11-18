@@ -43,9 +43,9 @@ source-policy mode and public/private lists, work/page limits and minimum age wi
 deployment details in the grant. Secret rotations alone do not expand scope.
 Source changes require a new reviewed grant. Grant contents are immutable within
 an active run; scope and expiry are revalidated at every dispatch phase, including
-after journal commits. Guard re-reads the grant before sending a removal or
-search request. Removing, disabling or replacing the file blocks further
-requests from the current run once the change is visible to that final check.
+after journal commits. Guard re-reads the grant and connection file before
+sending a removal or search request. A missing or changed grant, unreadable
+configuration, or a changed cleanup scope blocks the request at the final check.
 A request already sent can still complete.
 
 New containers use identified sources as public except configured private

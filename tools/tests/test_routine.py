@@ -40,10 +40,13 @@ class RoutineTests(unittest.TestCase):
         path = Path(self.f.folder.name) / CONTAINER_SCOPE_FILE
         path.write_text(json.dumps(container_scope_record(self.f.config)))
         path.chmod(0o600)
+        return self.write_connections()
+
+    def write_connections(self):
         config = copy.deepcopy(self.f.config)
         config["dry_run"] = True
         config["qbittorrent"].update(username="REPLACE_ME", password="REPLACE_ME")
-        config_path = path.parent / "connections.json"
+        config_path = Path(self.f.folder.name) / "connections.json"
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
         return config_path
@@ -207,9 +210,9 @@ class RoutineTests(unittest.TestCase):
         ongoing = dict(self.ongoing_grant(), code_digest=old_code)
         path = self.write_grant(ongoing)
         with self.assertRaisesRegex(SafetyError, "routine_code_not_authorized"):
-            RoutineAuthorization.load(path, self.f.config)
+            self.load_grant(path)
         path = self.write_grant(dict(ongoing, allow_code_updates=True))
-        RoutineAuthorization.load(path, self.f.config).validate(self.f.config, self.f.report)
+        self.load_grant(path).validate(self.f.config, self.f.report)
         for grant in (dict(ongoing, allow_code_updates=1),
                       dict(ongoing, allow_code_updates=False),
                       dict(self.grant, allow_code_updates=True)):
@@ -222,23 +225,26 @@ class RoutineTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def load_grant(self, path):
+        return RoutineAuthorization.load(path, self.f.config, config_path=self.write_connections())
+
     def test_grant_file_rejects_duplicate_enable_and_expiry(self):
         grant = self.ongoing_grant()
         path = self.write_grant(grant)
         original = path.read_text()
-        RoutineAuthorization.load(path, self.f.config)
+        self.load_grant(path)
         for before, after in (('"enabled": true', '"enabled": false, "enabled": true'),
                               ('"expires_at": null', '"expires_at": 1, "expires_at": null')):
             with self.subTest(field=before):
                 path.write_text(original.replace(before, after))
                 with self.assertRaisesRegex(SafetyError, "routine_authorization_unavailable"):
-                    RoutineAuthorization.load(path, self.f.config)
+                    self.load_grant(path)
 
     def test_loaded_grant_rejects_removal_and_replacement(self):
         for removed in (True, False):
             with self.subTest(removed=removed):
                 path = self.write_grant(self.ongoing_grant())
-                authority = RoutineAuthorization.load(path, self.f.config)
+                authority = self.load_grant(path)
                 if removed:
                     path.unlink()
                 else:
@@ -249,7 +255,7 @@ class RoutineTests(unittest.TestCase):
     def test_final_dispatch_blocks_grant_disabled_after_baseline_commit(self):
         grant = self.ongoing_grant()
         path = self.write_grant(grant)
-        self.authority = RoutineAuthorization.load(path, self.f.config)
+        self.authority = self.load_grant(path)
         refresh = self.f.journal.refresh_baselines
 
         def revoke_after_refresh(*args, **kwargs):
@@ -264,6 +270,28 @@ class RoutineTests(unittest.TestCase):
             sender.assert_not_called()
         self.assertEqual(row["stage"], "dispatch_blocked")
         self.assertEqual(row["stop_reason"], "routine_authorization_revoked_or_changed")
+
+    def test_standalone_grant_rechecks_disk_scope_at_final_dispatch(self):
+        path = self.write_grant(self.ongoing_grant())
+        config_path = self.write_connections()
+        self.authority = RoutineAuthorization.load(path, self.f.config, config_path=config_path)
+        refresh = self.f.journal.refresh_baselines
+
+        def protect_after_refresh(*args, **kwargs):
+            row = refresh(*args, **kwargs)
+            changed = json.loads(config_path.read_text())
+            changed["sonarr"]["HD"]["indexers"] = {
+                "mode": "private_exclusions", "private": ["Public Source"]}
+            config_path.write_text(json.dumps(changed))
+            return row
+
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                self.f.journal, "refresh_baselines", side_effect=protect_after_refresh), patch(
+                "production._send_queue_delete") as sender:
+            row = self.execute()
+            sender.assert_not_called()
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
 
     def test_ongoing_authority_cannot_be_changed_in_memory(self):
         authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
@@ -304,10 +332,10 @@ class RoutineTests(unittest.TestCase):
 
     def test_auth_file_requires_private_permissions_and_valid_content(self):
         path = self.write_grant(self.grant)
-        self.assertEqual(RoutineAuthorization.load(path, self.f.config).identifier, self.authority.identifier)
+        self.assertEqual(self.load_grant(path).identifier, self.authority.identifier)
         path.chmod(0o644)
         with self.assertRaises(SafetyError):
-            RoutineAuthorization.load(path, self.f.config)
+            self.load_grant(path)
 
     def newer_attempt(self, legacy=False):
         f = self.f

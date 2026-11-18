@@ -583,10 +583,13 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("ambiguous_torrent_hash_identity")
                 if alias != h and label in owners.get(alias, ()):
                     raise GuardError("ambiguous_alias_queue_ownership")
+            policy = instance["indexers"]
+            if any(classify_source(policy, row.get("indexer")) == "private" for row in rows):
+                raise GuardError("private_queue_source_protected")
             if len(aliases) > 1:
                 report["hash_aliases"] = aliases
             source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added, client_name)
-            classification = classify_source(instance["indexers"], source)
+            classification = classify_source(policy, source)
             if classification == "private":
                 raise GuardError("private_source_protected")
             if classification != "public":

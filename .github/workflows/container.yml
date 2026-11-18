@@ -58,7 +58,7 @@ jobs:
       - name: Choose unique candidate image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - name: Refresh compatible Python and Debian base for maintenance
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         run: |
           set -euo pipefail
           docker pull python:3.15-slim-trixie

@@ -498,7 +498,11 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         # search-intent commit too; any affected episode already grabbed makes
         # searching the whole set redundant. This is request evidence only,
         # not proof of original removal, successful download or import.
-        for event in history_since(apis[c["instance"]], c["window_start"]):
+        events = history_since(apis[c["instance"]], c["window_start"])
+        client = bound_client(config, apis[c["instance"]], c["instance"])
+        if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
+            raise SafetyError("identity_or_manifest_changed")
+        for event in events:
             event_type = metadata_history_type(event)
             if event["id"] in c["baseline_history_ids"] or event_type != "grabbed":
                 continue

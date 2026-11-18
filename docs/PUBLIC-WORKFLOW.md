@@ -17,6 +17,9 @@ before the torrent was added, regardless of how many hashes it has. It compares
 hashes without regard to case and selects the newest matching grab for each
 episode. That grab must name the uniquely configured, bound downloader before
 Guard trusts its indexer. A different or missing downloader name blocks cleanup.
+A private indexer on any matching queue row also blocks cleanup, even when grab
+history says the source is public. A public queue value alone cannot establish
+that a torrent is eligible. Fresh assessment repeats the queue check.
 A second queue group under a verified alias holds the whole torrent, even
 when both groups belong to the same Sonarr instance. An alias that matches
 another listed torrent also blocks assessment.
@@ -250,8 +253,9 @@ The bounded time correlation is not proof against concurrent manual operations.
 An attempt fingerprint binds the instance/hash, addition time and current grab
 IDs. Ownership/fresh rechecks include it: a re-grab during validation cancels the
 old proposal. Preview and simulation journals use separate records for successive
-attempts and preserve the previous action's evidence across restarts. Existing
-legacy rows are retained unchanged. Filename changes alone are not new attempts.
+attempts. A changed preview assessment gets its own evidence revision within
+the same attempt. The journal keeps earlier preview records and reuses a legacy
+record when its evidence matches. Filename changes alone are not new attempts.
 
 The disabled single-test sender deliberately retains its one-action-per-hash
 key. A re-grab cannot reuse a consumed approval, bypass a manual-review record or
