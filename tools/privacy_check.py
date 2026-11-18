@@ -33,9 +33,10 @@ def main():
         leaf = parts[-1].lower()
         if (leaf.startswith("handoff") or leaf == ".env" or leaf.startswith(".env.")
                 or (leaf.startswith("connections") and leaf.endswith(".json"))
+                or leaf.startswith(".guard-") or leaf == ".connections-validation.json"
                 or leaf in ("config.json", "batch-state.json", "routine-authorization.json",
                             "container-live-scope.json")
-                or leaf.endswith((".log", ".lock", ".zip", ".sqlite3")) or ".sqlite3-" in leaf
+                or leaf.endswith((".log", ".lock", ".zip", ".sqlite3")) or ".sqlite3-" in leaf or ".log." in leaf
                 or any(x in ("local", "downloads", "staging") for x in parts)):
             issues.append((name, "prohibited runtime or handoff artifact"))
         data = Path(name).read_bytes() if args.all else git("show", ":" + name)

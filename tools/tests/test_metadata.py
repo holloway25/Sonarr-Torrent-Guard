@@ -694,6 +694,76 @@ class MetadataSenderTests(unittest.TestCase):
         cases.append(dict(base, id=7, episodeId=None))  # Stale original row must also be validated.
         self.assert_invalid_final_records_block(cases, "/api/v3/queue", "replacement_queue_identity_invalid")
 
+    def test_final_queue_requests_unknown_series_and_blocks_search(self):
+        f = self.f
+        call = f.s.call
+
+        def remove_with_unmapped_item(*args, **kwargs):
+            self.removed()
+            f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [
+                {"id": 18, "seriesId": None, "episodeId": None}]}
+
+        def sonarr_queue(route, params=None):
+            result = call(route, params)
+            if route == "/api/v3/queue" and params.get("includeUnknownSeriesItems") != "true":
+                result["records"] = [r for r in result["records"] if r["seriesId"] is not None]
+                result["totalRecords"] = len(result["records"])
+            return result
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_with_unmapped_item) as send, patch.object(
+                f.s, "call", side_effect=sonarr_queue), patch("production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_queue_identity_invalid")
+        send.assert_called_once()
+        search.assert_not_called()
+
+    def assess_season_pack(self):
+        f = self.f
+        first = f.s.routes["/api/v3/queue"]["records"][0]
+        second = dict(first, id=8, episodeId=4)
+        f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [first, second]}
+        grabs = [f.grab, dict(f.grab, id=6, episodeId=4)]
+        f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": grabs}
+        f.s.routes["/api/v3/history/since"] = grabs
+        f.report = run(f.config, f.qb, f.apis)[0]
+        f.approval.update(ownership_fingerprint=f.report["ownership_fingerprint"],
+                          manifest_fingerprint=f.report["manifest_fingerprint"])
+        return second
+
+    def test_final_queue_ignores_both_stale_original_season_pack_rows(self):
+        f = self.f
+        self.assess_season_pack()
+
+        def remove_from_downloader_only(*args, **kwargs):
+            f.qb.routes["/api/v2/torrents/info"] = []
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_from_downloader_only) as send, patch(
+                "production._send_episode_search", return_value=41) as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_requested")
+        send.assert_called_once_with(f.s, 7, blocklist=False)
+        search.assert_called_once_with(f.s, [3, 4])
+
+    def test_final_queue_blocks_replacement_reusing_original_season_pack_row_id(self):
+        f = self.f
+        second = self.assess_season_pack()
+
+        def remove_and_replace(*args, **kwargs):
+            f.qb.routes["/api/v2/torrents/info"] = []
+            second["downloadId"] = "b" * 40
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_and_replace) as send, patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_already_queued")
+        send.assert_called_once()
+        search.assert_not_called()
+
     def test_final_queue_valid_unrelated_content_can_be_ignored(self):
         f = self.f
         original = f.journal.transition

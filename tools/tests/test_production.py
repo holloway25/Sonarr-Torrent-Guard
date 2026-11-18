@@ -1,3 +1,4 @@
+from contextlib import closing
 import copy
 import tempfile
 import datetime
@@ -483,6 +484,55 @@ class ProductionTests(unittest.TestCase):
                 report = run(self.config, self.qb, self.apis)[0]
                 self.assertEqual(report["decision"], "skip")
                 self.assertEqual(report["reason"], reason)
+
+    def conflicting_grab_order(self):
+        later_private = dict(self.grab, id=self.grab["id"] - 1,
+                             data={**self.grab["data"], "indexer": "Private Source"})
+        earlier = datetime.datetime.fromisoformat(self.grab["date"]) - datetime.timedelta(seconds=60)
+        self.grab["date"] = earlier.isoformat()
+        return later_private
+
+    def test_assessment_holds_grabs_with_conflicting_source_order(self):
+        private = self.conflicting_grab_order()
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, private]}
+        report = run(self.config, self.qb, self.apis)[0]
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "conflicting_grab_source_order")
+
+    def test_final_capture_holds_grabs_with_conflicting_source_order(self):
+        capture = production.capture_context
+        history_since = production.history_since
+        private = self.conflicting_grab_order()
+        for route in ("/api/v3/history", "/api/v3/history/since"):
+            with self.subTest(route=route):
+                calls = 0
+                self.s.routes["/api/v3/history"] = {"totalRecords": 1, "records": [self.grab]}
+
+                def capture_final(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2 and route == "/api/v3/history":
+                        self.s.routes[route] = {"totalRecords": 2, "records": [self.grab, private]}
+                    return capture(*args, **kwargs)
+
+                def baseline(*args, **kwargs):
+                    rows = history_since(*args, **kwargs)
+                    return [*rows, private] if calls == 2 and route.endswith("/since") else rows
+
+                with tempfile.TemporaryDirectory() as folder, closing(Journal(
+                        Path(folder) / "actions.sqlite3", allow_single_test=True)) as journal, patch(
+                        "production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                        "production.capture_context", side_effect=capture_final), patch(
+                        "production.history_since", side_effect=baseline), patch(
+                        "production._send_queue_delete") as sender:
+                    report = run(self.config, self.qb, self.apis)[0]
+                    approval = dict(self.approval, ownership_fingerprint=report["ownership_fingerprint"])
+                    row = production.execute_single_test(self.config, self.qb, self.apis,
+                                                         journal, report, approval)
+                    sender.assert_not_called()
+                self.assertEqual(calls, 2)
+                self.assertEqual(row["stage"], "dispatch_blocked")
+                self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
 
     def test_final_history_read_blocks_newer_private_grab_before_delete(self):
         capture = production.capture_context

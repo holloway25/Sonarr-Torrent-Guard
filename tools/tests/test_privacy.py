@@ -13,10 +13,11 @@ CHECKER = Path(__file__).resolve().parents[1] / "privacy_check.py"
 # Repository-only tooling is exercised by source CI; the runtime image has no Git.
 @unittest.skipUnless(shutil.which("git"), "Repository privacy CLI requires Git")
 class PrivacyFilenameTests(unittest.TestCase):
-    def test_private_configuration_families_in_staged_and_tracked_files(self):
+    def test_private_runtime_files_in_staged_and_tracked_checks(self):
         names = (".env", ".env.production", ".ENV.production", "connections.json",
                  "connections.production.json", "connections-local.json",
-                 "nested/connections.production.json")
+                 "nested/connections.production.json", ".connections-validation.json",
+                 "nested/.guard-sample", "nested/routine.log.1")
         for name in names:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)

@@ -368,6 +368,34 @@ class WorkflowTests(unittest.TestCase):
                 self.s.routes["/api/v3/queue"]["records"].reverse()
             self.assertEqual(assessed, [self.h, other, self.h, other])
 
+    def test_deadline_preserves_cursor_for_the_next_unfinished_torrent(self):
+        hashes = [letter * 40 for letter in "abc"]
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 3, "records": [
+            dict(self.row, id=i, downloadId=h) for i, h in enumerate(hashes, start=1)]}
+        self.s.routes["/api/v3/history"] = {"totalRecords": 3, "records": [
+            dict(self.grab, id=i, downloadId=h) for i, h in enumerate(hashes, start=1)]}
+        self.qb.routes["/api/v2/torrents/info"] = [dict(self.t, hash=h) for h in hashes]
+        call = self.qb.call
+        files_requests = []
+        state = {}
+
+        def expire_on_second_file_request(route, params=None):
+            if route.endswith("/files"):
+                files_requests.append(params["hash"])
+                if len(files_requests) > 1:
+                    raise GuardError("run_time_limit_reached")
+            return call(route, params)
+
+        with patch.object(self.qb, "call", side_effect=expire_on_second_file_request):
+            for finished, interrupted in zip(hashes, hashes[1:] + hashes[:1]):
+                files_requests.clear()
+                result = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+                self.assertEqual([r["hash"] for r in result if r["decision"] == "would_fail"], [finished])
+                self.assertEqual([r["hash"] for r in result if r.get("reason") == "run_time_limit_reached"],
+                                 [interrupted])
+                self.assertEqual(files_requests, [finished, interrupted])
+                self.assertEqual(state["after"], ["HD", finished])
+
     def test_rotation_across_instances(self):
         other = "b" * 40
         uhd = copy.deepcopy(self.s)

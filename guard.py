@@ -420,7 +420,7 @@ def latest_history_grabs(api, hashes, identities, max_pages, added):
 
 def select_latest_grabs(history, hashes, identities, require_all=True):
     aliases = set(hashes)
-    latest = {}
+    matches = collections.defaultdict(list)
     has_matching_hash = False
     for grab in history:
         identity = (grab.get("seriesId"), grab.get("episodeId"))
@@ -438,13 +438,27 @@ def select_latest_grabs(history, hashes, identities, require_all=True):
         has_matching_hash = True
         if not valid_identity:
             raise GuardError("unknown_content_identity")
-        if identity in identities and (identity not in latest or grab["id"] > latest[identity]["id"]):
-            latest[identity] = grab
+        if identity in identities:
+            matches[identity].append(grab)
     if require_all and not has_matching_hash:
         raise GuardError("no_sonarr_grab_history")
-    if require_all and latest.keys() != identities:
+    if require_all and matches.keys() != identities:
         raise GuardError("content_identity_not_in_grab_history")
-    return list(latest.values())
+    latest = []
+    for grabs in matches.values():
+        newest_id = max(grabs, key=lambda grab: grab["id"])
+        newest_id_stamp = grab_timestamp(newest_id)
+        source = grab_source(newest_id)
+        if any(grab_timestamp(grab) > newest_id_stamp and grab_source(grab) != source
+               for grab in grabs):
+            raise GuardError("conflicting_grab_source_order")
+        latest.append(newest_id)
+    return latest
+
+
+def grab_source(grab):
+    data = grab.get("data")
+    return (data.get("indexer"), data.get("downloadClientName")) if isinstance(data, dict) else (None, None)
 
 
 def unique_client_name(client, clients):
@@ -489,6 +503,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     maximum = config.get("max_torrents_per_run", 100)
     max_pages = config.get("max_pages", 20)
     minimum_age = config.get("minimum_age_seconds", 120)
+    deadlines = (getattr(api, "deadline", None) for api in (qb, *sonarr_apis.values()))
+    deadline = min((stamp for stamp in deadlines if stamp is not None), default=float("inf"))
     reports, queues, clients = [], {}, {}
     torrents = qb.call("/api/v2/torrents/info")
     if not isinstance(torrents, list) or any(not isinstance(t, dict) for t in torrents):
@@ -572,6 +588,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             continue
         api, instance = sonarr_apis[label], config["sonarr"][label]
         try:
+            if time.monotonic() >= deadline:
+                raise GuardError("run_time_limit_reached")
             added = t.get("added_on")
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
@@ -659,12 +677,17 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     "obtain_targeted_replacement_after_retry_settings_verified",
                 ]
                 if reasons == ["metadata_timeout"]:
+                    report["queue_rows"] = sorted([r["id"], r["episodeId"], h] for r in rows)
                     report["proposed_actions"] = [
                         "remove_torrent_and_data_through_sonarr_without_blocklisting",
                         "request_owning_sonarr_episode_search_after_confirmed_removal_and_final_checks",
                     ]
                 report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
         except GuardError as e:
+            if str(e) == "run_time_limit_reached" or time.monotonic() >= deadline:
+                reports.append({"instance": label, "hash": h, "dry_run": True,
+                                "decision": "skip", "reason": "run_time_limit_reached"})
+                break
             report.update(decision="skip", reason=str(e))
         if batch_state is not None:
             batch_state["after"] = [label, h]

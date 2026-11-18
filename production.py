@@ -16,9 +16,10 @@ import time
 import urllib.parse
 import urllib.request
 
-from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, hard_deadline, history_event_type,
-                   integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, select_latest_grabs, torrent_hash, unique_client_name, verify_client_binding)
+from guard import (Api, GuardError, bulk_hashes, endpoint_key, grab_indexer, grab_timestamp,
+                   hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
+                   records, recheck_candidate, run, select_latest_grabs, torrent_hash,
+                   unique_client_name, verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, reconcile, valid_digest)
 from maintenance import require_connectivity
@@ -42,7 +43,7 @@ def digest(value):
 
 
 def validate_context(value):
-    optional = {"routine_grant_digest", "metadata_retry", "hash_aliases"}
+    optional = {"routine_grant_digest", "metadata_retry", "hash_aliases", "queue_rows"}
     if (not isinstance(value, dict) or not set(value) <= CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | optional
             or set(value) - optional not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS)
             or (set(value) & optional and not ATTEMPT_CONTEXT_FIELDS <= set(value))):
@@ -69,6 +70,20 @@ def validate_context(value):
                 raise ValueError()
         if not value["episode_ids"]:
             raise ValueError()
+        if "queue_rows" in value:
+            rows = value["queue_rows"]
+            aliases = value.get("hash_aliases", [value["hash"]])
+            if not isinstance(rows, list) or not 1 <= len(rows) <= 10000:
+                raise ValueError()
+            if any(not isinstance(row, list) or len(row) != 3
+                   or not integer(row[0]) or row[0] <= 0
+                   or not integer(row[1]) or row[1] not in value["episode_ids"]
+                   or row[2] not in aliases for row in rows):
+                raise ValueError()
+            if (len({row[0] for row in rows}) != len(rows)
+                    or {row[1] for row in rows} != set(value["episode_ids"])
+                    or min(row[0] for row in rows) != value["queue_id"]):
+                raise ValueError()
         for field in ("binding_digest", "client_name_digest", "release_title_digest", "approval_digest"):
             if not valid_digest(value[field]):
                 raise ValueError()
@@ -225,7 +240,6 @@ def capture_context(config, api, report, approval_digest, now=None):
     approved_ids = {(grab["seriesId"], grab["episodeId"]): grab["id"] for grab in grabs}
     # Recent history is a second read. Do not hide evidence that arrived
     # between the targeted lookup and this baseline behind a baseline ID.
-    oldest_approved_id = min(approved_ids.values())
     try:
         for row in baseline_history:
             approved = approved_by_id.get(row["id"])
@@ -236,10 +250,11 @@ def capture_context(config, api, report, approval_digest, now=None):
                     or any(not integer(row.get(key)) or row[key] != approved[key]
                            for key in ("seriesId", "episodeId"))
                     or grab_indexer(row, client["name"]) != report["indexer"]
+                    or grab_timestamp(row) != grab_timestamp(approved)
                     or row.get("sourceTitle") != approved["sourceTitle"]):
                 raise SafetyError("identity_or_manifest_changed")
         recent_grabs = select_latest_grabs(
-            (row for row in baseline_history if row["id"] >= oldest_approved_id),
+            [*grabs, *(row for row in baseline_history if row["id"] not in approved_by_id)],
             aliases, identities, require_all=False)
         for grab in recent_grabs:
             approved_id = approved_ids[(grab["seriesId"], grab["episodeId"])]
@@ -258,6 +273,8 @@ def capture_context(config, api, report, approval_digest, now=None):
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
+    if metadata_policy(report) is not None:
+        context["queue_rows"] = report["queue_rows"]
     if "hash_aliases" in report:
         context["hash_aliases"] = aliases
     return validate_context(context)
@@ -482,7 +499,9 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         torrents = qb.call("/api/v2/torrents/info")
         if observed_torrent(torrents, c) is not None:
             raise SafetyError("target_reappeared")
-        queue = records(apis[c["instance"]], "/api/v3/queue", {}, config.get("max_pages", 20))
+        queue = records(apis[c["instance"]], "/api/v3/queue",
+                        {"includeUnknownSeriesItems": "true"}, config.get("max_pages", 20))
+        original_rows = {tuple(row) for row in c.get("queue_rows", ())}
         for queued in queue:
             if not integer(queued.get("seriesId")) or queued["seriesId"] <= 0:
                 raise SafetyError("replacement_queue_identity_invalid")
@@ -492,7 +511,13 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
                 continue
             if not integer(queued.get("episodeId")) or queued["episodeId"] <= 0:
                 raise SafetyError("replacement_queue_identity_invalid")
-            if queued["episodeId"] in c["episode_ids"] and queued["id"] != c["queue_id"]:
+            if queued["episodeId"] not in c["episode_ids"]:
+                continue
+            try:
+                queued_hash = torrent_hash(queued.get("downloadId"))
+            except GuardError:
+                raise SafetyError("replacement_already_queued") from None
+            if (queued["id"], queued["episodeId"], queued_hash) not in original_rows:
                 raise SafetyError("replacement_already_queued")
         # Queue visibility can lag a successful grab. Refresh history AFTER the
         # search-intent commit too; any affected episode already grabbed makes

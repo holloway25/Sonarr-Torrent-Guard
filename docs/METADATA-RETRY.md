@@ -57,8 +57,9 @@ If a new replacement grab has already been positively observed, mark
 `retry_superseded` and do not search again. Otherwise durably record
 `retry_search_recorded` BEFORE the second request. After this commit, repeat
 Sonarr-side connectivity, reviewed version and endpoint checks; reject a
-reappearing original hash or newly queued affected episode. A stale original
-queue row alone is ignored only while qBittorrent confirms that hash is absent.
+reappearing original hash or newly queued affected episode. After qBittorrent
+confirms absence, Guard ignores each stale original row whose queue ID, episode
+ID and normalized download hash match the saved pre-removal evidence.
 Refresh replacement grab history after the intent commit as well: queue
 visibility can lag history. A new post-removal-intent grab for ANY affected
 episode from the bound client (same hash or different hash) suppresses the entire
@@ -82,7 +83,8 @@ numeric types1–7 or their exact API names; missing, malformed, unsupported and
 `Unknown` (0/`unknown`) values block with `replacement_history_event_invalid`.
 Only known non-grab types can be ignored as non-grabs. This also validates event
 types of baseline rows; a baseline is not a waiver for malformed schema.
-Final queue rows first require a positive integer series ID. A positively
+The final queue read explicitly includes items Sonarr could not map to a
+series. Each queue row first requires a positive integer series ID. A positively
 identified different series is excluded without requiring its episode ID:
 Sonarr allows unmapped queue items with null episode IDs. For the target series,
 require a positive integer episode ID before excluding original or unrelated
