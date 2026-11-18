@@ -12,6 +12,10 @@ BASE = "python:3.15-slim-trixie"
 IMAGE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
                "authorization.py", "routine.py", "workflow.py", "reports.py", "retention.py",
                "container_worker.py", "LICENSE")
+BUILD_POLICY_FILES = (".dockerignore", ".github/workflows/container.yml",
+                      ".github/workflows/promote-image.yml", ".github/workflows/release-dependencies.yml",
+                      "tools/dependency_release.py", "tools/release_evidence.py")
+BUILD_INPUTS = (*IMAGE_FILES, "Dockerfile", *BUILD_POLICY_FILES)
 FROM = re.compile(r"\AFROM python:3\.15-slim-trixie@sha256:[a-f0-9]{64}\n")
 OLD_APT = "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata ca-certificates \\\n"
 NEW_APT = ("RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \\\n"
@@ -47,18 +51,22 @@ def code_fingerprint(files):
 
 
 def compare(candidate, baseline):
-    if code_fingerprint({k: v for k, v in candidate.items() if k != "Dockerfile"}) != code_fingerprint(
-            {k: v for k, v in baseline.items() if k != "Dockerfile"}):
+    if set(candidate) != set(BUILD_INPUTS) or set(baseline) != set(BUILD_INPUTS):
+        raise DependencyReviewRequired("image_source_set_changed")
+    if code_fingerprint({name: candidate[name] for name in IMAGE_FILES}) != code_fingerprint(
+            {name: baseline[name] for name in IMAGE_FILES}):
         raise DependencyReviewRequired("application_or_license_change_requires_review")
     if normalized_recipe(candidate["Dockerfile"]) != normalized_recipe(baseline["Dockerfile"], baseline=True):
         raise DependencyReviewRequired("build_recipe_change_requires_review")
+    if any(candidate[name] != baseline[name] for name in BUILD_POLICY_FILES):
+        raise DependencyReviewRequired("build_policy_change_requires_review")
 
 
 def git_inputs(revision):
     if re.fullmatch(r"[a-f0-9]{40}", revision) is None:
         raise ValueError("invalid_revision")
     return {name: subprocess.run(["git", "show", revision + ":" + name], check=True,
-                                 capture_output=True).stdout for name in (*IMAGE_FILES, "Dockerfile")}
+                                 capture_output=True).stdout for name in BUILD_INPUTS}
 
 
 def image_script():
@@ -103,7 +111,7 @@ def main():
     try:
         if args.operation == "compare":
             compare(git_inputs(args.candidate), git_inputs(args.baseline))
-            print("Released application and build recipe unchanged")
+            print("Released application, build recipe and publication policy unchanged")
         elif args.operation == "render":
             if re.fullmatch(r"sha256:[a-f0-9]{64}", args.digest) is None:
                 raise ValueError("invalid_digest")

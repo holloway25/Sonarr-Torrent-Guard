@@ -820,6 +820,23 @@ class ProductionTests(unittest.TestCase):
         self.qb.routes["/api/v2/torrents/info"] = [{}]
         self.assertIsNone(self.observe()["torrent_absent"])
 
+    def test_observe_cli_cannot_reconcile_while_sender_holds_worker_lock(self):
+        import contextlib
+        import fcntl
+        import io
+        import json
+
+        directory = Path(self.folder.name)
+        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
+        with (directory / "guard.lock").open("a") as lock, contextlib.redirect_stderr(io.StringIO()) as error, patch(
+                "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
+                "production.Api") as api, patch("production.Journal") as journal:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(production.main(), 1)
+        self.assertEqual(json.loads(error.getvalue())["error"], "another_run_is_active")
+        api.return_value.login.assert_not_called()
+        journal.assert_not_called()
+
     def test_context_has_no_raw_release_title_endpoint_or_credentials(self):
         text = str(self.context)
         for value in (self.grab["sourceTitle"], "example.invalid", "REPLACE_ME"):

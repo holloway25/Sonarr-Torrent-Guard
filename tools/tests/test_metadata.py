@@ -793,6 +793,93 @@ class MetadataSenderTests(unittest.TestCase):
             {"id": 33, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source",
              "sourceTitle": f.grab["sourceTitle"], "date": stamp}]}
 
+    def test_pre_removal_grab_stays_a_search_veto_after_baseline_refresh(self):
+        f = self.f
+        stamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)).isoformat()
+        grabbed = dict(f.grab, id=33, downloadId="b" * 40, date=stamp)
+
+        def record_grab(*args):
+            f.s.routes["/api/v3/history/since"].append(grabbed)
+
+        def remove(*args, **kwargs):
+            self.removed()
+            f.s.routes["/api/v3/history/since"].remove(grabbed)
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production.wait_for_event_boundary", side_effect=record_grab), patch(
+                "production._send_queue_delete", side_effect=remove) as delete, patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertIn(grabbed["id"], row["context"]["baseline_history_ids"])
+        self.assertIs(row["current_observation"]["replacement_observed"], False)
+        self.assertEqual(row["context"].get("metadata_search_hold"), "replacement_already_grabbed")
+        self.assertEqual(row["stage"], "retry_search_blocked")
+        self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
+        delete.assert_called_once()
+        search.assert_not_called()
+
+    def test_pre_removal_blocklist_is_preserved_as_a_search_veto(self):
+        self.assess_season_pack()
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production.wait_for_event_boundary", side_effect=lambda *_: self.blocklist_one_episode()), patch(
+                "production._send_queue_delete", side_effect=self.removed) as delete, patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertIs(row["current_observation"]["blocklisted"], False)
+        self.assertIn(33, row["context"]["baseline_blocklist_ids"])
+        self.assertEqual(row["stop_reason"], "replacement_blocklisted")
+        delete.assert_called_once()
+        search.assert_not_called()
+
+    def test_missing_blocklist_identity_holds_final_search(self):
+        import copy
+
+        f = self.f
+        sonarr, downloader = copy.deepcopy(f.s.routes), copy.deepcopy(f.qb.routes)
+        for field, mismatch_field in (("indexer", "sourceTitle"), ("sourceTitle", "indexer")):
+            for mismatch in (False, True):
+                with self.subTest(field=field, mismatch=mismatch):
+                    f.s.routes, f.qb.routes = copy.deepcopy(sonarr), copy.deepcopy(downloader)
+                    self.assert_incomplete_blocklist_result(field, mismatch_field if mismatch else None)
+
+    def assert_incomplete_blocklist_result(self, field, mismatch_field):
+        import tempfile
+        from pathlib import Path
+        from contextlib import closing
+
+        f = self.f
+        self.assess_season_pack()
+        self.f.s.routes["/api/v3/blocklist"] = {"totalRecords": 0, "records": []}
+        with tempfile.TemporaryDirectory() as folder, closing(
+                Journal(Path(folder) / "actions.sqlite3", allow_public_attempt=True)) as journal:
+            transition = journal.transition
+
+            def inject(*args, **kwargs):
+                row = transition(*args, **kwargs)
+                if args[2] == "retry_search_recorded":
+                    self.blocklist_one_episode()
+                    record = f.s.routes["/api/v3/blocklist"]["records"][0]
+                    del record[field]
+                    if mismatch_field:
+                        record[mismatch_field] = "Known different"
+                return row
+
+            with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+                    journal, "transition", side_effect=inject), patch(
+                    "production._send_queue_delete", side_effect=self.removed), patch(
+                    "production._send_episode_search", return_value=41) as search:
+                row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+            if mismatch_field:
+                self.assertEqual(row["stage"], "retry_requested")
+                search.assert_called_once()
+            else:
+                self.assertEqual(row["stage"], "retry_search_blocked")
+                self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
+                search.assert_not_called()
+                observation = production.OutcomeVerifier(
+                    f.config, f.qb, f.apis, row["context"], row["dispatched_at"]).observe()
+                self.assertIsNone(observation["blocklisted"])
+
     def test_metadata_partial_pack_blocklist_stops_retry(self):
         self.assess_season_pack()
 

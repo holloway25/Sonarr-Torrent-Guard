@@ -16,7 +16,7 @@ from tools import dependency_release as policy
 class DependencyReleaseTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parents[2]
-        self.inputs = {name: (self.root / name).read_bytes() for name in (*policy.IMAGE_FILES, "Dockerfile")}
+        self.inputs = {name: (self.root / name).read_bytes() for name in policy.BUILD_INPUTS}
 
     def test_only_base_digest_change_is_automatic(self):
         candidate = dict(self.inputs)
@@ -29,6 +29,16 @@ class DependencyReleaseTests(unittest.TestCase):
             candidate = dict(self.inputs)
             candidate[name] += b"\n# deliberate change\n"
             with self.subTest(name=name), self.assertRaises(policy.DependencyReviewRequired):
+                policy.compare(candidate, self.inputs)
+
+    def test_publication_workflows_and_helpers_cannot_change_automatically(self):
+        paths = (".dockerignore", ".github/workflows/container.yml", ".github/workflows/promote-image.yml",
+                 ".github/workflows/release-dependencies.yml", "tools/dependency_release.py",
+                 "tools/release_evidence.py")
+        for path in paths:
+            candidate = dict(self.inputs, **{path: (self.root / path).read_bytes() + b"\n# deliberate change\n"})
+            with self.subTest(path=path), self.assertRaisesRegex(
+                    policy.DependencyReviewRequired, "build_policy_change_requires_review"):
                 policy.compare(candidate, self.inputs)
 
     def test_added_or_missing_image_inputs_cannot_be_ignored(self):

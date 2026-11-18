@@ -63,12 +63,17 @@ reappearing original hash or newly queued affected episode. After qBittorrent
 confirms absence, Guard ignores each stale original row whose queue ID, episode
 ID and normalized download hash match the saved pre-removal evidence. Just
 before dispatch, read the blocklist again. A new matching entry for any affected
-episode or uncertain blocklist evidence blocks the search.
-Refresh replacement grab history after the intent commit as well: queue
+episode or uncertain blocklist evidence blocks the search. A missing indexer
+or release title leaves an otherwise relevant blocklist entry uncertain.
+Guard also retains any search veto seen after removal intent and before sending
+the removal, including a new grab or matching blocklist entry. Those rows stay
+in the outcome baseline and cannot establish a result of the removal.
+Refresh replacement grab history after the search-intent commit as well: queue
 visibility can lag history. A new post-removal-intent grab for ANY affected
 episode from the bound client (same hash or different hash) suppresses the entire
-extra search with `replacement_already_grabbed`. Baseline/pre-intent/other-client
-grabs do not qualify. Unavailable, malformed or ambiguous relevant history
+extra search with `replacement_already_grabbed`, including a grab in the
+refreshed outcome baseline. Grabs before removal intent or from a known different
+client do not qualify. Unavailable, malformed or ambiguous relevant history
 blocks the search rather than treating missing evidence as no replacement.
 For a new relevant grab, missing/non-object `data`, missing/non-string/blank
 `downloadClientName` blocks with `replacement_client_unknown`. Only a valid

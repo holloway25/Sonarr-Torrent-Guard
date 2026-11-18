@@ -27,7 +27,20 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
 }
 
 
-def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None, *, summary=None):
+def save_dispatch_cursor(state_path, cursor):
+    """Merge into current state under the same lock as assessment and recovery."""
+    with (state_path.parent / "guard.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SafetyError("another_run_is_active") from None
+        state = load_batch_state(state_path)
+        state["dispatch_after"] = cursor
+        save_batch_state(state_path, state)
+
+
+def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None, *,
+          summary=None, on_attempt=None):
     authority.validate(config)
     if proposal is None:
         proposal = public.cycle(config, qb, apis, journal, batch_state, reserve_dispatch=True)
@@ -39,10 +52,22 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
     summary.update(mode="routine", live_authorized=True, status="interrupted", retry_after_seconds=600,
                    grant_expires_at=authority.expires_at, grant_authorization_mode=authority.mode,
                    assessment=proposal["assessment"], recovery=proposal["recovery"], actions=actions)
-    # Snapshot this pass only. Never loop over replacements created by it.
-    for report in proposal["assessment"]:
-        if report.get("safeguards", {}).get("status") != "fresh_attempt_verified":
-            continue
+    # Rotate the verified snapshot independently of the earlier phases.
+    # Record the attempted key before starting work that can consume the cycle.
+    candidates = sorted(((r["instance"], r["hash"]), r) for r in proposal["assessment"]
+                        if r.get("safeguards", {}).get("status") == "fresh_attempt_verified")
+    after = tuple(batch_state.get("dispatch_after", ()))
+    deadlines = [getattr(api, "deadline", None) for api in (qb, *apis.values())]
+    deadline = min((value for value in deadlines if value is not None), default=float("inf"))
+    ordered = [entry for entry in candidates if entry[0] > after] + [
+        entry for entry in candidates if entry[0] <= after]
+    for key, report in ordered:
+        if time.monotonic() >= deadline:
+            raise GuardError("run_time_limit_reached")
+        cursor = list(key)
+        if on_attempt is not None:
+            on_attempt(cursor)
+        batch_state["dispatch_after"] = cursor
         try:
             row = production.execute_routine_attempt(runtime, qb, apis, journal, report, authority)
             actions.append({"instance": report["instance"], "hash": report["hash"],
@@ -110,7 +135,8 @@ def main():
                 text = json.dumps({"event": "routine_action", **action})
                 handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
             with hard_deadline(deadline):
-                cycle(config, qb, apis, journal, authority, state, proposal, log_action, summary=result)
+                cycle(config, qb, apis, journal, authority, state, proposal, log_action, summary=result,
+                      on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor))
         finally:
             journal.close()
     except (SafetyError, GuardError) as error:
@@ -120,7 +146,8 @@ def main():
             "explicit_live_mode_required", "live_execution_disabled",
             "container_live_scope_confirmation_required",
             "routine_log_requires_private_config_directory", "run_time_limit_reached",
-            "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused"}
+            "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused",
+            "another_run_is_active"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

@@ -37,6 +37,10 @@ CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "c
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
                   "window_start", "baseline_history_ids", "baseline_blocklist_ids", "approval_digest"}
 ATTEMPT_CONTEXT_FIELDS = {"attempt_fingerprint", "download_added_on", "grab_ids"}
+METADATA_SEARCH_HOLDS = {"replacement_already_grabbed", "replacement_history_ambiguous",
+                         "replacement_client_unknown", "replacement_history_identity_invalid",
+                         "replacement_history_event_invalid", "replacement_blocklisted",
+                         "replacement_blocklist_uncertain", "dispatch_validation_failed"}
 
 
 def digest(value):
@@ -44,7 +48,7 @@ def digest(value):
 
 
 def validate_context(value):
-    optional = {"routine_grant_digest", "metadata_retry", "hash_aliases", "queue_rows"}
+    optional = {"routine_grant_digest", "metadata_retry", "hash_aliases", "queue_rows", "metadata_search_hold"}
     if (not isinstance(value, dict) or not set(value) <= CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS | optional
             or set(value) - optional not in (CONTEXT_FIELDS, CONTEXT_FIELDS | ATTEMPT_CONTEXT_FIELDS)
             or (set(value) & optional and not ATTEMPT_CONTEXT_FIELDS <= set(value))):
@@ -106,6 +110,9 @@ def validate_context(value):
                     or set(policy) != {"blocklist", "search"}
                     or policy["blocklist"] is not False or policy["search"] != "EpisodeSearch"):
                 raise ValueError()
+        if "metadata_search_hold" in value and (
+                "metadata_retry" not in value or value["metadata_search_hold"] not in METADATA_SEARCH_HOLDS):
+            raise ValueError()
     except (ValueError, TypeError, GuardError):
         raise SafetyError("invalid_operation_context") from None
     return json.loads(json.dumps(value))
@@ -218,7 +225,7 @@ def wait_for_event_boundary(dispatched_at):
     return boundary
 
 
-def capture_context(config, api, report, approval_digest, now=None):
+def capture_context(config, api, report, approval_digest, now=None, *, dispatch=None):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
     if report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True:
@@ -291,8 +298,19 @@ def capture_context(config, api, report, approval_digest, now=None):
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
-    if metadata_policy(report) is not None:
+    policy = metadata_policy(report)
+    if policy is not None:
         context["queue_rows"] = report["queue_rows"]
+        if dispatch is not None:
+            context["metadata_retry"] = policy
+            previous = dispatch["context"]
+            try:
+                check_metadata_blocklist(blocklist, previous, dispatch["dispatched_at"])
+                check_replacement_grabs(baseline_history, previous, dispatch["dispatched_at"])
+            except (GuardError, SafetyError) as error:
+                # Preserve an observed veto even if the later read no longer contains the row.
+                reason = str(error)
+                context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
     if "hash_aliases" in report:
         context["hash_aliases"] = aliases
     return validate_context(context)
@@ -313,16 +331,19 @@ def observed_torrent(qb, context):
     return by_hash.get(canonical), aliases_by_hash.get(canonical, ())
 
 
-def blocklist_observation(api, context, not_before, max_pages, *, any_episode=False):
+def blocklist_observation(rows, context, not_before, *, any_episode=False):
     required = set(context["episode_ids"])
-    rows = records(api, "/api/v3/blocklist", {"seriesIds": context["series_id"]}, max_pages)
     matched, ambiguous = set(), set()
     for row in rows:
         if not integer(row.get("seriesId")) or row["seriesId"] <= 0:
             raise SafetyError("invalid_blocklist_identity")
-        if (row["id"] in context["baseline_blocklist_ids"] or row["seriesId"] != context["series_id"]
-                or row.get("indexer") != context["indexer"]
-                or digest(row.get("sourceTitle")) != context["release_title_digest"]):
+        if row["id"] in context["baseline_blocklist_ids"] or row["seriesId"] != context["series_id"]:
+            continue
+        indexer, title = row.get("indexer"), row.get("sourceTitle")
+        indexer_known = isinstance(indexer, str) and bool(indexer.strip())
+        title_known = isinstance(title, str) and bool(title.strip())
+        if (indexer_known and indexer != context["indexer"]
+                or title_known and digest(title) != context["release_title_digest"]):
             continue
         after = event_after(row, not_before)
         if after is False:
@@ -330,7 +351,8 @@ def blocklist_observation(api, context, not_before, max_pages, *, any_episode=Fa
         ids = row.get("episodeIds")
         if not isinstance(ids, list) or any(not integer(i) or i <= 0 for i in ids):
             raise SafetyError("invalid_blocklist_identity")
-        (matched if after else ambiguous).update(required.intersection(ids))
+        definite = after is True and indexer_known and title_known
+        (matched if definite else ambiguous).update(required.intersection(ids))
     if matched == required or (any_episode and matched):
         return True
     return None if ambiguous - matched else False
@@ -418,9 +440,9 @@ class OutcomeVerifier:
         except Exception:
             pass
         try:
+            rows = records(api, "/api/v3/blocklist", {"seriesIds": c["series_id"]}, self.config.get("max_pages", 20))
             result["blocklisted"] = blocklist_observation(
-                api, c, self.not_before, self.config.get("max_pages", 20),
-                any_episode=c.get("metadata_retry", {}).get("blocklist") is False)
+                rows, c, self.not_before, any_episode=c.get("metadata_retry", {}).get("blocklist") is False)
         except Exception:
             pass
         return result
@@ -518,6 +540,39 @@ def metadata_history_type(event):
         raise SafetyError("replacement_history_event_invalid") from None
 
 
+def check_replacement_grabs(events, context, not_before):
+    for event in events:
+        if metadata_history_type(event) != "grabbed":
+            continue
+        # A late grab can belong to the refreshed outcome baseline. Its
+        # presence can still make a new search redundant.
+        if event["id"] in context["baseline_history_ids"] and event_after(event, not_before) is False:
+            continue
+        if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
+            raise SafetyError("replacement_history_identity_invalid")
+        if event["seriesId"] != context["series_id"] or event["episodeId"] not in context["episode_ids"]:
+            continue
+        after = event_after(event, not_before)
+        if after is None:
+            raise SafetyError("replacement_history_ambiguous")
+        if after is False:
+            continue
+        data = event.get("data")
+        name = data.get("downloadClientName") if isinstance(data, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise SafetyError("replacement_client_unknown")
+        if digest(name) != context["client_name_digest"]:
+            continue
+        torrent_hash(event.get("downloadId"))
+        raise SafetyError("replacement_already_grabbed")
+
+
+def check_metadata_blocklist(rows, context, not_before):
+    blocklisted = blocklist_observation(rows, context, not_before, any_episode=True)
+    if blocklisted is not False:
+        raise SafetyError("replacement_blocklisted" if blocklisted else "replacement_blocklist_uncertain")
+
+
 def finish_metadata_retry(config, qb, apis, journal, row, validate):
     """Only the original coordinator can request a search; recovery stays read-only."""
     if row["stage"] != "retry_removed":
@@ -527,6 +582,8 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
     row = journal.transition(row["key"], "retry_removed", "retry_search_recorded")
     c = row["context"]
     try:
+        if "metadata_search_hold" in c:
+            raise SafetyError(c["metadata_search_hold"])
         require_connectivity(config, apis[c["instance"]], c["instance"])
         # The first absence observation is insufficient if another actor has
         # re-added the hash or queued a replacement while intent was committed.
@@ -561,41 +618,16 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         client = bound_client(config, apis[c["instance"]], c["instance"])
         if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
             raise SafetyError("identity_or_manifest_changed")
-        for event in events:
-            event_type = metadata_history_type(event)
-            if event["id"] in c["baseline_history_ids"] or event_type != "grabbed":
-                continue
-            # Unknown content identity cannot establish that a new grab is
-            # unrelated. Reject bools, coercible strings/floats and nonpositive IDs.
-            if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
-                raise SafetyError("replacement_history_identity_invalid")
-            if event["seriesId"] != c["series_id"] or event["episodeId"] not in c["episode_ids"]:
-                continue
-            after = event_after(event, row["dispatched_at"])
-            if after is None:
-                raise SafetyError("replacement_history_ambiguous")
-            if after is False:
-                continue
-            data = event.get("data")
-            client_name = data.get("downloadClientName") if isinstance(data, dict) else None
-            if not isinstance(client_name, str) or not client_name.strip():
-                raise SafetyError("replacement_client_unknown")
-            # Only a positively named different client may be excluded. Missing
-            # identity is uncertainty, not evidence of no replacement.
-            if digest(client_name) != c["client_name_digest"]:
-                continue
-            torrent_hash(event.get("downloadId"))
-            raise SafetyError("replacement_already_grabbed")
+        check_replacement_grabs(events, c, row["dispatched_at"])
         status = apis[c["instance"]].call("/api/v3/system/status")
         if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
             raise SafetyError("unreviewed_sonarr_version")
         if (binding_digest(config, c["instance"]) != c["binding_digest"] or
                 endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
             raise SafetyError("identity_or_manifest_changed")
-        blocklisted = blocklist_observation(
-            apis[c["instance"]], c, row["dispatched_at"], config.get("max_pages", 20), any_episode=True)
-        if blocklisted is not False:
-            raise SafetyError("replacement_blocklisted" if blocklisted else "replacement_blocklist_uncertain")
+        blocks = records(apis[c["instance"]], "/api/v3/blocklist", {"seriesIds": c["series_id"]},
+                         config.get("max_pages", 20))
+        check_metadata_blocklist(blocks, c, row["dispatched_at"])
         validate()
         if METADATA_RETRY_RELEASE_ENABLED is not True:
             raise SafetyError("live_execution_disabled")
@@ -753,10 +785,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             check_fresh(report, final_snapshot)
             validate()
             refreshed_context = capture_context(config, apis[report["instance"]],
-                final_snapshot["assessment"], digest(approval["nonce"]))
-            refreshed_policy = metadata_policy(final_snapshot["assessment"])
-            if refreshed_policy is not None:
-                refreshed_context["metadata_retry"] = refreshed_policy
+                final_snapshot["assessment"], digest(approval["nonce"]),
+                **({"dispatch": row} if policy is not None else {}))
             if authority is not None:
                 refreshed_context["routine_grant_digest"] = authority.identifier
             row = journal.refresh_baselines(row["key"], refreshed_context)
@@ -804,28 +834,34 @@ def main():
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {k: Api(v, deadline=deadline) for k, v in config["sonarr"].items()}
-        qb.login()
         selection = args.preflight or args.observe
         target = (selection[0], torrent_hash(selection[1]))
         if target[0] not in apis:
             raise SafetyError("unknown_sonarr_instance")
         if args.observe:
-            journal = Journal(args.config.parent / "action-journal.sqlite3")
-            try:
-                key = digest(["single_test", target[0], target[1]])
-                row = journal.get(key)
-                if row is None:
-                    raise SafetyError("no_recorded_single_test")
-                verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
-                row = reconcile(journal, key, verifier.observe)
-                print(json.dumps({"live_sender_enabled": False, "instance": target[0], "hash": target[1],
-                                  "stage": row["stage"], "confirmed": row["confirmed"],
-                                  "stop_reason": row["stop_reason"],
-                                  "observation": row["observation"], "current_observation": row["current_observation"],
-                                  "observation_available": row["observation_available"]}))
-                return 0
-            finally:
-                journal.close()
+            with (args.config.parent / "guard.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise SafetyError("another_run_is_active") from None
+                qb.login()
+                journal = Journal(args.config.parent / "action-journal.sqlite3")
+                try:
+                    key = digest(["single_test", target[0], target[1]])
+                    row = journal.get(key)
+                    if row is None:
+                        raise SafetyError("no_recorded_single_test")
+                    verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
+                    row = reconcile(journal, key, verifier.observe)
+                    print(json.dumps({"live_sender_enabled": False, "instance": target[0], "hash": target[1],
+                                      "stage": row["stage"], "confirmed": row["confirmed"],
+                                      "stop_reason": row["stop_reason"],
+                                      "observation": row["observation"], "current_observation": row["current_observation"],
+                                      "observation_available": row["observation_available"]}))
+                    return 0
+                finally:
+                    journal.close()
+        qb.login()
         with hard_deadline(deadline):
             reports = run(config, qb, apis, target=target)
             if len(reports) != 1:

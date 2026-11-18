@@ -47,6 +47,28 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(path.read_text()), config)
 
+    def test_file_check_rejects_blank_labels_and_invalid_credential_shapes(self):
+        import copy
+
+        path = worker.configure(self.env)
+        valid = json.loads(path.read_bytes())
+        for field, value in (("label", ""), ("label", "  "), ("api_key", ["placeholder"]),
+                             ("api_key", " "), ("username", {"name": "placeholder"}), ("password", True)):
+            with self.subTest(field=field, value=value):
+                invalid = copy.deepcopy(valid)
+                if field == "label":
+                    invalid["sonarr"][value] = invalid["sonarr"].pop("Sonarr-HD")
+                elif field == "api_key":
+                    invalid["sonarr"]["Sonarr-HD"][field] = value
+                else:
+                    invalid["qbittorrent"][field] = value
+                worker.atomic_json(path, invalid)
+                before = path.read_bytes()
+                result, cycle, _ = self.run_mode({"STGUARD_CONFIG_SOURCE": "file"}, "--check-config")
+                self.assertEqual(result, 1)
+                cycle.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+
     def test_invalid_env_does_not_replace_existing_configuration(self):
         path = worker.configure(self.env)
         before = path.read_bytes()

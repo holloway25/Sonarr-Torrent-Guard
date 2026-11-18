@@ -140,7 +140,9 @@ and its backup paths must be separate from the configuration, grant, journal
 and other reserved state files. The worker also prints a
 sanitized summary for the service journal. If the shared three-minute deadline
 or a handled error interrupts the live pass, the summary says `interrupted`
-and includes the actions already reported.
+and includes the actions already reported. The worker saves a separate live
+dispatch cursor before each attempt, so an interruption gives the next
+verified candidate first turn on a later cycle.
 Waiting, grant expiry/code mismatch and held results are visible; no credentials,
 raw endpoints or file paths are logged. No application file deletion is added.
 

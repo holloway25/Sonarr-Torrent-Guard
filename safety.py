@@ -418,7 +418,7 @@ class Journal:
         """
         from production import validate_context
         refreshed = validate_context(refreshed)
-        mutable = {"baseline_history_ids", "baseline_blocklist_ids", "window_start"}
+        mutable = {"baseline_history_ids", "baseline_blocklist_ids", "window_start", "metadata_search_hold"}
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.get(key)
@@ -433,6 +433,8 @@ class Journal:
             merged = dict(previous)
             for field in ("baseline_history_ids", "baseline_blocklist_ids"):
                 merged[field] = sorted(set(previous[field]) | set(refreshed[field]))
+            if "metadata_search_hold" in refreshed:
+                merged.setdefault("metadata_search_hold", refreshed["metadata_search_hold"])
             merged = validate_context(merged)
             self.db.execute("UPDATE actions SET context=?,updated=? WHERE key=? AND stage='dispatch_recorded'",
                             (json.dumps(merged), time.time(), key))

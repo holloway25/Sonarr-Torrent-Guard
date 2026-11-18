@@ -104,11 +104,12 @@ step; application/API credentials are never involved.
 PRs are not automatically merged. After a successful published maintenance build
 on `main`, **Release tested dependency refresh** runs automatically. It verifies
 publication evidence, then compares all copied application files and the licence
-against the currently released image's source. It also compares complete Docker
-build instructions, ignoring only the compatible base digest. Changes to guard
-code, startup settings, permissions, COPY inputs, licence, Python family or distro
-are held for manual review. It additionally hashes all application/licence files
-inside both actual images before retagging anything.
+against the currently released image's source. It compares the Dockerfile,
+allowing a compatible base digest refresh, and checks the Docker build context
+rules, publication and promotion workflows, and their release helpers.
+Changes to these rules or to application files, startup settings, permissions,
+licence, Python family or distro require manual review. Before retagging,
+the workflow hashes all application and licence files inside both actual images.
 
 One narrow bootstrap is authorized: the pre-maintenance released Dockerfile may
 lack the package-upgrade step; adding that exact step is allowed while everything

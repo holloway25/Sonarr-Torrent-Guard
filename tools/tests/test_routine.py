@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from authorization import (CONTAINER_SCOPE_FILE, ContainerAuthorization, RoutineAuthorization,
                            code_digest, container_scope_record, scope_digest, RULE, MAX_TRIAL_SECONDS)
-from guard import run
+from guard import load_batch_state, run
 import production
 import routine
 from safety import SafetyError
@@ -120,6 +120,48 @@ class RoutineTests(unittest.TestCase):
             self.assertEqual({path: path.read_bytes() for path in before}, before)
             if log_path not in before:
                 self.assertFalse(log_path.exists())
+
+    def test_live_dispatch_rotates_across_cli_restarts_after_a_timeout(self):
+        import contextlib
+        import io
+
+        f = self.f
+        directory = Path(f.folder.name)
+        state_path = directory / "batch-state.json"
+        args = ["routine.py", "--live", "--config", str(directory / "connections.json"),
+                "--authorization", str(directory / "routine-authorization.json"),
+                "--log-file", str(directory / "routine.log")]
+        verified = dict(f.report, safeguards={"status": "fresh_attempt_verified"})
+        other = dict(verified, hash="b" * 40)
+        tried = []
+
+        def attempt(config, qb, apis, journal, report, authority):
+            tried.append(report["hash"])
+            self.assertEqual(load_batch_state(state_path)["dispatch_after"], ["HD", report["hash"]])
+            if report["hash"] == f.hash:
+                raise production.GuardError("run_time_limit_reached")
+            return {"key": "key", "stage": "cleanup_resolved", "confirmed": {},
+                    "current_observation": {}, "stop_reason": None, "context": {}, "search_command_id": None}
+
+        def assess(config, qb, apis, journal, state, **kwargs):
+            state["after"] = ["HD", other["hash"]]
+            return {"assessment": [verified, other], "recovery": []}
+
+        for number in range(3):
+            tried.clear()
+            with contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.argv", args), patch(
+                    "routine.load_config", return_value=f.config), patch(
+                    "routine.RoutineAuthorization.load", return_value=self.authority), patch(
+                    "routine.Api", side_effect=[f.qb, f.s]), patch(
+                    "routine.public.cycle", side_effect=assess), patch(
+                    "production.execute_routine_attempt", side_effect=attempt):
+                self.assertEqual(routine.main(), 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["status"], "interrupted")
+            self.assertEqual(tried, [f.hash] if number == 0 else [other["hash"], f.hash])
+            self.assertEqual([row["hash"] for row in result["actions"]], [] if number == 0 else [other["hash"]])
+            self.assertEqual(load_batch_state(state_path), {
+                "after": ["HD", other["hash"]], "dispatch_after": ["HD", f.hash]})
 
     def test_assessment_cursor_is_accessed_only_under_the_lock(self):
         import contextlib

@@ -146,14 +146,14 @@ def load_batch_state(path):
         if not path.exists():
             return {}
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "verification_after", "recovery_after"}:
+        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "verification_after", "dispatch_after", "recovery_after"}:
             raise ValueError()
-        for key in ("after", "timed_out", "verification_after"):
+        for key in ("after", "timed_out", "verification_after", "dispatch_after"):
             if key not in state:
                 continue
             cursor = state[key]
             if (not isinstance(cursor, list) or len(cursor) != 2
-                    or not isinstance(cursor[0], str) or not cursor[0]):
+                    or not isinstance(cursor[0], str) or not cursor[0].strip()):
                 raise ValueError()
             torrent_hash(cursor[1])
         if "recovery_after" in state:
@@ -784,8 +784,10 @@ def load_config(path):
             if not integer(val) or not 1 <= val <= limit:
                 raise GuardError("invalid_work_limits")
         categories = set()
-        for item in config["sonarr"].values():
-            if not item.get("api_key") or not isinstance(item.get("category"), str) or not item["category"]:
+        for label, item in config["sonarr"].items():
+            if (not label.strip() or not isinstance(item, dict) or
+                    any(not isinstance(item.get(key), str) or not item[key].strip()
+                        for key in ("api_key", "category"))):
                 raise GuardError("invalid_sonarr_configuration")
             if item["category"] in categories:
                 raise GuardError("duplicate_instance_category")
@@ -799,7 +801,9 @@ def load_config(path):
                 raise GuardError("monitored_downloader_binding_mismatch")
         for item in [config["qbittorrent"], *config["sonarr"].values()]:
             endpoint_key(item["url"])
-        if not config["qbittorrent"].get("username") or not config["qbittorrent"].get("password"):
+        qbittorrent = config["qbittorrent"]
+        if any(not isinstance(qbittorrent.get(key), str) or not qbittorrent[key].strip()
+               for key in ("username", "password")):
             raise GuardError("missing_qbittorrent_credentials")
         return config
     except GuardError:
