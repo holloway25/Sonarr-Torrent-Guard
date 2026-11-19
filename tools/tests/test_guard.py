@@ -39,11 +39,19 @@ class FilesTests(unittest.TestCase):
         self.assertEqual(assess_files(files), ["only_txt_nfo_selected"])
 
     def test_blocked_suffixes_require_selection_except_executables_and_screen_savers(self):
-        for suffix in ("lnk", "arj", "zipx", "001", "rar", "gz", "lz", "lzh", "uue", "iso"):
+        for suffix in ("lnk", "rar", "001"):
             with self.subTest(suffix=suffix):
                 extra = "extra." + suffix.upper()
-                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 1))), ["blocked_file_selected"])
-                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 0))), [])
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 1)), ("*." + suffix,)), ["blocked_file_selected"])
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 0)), ("*." + suffix,)), [])
+
+    def test_exclusion_globs_match_names_and_parent_folders(self):
+        patterns = ("extras", "readme-?.[tx][tx][tx]")
+        for path in ("Extras/Subdirectory/file.mkv", "release/README-A.TXT"):
+            with self.subTest(path=path):
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (path, 1)), patterns),
+                                 ["blocked_file_selected"])
+        self.assertEqual(assess_files(manifest(("episode.mkv", 1), ("release/readme-ab.txt", 1)), patterns), [])
 
     def test_invalid_or_partial_manifest_is_not_failure(self):
         invalid = [[], None, {}, [{"name": "payload.exe"}]]
@@ -65,6 +73,8 @@ class FakeApi:
 
     def call(self, route, params=None):
         self.calls.append((route, params))
+        if route == "/api/v2/app/preferences" and route not in self.routes:
+            return {"excluded_file_names_enabled": False}
         if route == "/api/v2/torrents/properties" and route not in self.routes:
             return {"hash": params["hash"], "infohash_v1": params["hash"], "infohash_v2": ""}
         scoped_history = route == "/api/v3/history" and params and "episodeId" in params
@@ -195,12 +205,43 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(report["decision"], "would_fail")
         self.assertTrue(report["dry_run"])
         allowed = {"/api/v2/torrents/info", "/api/v2/torrents/files", "/api/v2/torrents/properties", "/api/v3/queue",
-                   "/api/v3/history", "/api/v3/downloadclient"}
+                   "/api/v3/history", "/api/v3/downloadclient", "/api/v2/app/preferences"}
         self.assertTrue(all(route in allowed for route, _ in self.qb.calls + self.s.calls))
 
     def test_stopped_good_torrent_is_kept(self):
         self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
         self.assertEqual(self.check()["decision"], "keep")
+
+    def test_file_policy_reads_the_current_qbittorrent_exclusions(self):
+        path = "/api/v2/app/preferences"
+        self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("extras.newext", 1))
+        results = [
+            ({"excluded_file_names_enabled": True, "excluded_file_names": "*.ZIP\n*.NEWEXT"},
+             ("would_fail", None, ["blocked_file_selected"])),
+            ({"excluded_file_names_enabled": True, "excluded_file_names": "*.ZIP"},
+             ("keep", None, [])),
+            ({"excluded_file_names_enabled": True, "excluded_file_names": "*.NEWEXT["},
+             ("keep", None, [])),
+            ({"excluded_file_names_enabled": False, "excluded_file_names": "*.NEWEXT"},
+             ("keep", None, [])),
+            ({"excluded_file_names_enabled": "true", "excluded_file_names": "*.NEWEXT"},
+             ("skip", "qbittorrent_file_exclusions_unavailable", None)),
+            (GuardError("api_request_or_response_failed"),
+             ("skip", "qbittorrent_file_exclusions_unavailable", None)),
+        ]
+        for preferences, expected in results:
+            with self.subTest(preferences=preferences):
+                self.qb.routes[path] = preferences
+                self.qb.calls.clear()
+                report = self.check()
+                self.assertEqual((report["decision"], report.get("reason"), report.get("reasons")), expected)
+                self.assertEqual([call for call in self.qb.calls if call[0] == path], [(path, None)])
+        self.qb.routes[path] = {"excluded_file_names_enabled": True, "excluded_file_names": "*[.newext"}
+        self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("extras[.newext", 1))
+        self.assertEqual(self.check()["decision"], "keep")
+        self.qb.routes[path] = GuardError("api_request_or_response_failed")
+        self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("payload.scr", 0))
+        self.assertEqual(self.check()["reasons"], ["contains_scr"])
 
     def test_target_recheck_reads_fresh_manifest_and_identity(self):
         original = self.check()

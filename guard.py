@@ -4,12 +4,14 @@ import argparse
 import collections
 import contextlib
 import datetime
+import fnmatch
 import hashlib
 import http.cookiejar
 import json
 import logging
 import logging.handlers
 import os
+import re
 from pathlib import Path, PurePosixPath
 import signal
 import stat
@@ -247,7 +249,6 @@ FILE_ASSESSMENT_STATES = {
     "downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
     "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP", "forcedDL", "forcedUP",
 }
-BLOCKED_SELECTED_SUFFIXES = {".lnk", ".arj", ".zipx", ".001", ".rar", ".gz", ".lz", ".lzh", ".uue", ".iso"}
 
 
 def manifest_fingerprint(files):
@@ -256,13 +257,46 @@ def manifest_fingerprint(files):
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
 
-def assess_files(files):
+# Use the common Qt and Python glob forms. An invalid Qt character class
+# must not be reinterpreted as a literal filename by Python.
+QBITTORRENT_NAME_GLOB = re.compile(r"""
+    (?:
+        [^\[/\\]                               # Ordinary name character
+        | \[ !? (?: \][^\[\]/\\]* | [^\[\]!^/\\][^\[\]/\\]* ) \]
+        | \[\[\]                               # Literal opening bracket
+    )+
+""", re.VERBOSE)
+
+
+def read_file_exclusions(qb):
+    """Return the current downloader patterns and whether they were available."""
+    try:
+        preferences = qb.call("/api/v2/app/preferences")
+    except GuardError as error:
+        if str(error) == "run_time_limit_reached":
+            raise
+        return (), False
+    if not isinstance(preferences, dict):
+        return (), False
+    enabled = preferences.get("excluded_file_names_enabled")
+    if enabled is False:
+        return (), True
+    names = preferences.get("excluded_file_names")
+    if enabled is not True or not isinstance(names, str) or "\x00" in names or len(names) > 65536:
+        return (), False
+    patterns = tuple(dict.fromkeys(line.lower() for line in names.split("\n")
+                                   if QBITTORRENT_NAME_GLOB.fullmatch(line)))
+    return patterns, True
+
+
+def assess_files(files, excluded_names=()):
     """Return failure reasons only for a structurally valid full manifest."""
     if not isinstance(files, list) or not files:
         raise GuardError("empty_or_invalid_manifest")
     indexes = set()
     selected = []
     dangerous = set()
+    excluded_selected = False
     for item in files:
         if not isinstance(item, dict):
             raise GuardError("invalid_manifest_entry")
@@ -281,10 +315,14 @@ def assess_files(files):
             dangerous.add(suffix)
         if priority:
             selected.append(suffix)
+            if excluded_names and not excluded_selected:
+                names = name.lower().split("/")
+                excluded_selected = any(fnmatch.fnmatchcase(part, pattern)
+                                        for part in names if part for pattern in excluded_names)
     if indexes != set(range(len(files))):
         raise GuardError("incomplete_manifest_indexes")
     reasons = ["contains_" + s[1:] for s in sorted(dangerous)]
-    if BLOCKED_SELECTED_SUFFIXES.intersection(selected):
+    if excluded_selected:
         reasons.append("blocked_file_selected")
     if not selected:
         reasons.append("all_files_unselected")
@@ -705,6 +743,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             except GuardError:
                 pass
     candidates = []
+    exclusions = None
     for label, api in sonarr_apis.items():
         instance = config["sonarr"][label]
         category = instance["category"]
@@ -824,7 +863,12 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("metadata_state_inconsistent")
                 reasons = ["metadata_timeout"]
             else:
-                reasons = assess_files(files)
+                if exclusions is None:
+                    exclusions = read_file_exclusions(qb)
+                patterns, available = exclusions
+                reasons = assess_files(files, patterns)
+                if not reasons and not available:
+                    raise GuardError("qbittorrent_file_exclusions_unavailable")
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
             report.update(public_source_confirmed=True, indexer=source,
                           queue_ids=sorted({r["id"] for r in rows}),

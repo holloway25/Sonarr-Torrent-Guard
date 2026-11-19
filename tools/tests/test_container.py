@@ -243,7 +243,7 @@ class ContainerTests(unittest.TestCase):
         env = dict(self.env, STGUARD_MODE="live")
         config = worker.runtime_config(env)
         scope = worker.container_scope_record(config)
-        worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, dict(scope, rule="public-sonarr-cleanup-v3"))
+        worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, dict(scope, rule="public-sonarr-cleanup-v4"))
         for command in ("--check-config", "--once"):
             result, cycle, error = self.run_mode(env, command)
             self.assertEqual(result, 1)

@@ -16,9 +16,9 @@ import urllib.request
 from authorization import ContainerAuthorization, RoutineAuthorization
 from guard import (Api, FILE_ASSESSMENT_STATES, GuardError, assess_files, classify_source, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
-                   manifest_fingerprint, metadata_still_pending, records, recheck_candidate, run, select_latest_grabs, torrent_hash,
-                   torrent_hash_ownership, torrents_by_hash, unique_client_name, unique_response_keys, verified_hashes,
-                   verify_client_binding)
+                   manifest_fingerprint, metadata_still_pending, read_file_exclusions, records, recheck_candidate,
+                   run, select_latest_grabs, torrent_hash, torrent_hash_ownership, torrents_by_hash,
+                   unique_client_name, unique_response_keys, verified_hashes, verify_client_binding)
 from safety import SafetyError, DISPATCH_STOP_REASONS, check_fresh, evidence, open_lock_file, valid_digest
 from maintenance import require_connectivity
 from workflow import file_policy_removal, manual_handling_reason, read_readiness
@@ -302,7 +302,7 @@ def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
         fresh = {"assessment": current}
         check_fresh(report, fresh)
         check_visible_native_grabs(api, instance, current, config.get("max_pages", 20))
-        require_current_file_failure(qb, current, instance["category"], current["manifest_fingerprint"])
+        require_current_file_failure(qb, current, instance["category"])
         authority.validate(config, current)
         check_fresh(report, fresh)
         _send_queue_delete(api, min(current["queue_ids"]), blocklist=True)
@@ -404,10 +404,13 @@ def require_current_metadata_timeout(qb, context, category):
         raise SafetyError("metadata_timeout_no_longer_confirmed")
 
 
-def require_current_file_failure(qb, context, category, expected_manifest):
+def require_current_file_failure(qb, context, category):
     """Check the target's incarnation and full file policy immediately before removal."""
     target = context["hash"]
     try:
+        patterns, available = (), True
+        if "blocked_file_selected" in context["reasons"]:
+            patterns, available = read_file_exclusions(qb)
         torrents = torrents_by_hash(qb.call("/api/v2/torrents/info", {"hashes": target}))
         if set(torrents) != {target}:
             raise SafetyError("identity_or_manifest_changed")
@@ -418,8 +421,13 @@ def require_current_file_failure(qb, context, category, expected_manifest):
                 or sorted(verified_hashes(qb, torrent)) != context.get("hash_aliases", [target])):
             raise SafetyError("identity_or_manifest_changed")
         files = qb.call("/api/v2/torrents/files", {"hash": target})
-        if not assess_files(files) or manifest_fingerprint(files) != expected_manifest:
+        reasons = assess_files(files, patterns)
+        if manifest_fingerprint(files) != context["manifest_fingerprint"]:
             raise SafetyError("identity_or_manifest_changed")
+        if not reasons:
+            reason = ("qbittorrent_file_exclusion_no_longer_matches" if available
+                      else "qbittorrent_file_exclusions_unavailable")
+            raise SafetyError(reason)
     except GuardError as error:
         if str(error) == "run_time_limit_reached":
             raise

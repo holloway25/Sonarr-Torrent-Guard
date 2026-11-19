@@ -157,8 +157,9 @@ stop the container. A request already sent can still complete.
 
 Fresh appdata records the configured cleanup scope on the first live start.
 Subsequent image updates reuse the approved record while the scope and rule
-match. Upgrading from the v3 cleanup rule to v4 requires one scope confirmation
-because selected blocked file types now qualify for removal. A worker configured
+match. Upgrading to the v5 cleanup rule requires one scope confirmation to use
+qBittorrent’s enabled exclusion patterns. Later edits to the qBittorrent list take
+effect automatically. A worker configured
 as live reports `container_live_scope_confirmation_required` until that confirmation
 is recorded. Use the procedure below to approve the reviewed scope.
 

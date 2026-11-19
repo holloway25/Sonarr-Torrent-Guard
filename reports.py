@@ -11,7 +11,7 @@ REASONS = {
     "metadata_timeout_not_reached": "waiting for metadata; 30-minute timeout not reached",
     "contains_exe": "contains an .exe (selected or unselected)",
     "contains_scr": "contains an .scr (selected or unselected)",
-    "blocked_file_selected": "a blocked file type is selected",
+    "blocked_file_selected": "a selected file matches a qBittorrent exclusion",
     "all_files_unselected": "all files are unselected",
     "only_txt_nfo_selected": "only .txt/.nfo files are selected",
     "private_source_protected": "private source protected",

@@ -36,7 +36,7 @@ exact request, Sonarr's history limits and how to read the result.
 | File list or selection | Result |
 | --- | --- |
 | Any `.exe` or `.scr`, selected or unselected | Fail |
-| A selected `.lnk`, `.arj`, `.zipx`, `.001`, `.rar`, `.gz`, `.lz`, `.lzh`, `.uue` or `.iso` | Fail |
+| A selected file matches an enabled qBittorrent **Excluded file names** pattern | Fail |
 | Every file is unselected | Fail |
 | Only `.txt` or `.nfo` files are selected, regardless of size | Fail |
 | Selected media with unselected shortcut or archive extras | Keep if no failure rule matches |
@@ -46,6 +46,15 @@ Paused or stopped public torrents can still fail a file rule. The state alone
 never causes a failure. Guard leaves incomplete manifests and unknown states
 alone, and the default minimum torrent age is two minutes. Guard uses file names
 and selection for this policy and reads no payload contents.
+
+Maintain the exclusion patterns in qBittorrent under **Settings → Downloads →
+Excluded file names**. Guard reads the enabled list when it checks files and
+re-reads it before removing a torrent based on a match. Patterns such as `*.rar`
+and `sample-*` are case-insensitive and can match a file or a parent folder.
+If the list is disabled or cannot be read, Guard can still act on the independent
+file rules. Keep
+`*.exe` and `*.scr` in the exclusion list if qBittorrent should skip those files
+as well.
 
 ### Metadata timeouts
 
@@ -70,8 +79,8 @@ directory. A media library or download mount is unnecessary.
 Start with the default `STGUARD_MODE=dry-run`. Review the proposed actions
 and private-indexer settings for each Sonarr owner. Set `STGUARD_MODE=live`
 when the reviewed configuration is ready. Existing live installs must confirm
-the v4 cleanup policy once because selected blocked file types now qualify for
-removal. Confirm again only when the approved configuration or rule changes.
+the v5 cleanup policy once to start using qBittorrent as the source of filename
+exclusions. Later edits to that list take effect automatically.
 
 Use the [reviewed release process](docs/DEPENDENCY-MAINTENANCE.md) to approve a
 candidate before it becomes `latest`. A source commit, a published candidate and

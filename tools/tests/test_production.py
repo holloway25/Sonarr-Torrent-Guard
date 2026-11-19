@@ -696,6 +696,8 @@ class FileCleanupTests(unittest.TestCase):
     def test_live_container_uses_the_native_remove_and_blocklist_action_for_each_file_failure(self):
         f = self.f
         torrents = f.qb.routes["/api/v2/torrents/info"]
+        f.qb.routes["/api/v2/app/preferences"] = {
+            "excluded_file_names_enabled": True, "excluded_file_names": "*.rar"}
         cases = [
             (manifest(("episode.mkv", 1), ("PAYLOAD.EXE", 0)), "contains_exe"),
             (manifest(("episode.mkv", 1), ("payload.scr", 0)), "contains_scr"),
@@ -899,6 +901,30 @@ class FileCleanupTests(unittest.TestCase):
         action, = second["actions"]
         self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
         self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
+
+    def test_exclusion_is_read_again_before_sonarr_removal(self):
+        f = self.f
+        path = "/api/v2/app/preferences"
+        f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("extras.newext", 1))
+        check = production.check_visible_native_grabs
+        for final_preferences, reason in (
+                ({"excluded_file_names_enabled": False}, "qbittorrent_file_exclusion_no_longer_matches"),
+                ({"excluded_file_names_enabled": True, "excluded_file_names": []},
+                 "qbittorrent_file_exclusions_unavailable")):
+            with self.subTest(preferences=final_preferences), tempfile.TemporaryDirectory() as folder:
+                f.qb.routes[path] = {"excluded_file_names_enabled": True, "excluded_file_names": "*.newext"}
+
+                def check_then_change(*args):
+                    check(*args)
+                    f.qb.routes[path] = final_preferences
+
+                send = Mock()
+                with patch("production.check_visible_native_grabs", side_effect=check_then_change):
+                    result = self.container_cycle(Path(folder), send)
+                self.assertEqual(result["assessment"][0]["reasons"], ["blocked_file_selected"])
+                action, = result["actions"]
+                self.assertEqual((action["stage"], action["stop_reason"]), ("held", reason))
+                send.assert_not_called()
 
     def test_file_manifest_changes_during_final_sonarr_read_hold_removal(self):
         f = self.f
