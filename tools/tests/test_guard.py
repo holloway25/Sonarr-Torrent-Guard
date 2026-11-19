@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from guard import (Api, GuardError, SameOriginRedirect, PrivateRotatingFileHandler,
-                   assess_files, compile_file_exclusion, load_config, load_batch_state, save_batch_state, records, run,
+                   assess_files, compile_file_exclusion, fold_filename_case, load_config, load_batch_state, save_batch_state, records, run,
                    recheck_candidate)
 from safety import SafetyError
 from reports import human_report, json_events
@@ -66,6 +66,16 @@ class FilesTests(unittest.TestCase):
         match = compile_file_exclusion("[A-z]*.zip")
         self.assertTrue(match.fullmatch("_episode.zip"))
         self.assertTrue(match.fullmatch("Episode.ZIP"))
+
+    def test_case_fold_preserves_wildcards_and_does_not_widen_character_classes(self):
+        plain = compile_file_exclusion("*.zip")
+        for name in ("extras.z\u0130p", "extras.z\u0131p"):
+            self.assertIsNone(plain.fullmatch(fold_filename_case(name)))
+        self.assertIsNotNone(plain.fullmatch(fold_filename_case("\u0131stanbul.ZIP")))
+        # Kelvin sign and long s are genuine case equivalents of ASCII K and S.
+        self.assertIsNotNone(compile_file_exclusion("[KS]*").fullmatch(fold_filename_case("\u212aelvin")))
+        self.assertIsNone(compile_file_exclusion("[^KS]*").fullmatch(fold_filename_case("\u017fample")))
+        self.assertIsNone(compile_file_exclusion("[\u0130-\u0140]*"))
 
     def test_invalid_or_partial_manifest_is_not_failure(self):
         invalid = [[], None, {}, [{"name": "payload.exe"}]]

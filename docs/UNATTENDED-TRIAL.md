@@ -86,8 +86,9 @@ bursts. User-service persistence after reboot requires operator-managed user
 service setup. Review installation paths rather than copying private deployment
 paths into source. Public dry-run units remain separate.
 
-The worker logs each finished/held action immediately and a cycle summary to
-owner-private rotating `routine.log` beside the configuration. The active log
+The worker writes action outcomes and verification holds to owner-private
+rotating `routine.log` beside the configuration. Verification holds carry
+`phase: verification`. The active log
 and its backup paths must be separate from the configuration, grant
 and other reserved state files. The worker also prints a
 sanitized summary for system service logs. If the shared three-minute deadline

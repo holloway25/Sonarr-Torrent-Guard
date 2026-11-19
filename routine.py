@@ -28,6 +28,12 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
 }
 
 
+def loggable_hold_reason(reason):
+    if isinstance(reason, str) and reason in HELD_REASONS:
+        return reason
+    return "maintenance_or_safety_check_unavailable"
+
+
 def save_dispatch_cursor(state_path, cursor):
     """Merge into current state under the same lock as assessment."""
     with open_lock_file(state_path.parent / "guard.lock") as lock:
@@ -53,6 +59,14 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
     summary.update(mode="routine", live_authorized=True, status="interrupted", retry_after_seconds=600,
                    grant_expires_at=authority.expires_at, grant_authorization_mode=authority.mode,
                    assessment=proposal["assessment"], actions=actions)
+    if on_action is not None:
+        for report in proposal["assessment"]:
+            safeguards = report.get("safeguards", {})
+            if safeguards.get("status") == "held":
+                on_action({"instance": report["instance"], "hash": report["hash"],
+                           "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier,
+                           "stage": "held", "phase": "verification",
+                           "stop_reason": loggable_hold_reason(safeguards.get("reason"))})
     # Rotate the verified snapshot independently of the earlier phases.
     # Record the attempted key before starting work that can consume the cycle.
     candidates = sorted(((r["instance"], r["hash"]), r) for r in proposal["assessment"]
@@ -81,7 +95,7 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
             if str(error) == "run_time_limit_reached":
                 raise
             # Only exact known codes may reach logs; exception text can contain secrets.
-            reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
+            reason = loggable_hold_reason(str(error))
             stage = "uncertain" if reason == "delete_request_outcome_uncertain" else "held"
             action.update(stage=stage, stop_reason=reason)
         actions.append(action)

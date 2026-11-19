@@ -274,6 +274,19 @@ QBITTORRENT_GLOB_TOKEN = re.compile(r"""
 """, re.VERBOSE)
 
 
+def fold_filename_case(name):
+    """Use one-character Unicode folds, without locale-specific I equivalences."""
+    if name.isascii():
+        return name
+    folded = []
+    for char in name:
+        simple = char.casefold()
+        if len(simple) != 1:
+            simple = char.lower()
+        folded.append(simple if len(simple) == 1 else char)
+    return "".join(folded)
+
+
 def compile_file_exclusion(pattern):
     if not pattern or "\x00" in pattern:
         return None
@@ -285,8 +298,11 @@ def compile_file_exclusion(pattern):
         offset = token.end()
         members = token["members"]
         if members is None:
-            parts.append(token[0])
+            parts.append(fold_filename_case(token[0]))
             continue
+        # Folding Unicode class endpoints can change the meaning of a range.
+        if not members.isascii():
+            return None
         # Validate the range before fnmatch can discard an invalid one.
         escaped = "".join(char if char == "-" else re.escape(char) for char in members)
         try:
@@ -299,7 +315,8 @@ def compile_file_exclusion(pattern):
     if offset != len(pattern):
         return None
     try:
-        return re.compile(fnmatch.translate("".join(parts)), re.IGNORECASE)
+        # Unicode IGNORECASE treats dotted and dotless I as ASCII I.
+        return re.compile(fnmatch.translate("".join(parts)), re.IGNORECASE | re.ASCII)
     except re.error:
         return None
 
@@ -362,7 +379,7 @@ def assess_files(files, exclusions=()):
         if priority:
             selected.append(PurePosixPath(basename).suffix)
             if exclusions and not excluded_selected:
-                names = name.split("/")
+                names = fold_filename_case(name).split("/")
                 excluded_selected = any(pattern.fullmatch(part)
                                         for part in names if part for pattern in exclusions)
     if indexes != set(range(len(files))):

@@ -51,6 +51,8 @@ Maintain the exclusion patterns in qBittorrent under **Settings â†’ Downloads â†
 Excluded file names**. Guard reads the enabled list when it checks files and
 re-reads it before removing a torrent based on a match. Patterns such as `*.rar`
 and `sample-*` are case-insensitive and can match a file or a parent folder.
+Guard supports ASCII characters in bracket classes. Non-ASCII bracket classes
+are reported as unsupported.
 Guard reports an incomplete list when it encounters an invalid or unsupported
 pattern. The invalid pattern cannot trigger removal. Other valid patterns and
 the independent file rules can still apply. Keep

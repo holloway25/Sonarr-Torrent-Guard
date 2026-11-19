@@ -914,6 +914,50 @@ class FileCleanupTests(unittest.TestCase):
         self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
         self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
 
+    def test_ascii_exclusion_extension_does_not_match_turkish_i_variants(self):
+        f = self.f
+        torrents = f.qb.routes["/api/v2/torrents/info"]
+        f.qb.routes["/api/v2/app/preferences"] = {
+            "excluded_file_names_enabled": True, "excluded_file_names": "*.zip"}
+        for name, matches in (("extras.z\u0131p", False), ("extras.z\u0130p", False),
+                              ("extras.ZIP", True), ("\u0131stanbul.ZIP", True)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as folder:
+                f.qb.routes["/api/v2/torrents/info"] = torrents
+                f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), (name, 1))
+                send = Mock(side_effect=self.sonarr_transport)
+                result = self.container_cycle(Path(folder), send)
+                report, = result["assessment"]
+                self.assertEqual(report["decision"], "would_fail" if matches else "keep")
+                if matches:
+                    send.assert_called_once()
+                else:
+                    self.assertEqual(result["actions"], [])
+                    send.assert_not_called()
+
+    def test_live_verification_hold_is_written_to_routine_log(self):
+        import json
+        import public
+
+        f = self.f
+        recheck = public.recheck_candidate
+
+        def become_healthy(*args):
+            f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
+            return recheck(*args)
+
+        with tempfile.TemporaryDirectory() as folder, patch("public.recheck_candidate", side_effect=become_healthy):
+            folder = Path(folder)
+            send = Mock()
+            result = self.container_cycle(folder, send)
+            entry, = [json.loads(line) for line in (folder / "routine.log").read_text().splitlines()]
+        report, = result["assessment"]
+        self.assertEqual(report["safeguards"]["reason"], "candidate_no_longer_eligible")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["actions"], [])
+        send.assert_not_called()
+        self.assertEqual((entry["hash"], entry["stage"], entry["phase"], entry["stop_reason"]),
+                         (f.hash, "held", "verification", "candidate_no_longer_eligible"))
+
     def test_malformed_exclusions_cannot_remove_healthy_torrents(self):
         f = self.f
         pref_path = "/api/v2/app/preferences"
