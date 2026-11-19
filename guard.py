@@ -772,7 +772,8 @@ def source_for(api, hashes, rows, max_pages, added, client_name):
     grab_time_floor = min(grab_timestamp(grab) for grab in grabs)
     if len(sources) != 1:
         raise GuardError("ambiguous_indexer_identity")
-    return next(iter(sources)), grab_ids, grab_time_floor
+    grab_download_ids = sorted({grab["downloadId"] for grab in grabs})
+    return next(iter(sources)), grab_ids, grab_time_floor, grab_download_ids
 
 
 def metadata_still_pending(torrent):
@@ -898,7 +899,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                 raise GuardError("private_queue_source_protected")
             if len(aliases) > 1:
                 report["hash_aliases"] = aliases
-            source, grab_ids, grab_time_floor = source_for(api, aliases, rows, max_pages, added, client_name)
+            source, grab_ids, grab_time_floor, grab_download_ids = source_for(
+                api, aliases, rows, max_pages, added, client_name)
             classification = classify_source(policy, source)
             if classification == "private":
                 raise GuardError("private_source_protected")
@@ -945,6 +947,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                           torrent_state=state)
             report["download_added_on"] = added
             report["grab_ids"] = grab_ids
+            report["grab_download_ids"] = grab_download_ids
             report["grab_time_floor"] = grab_time_floor
             report["attempt_fingerprint"] = hashlib.sha256(
                 json.dumps([label, h, added, grab_ids]).encode()).hexdigest()
@@ -955,7 +958,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "sonarr_endpoint": endpoint_key(instance["url"]),
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
                          "attempt": report["attempt_fingerprint"],
-                         "grab_time_floor": grab_time_floor,
+                         "grab_time_floor": grab_time_floor, "grab_download_ids": grab_download_ids,
                          "download_id_spelling": report["download_id_spelling"],
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             if "hash_aliases" in report:

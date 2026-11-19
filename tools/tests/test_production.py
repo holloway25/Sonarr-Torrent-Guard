@@ -1078,6 +1078,64 @@ class FileCleanupTests(unittest.TestCase):
         self.assertEqual((action["stage"], action["stop_reason"]), ("held", "identity_or_manifest_changed"))
         send.assert_not_called()
 
+    def test_alternate_hash_cleanup_uses_the_queue_and_verified_history_id(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        f = self.f
+        f.hybrid_report()
+        f.qb.routes["/api/v2/torrents/files"] = manifest(("payload.scr", 0))
+        torrent = f.qb.routes["/api/v2/torrents/info"][0]
+        data = f.grab["data"]
+        data.update(torrentInfoHash=f.grab["downloadId"], protocol="2", size="100",
+                    publishedDate=f.grab["date"])
+        original_title = f.grab["sourceTitle"]
+        for case in ("complete", "unsafe_release_hash", "torrent_still_present", "history_changed",
+                     "history_outcome_uncertain"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder, patch(
+                    "production.METADATA_RETRY_RELEASE_ENABLED", False):
+                f.qb.routes["/api/v2/torrents/info"] = [torrent]
+                f.grab["sourceTitle"] = original_title
+                data["torrentInfoHash"] = "f" * 40 if case == "unsafe_release_hash" else f.grab["downloadId"]
+
+                def transport(request, **kwargs):
+                    url = urlsplit(request.full_url)
+                    self.assertEqual(url.netloc, "sonarr.example.invalid")
+                    if request.get_method() == "DELETE":
+                        self.assertEqual(url.path, "/api/v3/queue/7")
+                        self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["false"],
+                                                              "skipRedownload": ["true"], "changeCategory": ["false"]})
+                        if case != "torrent_still_present":
+                            f.qb.routes["/api/v2/torrents/info"] = []
+                        if case == "history_changed":
+                            f.grab["sourceTitle"] = "Replacement Example Title"
+                    else:
+                        self.assertEqual(request.get_method(), "POST")
+                        self.assertEqual(url.path, "/api/v3/history/failed/5")
+                        self.assertEqual(f.qb.routes["/api/v2/torrents/info"], [])
+                        if case == "history_outcome_uncertain":
+                            raise TimeoutError()
+                    response = Mock(status=200, read=Mock(return_value=b"{}"))
+                    response.__enter__ = Mock(return_value=response)
+                    response.__exit__ = Mock(return_value=False)
+                    return response
+
+                send = Mock(side_effect=transport)
+                result = self.container_cycle(Path(folder), send)
+                action, = result["actions"]
+                methods = [call.args[0].get_method() for call in send.call_args_list]
+                if case == "complete":
+                    self.assertEqual((action["stage"], methods),
+                                     ("sonarr_remove_blocklist_accepted", ["DELETE", "POST"]))
+                elif case == "unsafe_release_hash":
+                    self.assertEqual((action["stop_reason"], methods), ("sonarr_blocklist_scope_unverified", []))
+                else:
+                    reasons = {"torrent_still_present": "alternate_hash_removal_unverified",
+                               "history_changed": "sonarr_blocklist_scope_unverified",
+                               "history_outcome_uncertain": "alternate_hash_blocklist_request_uncertain"}
+                    self.assertEqual((action["stage"], action["stop_reason"]),
+                                     ("sonarr_remove_accepted_blocklist_unverified", reasons[case]))
+                    self.assertEqual(methods, ["DELETE", "POST"] if case == "history_outcome_uncertain" else ["DELETE"])
+
     def test_native_blocklist_holds_conflicting_visible_history(self):
         f = self.f
         hidden_from_episode_query = dict(f.grab, id=6, episodeId=444,

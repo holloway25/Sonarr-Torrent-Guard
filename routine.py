@@ -87,8 +87,11 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
                   "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier}
         try:
             if file_policy_removal(report):
-                production.execute_native_file_removal(runtime, qb, apis, report, authority, lock_path)
-                action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
+                outcome = production.execute_native_file_removal(runtime, qb, apis, report, authority, lock_path)
+                if outcome is None:
+                    action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
+                else:
+                    action.update(outcome)
             else:
                 action.update(production.execute_live_metadata_retry(runtime, qb, apis, report, authority, lock_path))
         except (GuardError, SafetyError) as error:

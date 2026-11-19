@@ -92,9 +92,25 @@ verification. If Sonarr already removed it, that pass simply has no matching
 torrent to act on. Sonarr's failure and blocklist history is the place to check
 whether its native action completed.
 
+### Torrents with different queue and history hashes
+
+A hybrid torrent can have two verified hashes. Sonarr uses the exact queue
+hash to look up grab history during its combined Remove and Blocklist action.
+If that lookup is empty and all approved grabs use a single verified alternate
+hash, Guard checks the visible history and release metadata for that hash.
+
+Guard asks Sonarr to remove the original queue item first. After qBittorrent
+confirms the torrent is absent, Guard rechecks the authorized grab and asks the
+owning Sonarr to mark that grab failed. Sonarr writes its blocklist entry and
+applies its own retry settings. Removing the queue item first lets Sonarr
+evaluate replacements without that download in the queue. The two requests can
+complete independently. If the second cannot be verified, the live log shows
+`sonarr_remove_accepted_blocklist_unverified`. An interrupted pass cannot
+resume a previous request. [Queue removal](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs#L67-L86) · [Mark as Failed by history ID](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/History/HistoryController.cs#L119-L124)
+
 ### File-policy blocklist scope
 
-This is the same action as Sonarr's queue UI. Guard holds visible history
+For a matching queue and history hash, this is the same action as Sonarr's queue UI. Guard holds visible history
 conflicts and verifies that the torrent under assessment is from an eligible
 public source. Sonarr chooses the internal grab used for blocklisting. In
 Sonarr 4.0.20.3014, the public history API can omit deleted episodes that

@@ -72,15 +72,20 @@ def cycle(config, qb, apis, batch_state=None, *, reserve_dispatch=False):
                 if time.monotonic() >= verification_end:
                     raise GuardError("run_time_limit_reached")
                 batch_state["verification_after"] = list(key)
+                operation = None
                 with hard_deadline(verification_end):
                     fresh = recheck_candidate(report, config, qb, apis)
                     check_fresh(report, fresh)
                     if not reserve_dispatch and file_policy_removal(report):
                         label = report["instance"]
                         require_sonarr_v4(apis[label])
-                        check_visible_native_grabs(apis[label], config["sonarr"][label], fresh["assessment"],
-                                                   config.get("max_pages", 20))
+                        separate_failure = check_visible_native_grabs(
+                            apis[label], config["sonarr"][label], fresh["assessment"], config.get("max_pages", 20))
+                        if separate_failure:
+                            operation = "sonarr_remove_then_mark_grab_failed"
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
+                if operation:
+                    report["safeguards"]["operation"] = operation
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
     return {"dry_run": True, "status": "assessed", "retry_after_seconds": RETRY_AFTER_SECONDS,

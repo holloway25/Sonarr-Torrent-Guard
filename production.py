@@ -243,12 +243,24 @@ def wait_for_event_boundary(dispatched_at):
 
 
 def check_visible_native_grabs(api, instance, report, max_pages):
-    """Hold contradictory public API records before using Sonarr's native action."""
-    try:
-        download_id = report["download_id_spelling"]
-        rows = records(api, "/api/v3/history", {
+    """Verify Sonarr's history scope and identify a separate failure request when needed."""
+    def grabs_for(download_id):
+        return records(api, "/api/v3/history", {
             "downloadId": download_id, "eventType": 1, "sortKey": "date", "sortDirection": "descending",
         }, max_pages)
+
+    try:
+        queue_hash = report["download_id_spelling"]
+        download_id = queue_hash
+        rows = grabs_for(queue_hash)
+        if not rows:
+            history_hashes = report.get("grab_download_ids", ())
+            aliases = report.get("hash_aliases", ())
+            if (len(history_hashes) != 1 or torrent_hash(history_hashes[0]) not in aliases
+                    or torrent_hash(history_hashes[0]) == torrent_hash(queue_hash)):
+                raise ValueError()
+            download_id = history_hashes[0]
+            rows = grabs_for(download_id)
         episodes = set(report["episode_ids"])
         approved = set(report["grab_ids"])
         if (not rows or len(report["series_ids"]) != 1
@@ -275,7 +287,25 @@ def check_visible_native_grabs(api, instance, report, max_pages):
         # Require all visible grabs for this download ID to agree on the title.
         if len({row["sourceTitle"] for row in rows}) != 1:
             raise SafetyError("ambiguous_release_title_evidence")
-    except (GuardError, TypeError, ValueError) as error:
+        if download_id != queue_hash:
+            # When called by history ID, Sonarr's blocklist uses the grab's
+            # stored release hash, protocol and publication date.
+            grab = max(rows, key=lambda row: (grab_timestamp(row), row["id"]))
+            data = grab["data"]
+            release_hash = torrent_hash(data.get("torrentInfoHash"))
+            release_size = data.get("size", "0")
+            if (data.get("protocol") != "2" or release_hash not in aliases
+                    or not isinstance(release_size, str)
+                    or re.fullmatch(r"[0-9]{1,19}", release_size) is None
+                    or int(release_size) > 2**63 - 1):
+                raise ValueError()
+            try:
+                event_time({"date": data.get("publishedDate")})
+            except SafetyError:
+                raise ValueError() from None
+            return grab["id"], digest([download_id, grab["sourceTitle"], data])
+        return None
+    except (GuardError, TypeError, ValueError, OverflowError) as error:
         if str(error) == "run_time_limit_reached":
             raise
         raise SafetyError("sonarr_blocklist_scope_unverified") from None
@@ -305,11 +335,31 @@ def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
         current = refreshed[0]
         fresh = {"assessment": current}
         check_fresh(report, fresh)
-        check_visible_native_grabs(api, instance, current, config.get("max_pages", 20))
+        max_pages = config.get("max_pages", 20)
+        separate_failure = check_visible_native_grabs(api, instance, current, max_pages)
         require_current_file_failure(qb, current, instance["category"])
         authority.validate(config, current)
         check_fresh(report, fresh)
-        _send_queue_delete(api, min(current["queue_ids"]), blocklist=True)
+        if separate_failure is None:
+            _send_queue_delete(api, min(current["queue_ids"]), blocklist=True)
+            return None
+
+        # Remove first so Sonarr's native retry cannot race the old queue entry.
+        _send_queue_delete(api, min(current["queue_ids"]), blocklist=False, alternate_hash_cleanup=True)
+        try:
+            torrent, _ = observed_torrent(qb, current)
+            if torrent is not None:
+                raise SafetyError("alternate_hash_removal_unverified")
+            require_sonarr_v4(api)
+            if check_visible_native_grabs(api, instance, current, max_pages) != separate_failure:
+                raise SafetyError("sonarr_blocklist_scope_unverified")
+            authority.validate(config, current)
+            _send_history_failure(api, separate_failure[0])
+        except (GuardError, SafetyError) as error:
+            reason = str(error)
+            return {"stage": "sonarr_remove_accepted_blocklist_unverified",
+                    "stop_reason": reason if reason in DISPATCH_STOP_REASONS else "dispatch_validation_failed"}
+        return None
 
 
 def capture_context(config, api, report, now=None):
@@ -614,10 +664,10 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
         raise SafetyError("delete_redirect_refused")
 
 
-def _send_queue_delete(api, queue_id, *, blocklist):
+def _send_queue_delete(api, queue_id, *, blocklist, alternate_hash_cleanup=False):
     """Send one native queue removal after the live checks."""
     if (ROUTINE_RELEASE_ENABLED is not True or not isinstance(blocklist, bool)
-            or (not blocklist and METADATA_RETRY_RELEASE_ENABLED is not True)):
+            or (not blocklist and not alternate_hash_cleanup and METADATA_RETRY_RELEASE_ENABLED is not True)):
         raise SafetyError("live_execution_disabled")
     if not integer(queue_id) or queue_id <= 0:
         raise SafetyError("invalid_queue_id")
@@ -634,6 +684,25 @@ def _send_queue_delete(api, queue_id, *, blocklist):
                     raise SafetyError("delete_response_uncertain")
     except Exception:
         raise SafetyError("delete_request_outcome_uncertain") from None
+
+
+def _send_history_failure(api, grab_id):
+    """Use Sonarr's normal Mark as Failed action for a verified grab."""
+    if ROUTINE_RELEASE_ENABLED is not True:
+        raise SafetyError("live_execution_disabled")
+    if not integer(grab_id) or grab_id <= 0:
+        raise SafetyError("invalid_grab_id")
+    url = api.config["url"].rstrip("/") + f"/api/v3/history/failed/{grab_id}"
+    request = urllib.request.Request(url, headers={"X-Api-Key": api.config["api_key"]}, method="POST")
+    deadline = min(api.deadline or float("inf"), time.monotonic() + 15)
+    try:
+        with hard_deadline(deadline):
+            with urllib.request.build_opener(RejectDeleteRedirect()).open(
+                    request, timeout=min(15, deadline - time.monotonic())) as response:
+                if not 200 <= response.status < 300 or len(response.read(4097)) > 4096:
+                    raise ValueError()
+    except Exception:
+        raise SafetyError("alternate_hash_blocklist_request_uncertain") from None
 
 
 def _send_episode_search(api, episode_ids):
@@ -865,9 +934,11 @@ def main():
                 check_fresh(report, fresh)
                 api = apis[target[0]]
                 require_sonarr_v4(api)
-                check_visible_native_grabs(api, config["sonarr"][target[0]], fresh["assessment"],
-                                           config.get("max_pages", 20))
-                result.update(preflight="verified", operation="sonarr_remove_and_blocklist")
+                separate_failure = check_visible_native_grabs(
+                    api, config["sonarr"][target[0]], fresh["assessment"], config.get("max_pages", 20))
+                operation = ("sonarr_remove_then_mark_grab_failed" if separate_failure
+                             else "sonarr_remove_and_blocklist")
+                result.update(preflight="verified", operation=operation)
             else:
                 fresh = recheck_candidate(report, config, qb, apis)
                 check_fresh(report, fresh)
