@@ -18,8 +18,8 @@ approving the reviewed code and configured public workflow. The file and parent
 directory must be owner-private, outside the checkout. It contains exactly:
 
 - `enabled`: true only for explicitly approved operation.
-- `rule`: `public-sonarr-cleanup-v3` (metadata removal without blocklisting plus
-  separately authorized Sonarr episode search).
+- `rule`: `public-sonarr-cleanup-v3` (native remove-and-blocklist for file
+  failures and the separate journal-based metadata policy).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
 - `issued_at`, `expires_at`: UTC epoch times, no longer than seven days apart.
   Increasing the code limit does not extend an existing grant. Any extension
@@ -68,24 +68,27 @@ dispatch. After recovery, the worker releases the assessment lock and uses the
 existing locked coordinator for each eligible snapshot. Concurrent
 workers may cause a hold, but cannot bypass fresh checks or duplicate dispatch.
 
-Only the current pass's assessed attempts are handled. Replacements are checked
-on a later ten-minute run, never chased in an inner loop. All existing client,
-public-source, age, manifest, retry, version, endpoint, timestamp alignment,
-baseline, expiry and durable-intent guards remain. Public removal/data removal,
-blocklisting and retries are requested through owning Sonarr only. File failures
-use native retry; the separately authorized metadata policy uses the exact episode
-search described in [metadata retry](METADATA-RETRY.md).
+The worker acts on candidates from the current assessment. It checks
+replacements on later scheduled passes. The two live paths are:
 
-Per-action execution tokens are generated under this delegated permission, bound
-to one assessment, capped at 120 seconds and by the trial expiry when applicable.
-Ongoing grants never create non-expiring per-action tokens. They are not fabricated human
-test approvals. Each action context records the routine-grant digest so the
-authority can be correlated with the protected external grant and operational
-reports. Save the issued grant with operational records outside the repository.
+- [File-policy cleanup](PUBLIC-WORKFLOW.md#live-file-policy-cleanup) repeats the
+  ownership, source, file and grant checks, then sends Sonarr's native Remove
+  and Blocklist action. Sonarr handles its own retry. If a torrent is still
+  queued on a later run, Guard can act after a fresh check. This path needs
+  neither an action-journal record nor a separate execution token.
+- [Metadata retry](METADATA-RETRY.md) records intent in SQLite, uses a
+  short-lived per-action token and can ask Sonarr for one affected-episode
+  search after confirmed removal. Tokens are bound to the assessment and
+  expire after at most 120 seconds or when the trial expires, whichever
+  comes first. An unavailable journal holds metadata actions.
 
-## Old holds versus new grabs
+Both paths include the grant digest in the action report. Metadata also
+stores that digest in its operation context. Save the issued grant with private
+operational records outside the repository.
 
-Uncertainty still prevents a repeat send against the SAME attempt. A newly
+## Metadata holds and new grabs
+
+An uncertain journal-based action holds the same attempt. A newly
 validated Sonarr attempt can supersede an older hold only if its downloader
 addition and all latest episode-grab timestamps are strictly after the earlier
 dispatch, its attempt fingerprint differs, and the normalized Sonarr/downloader
@@ -147,17 +150,17 @@ verified candidate first turn on a later cycle.
 Waiting, grant expiry/code mismatch and held results are visible; no credentials,
 raw endpoints or file paths are logged. No application file deletion is added.
 
-Pre-dispatch validation failures retain `stage: cancelled`, an exact allowlisted
-`stop_reason` and the grant reference in both the private journal and routine
-action report. Unknown errors use `cancellation_validation_failed`; raw exception
-text is never logged. Cancellation is definitely unsent and has no dispatch
-timestamp. Existing legacy cancellations without a reason are left unchanged.
+File-policy reports use `held` for an unsent action, `uncertain` for a lost
+or unverified response, and `sonarr_remove_blocklist_accepted` for acceptance.
+For a journal-based action, failure before recording dispatch retains a
+`cancelled` stage and an allowlisted `stop_reason`. Failure after intent but
+before transport can record `dispatch_blocked`. Raw exception text is never logged.
 
 Trial expiry stops new actions automatically, though an installed timer may keep
-recording waiting runs until disabled. Active journal capacity remains 1000 rows and
-fails closed when full; no old or uncertain action is purged. This bounds the
-trial safely without introducing an unreviewed retention policy. Ongoing
-operation keeps the same capacity hold; it does not enable automatic archival.
+recording waiting runs until disabled. The 1,000-row journal capacity holds new
+journal-based actions when full. File-policy cleanup evaluates the current queue
+independently. Ongoing permission keeps the same bounds and leaves archival
+disabled.
 Inspect capacity and explicitly approve retention application when needed.
 An explicit [retention candidate](JOURNAL-RETENTION.md) is now implemented with
 application disabled. It preserves archived records in duplicate/ownership safety

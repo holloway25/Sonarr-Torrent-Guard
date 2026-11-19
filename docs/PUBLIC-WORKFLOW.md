@@ -1,93 +1,72 @@
-# Public failure workflow: dry-run and disabled senders
+# Public cleanup workflow
 
-A gated single-test sender and read-only production verifier exist for review.
-Manual sender release gates are false. Docker uses the explicit live-mode
-switch. Standalone unattended workers use a private trial or ongoing grant. See
-[unattended authorization](UNATTENDED-TRIAL.md). Unit-tested requests do not establish
-production mutation behaviour or implicitly authorize live operation.
-Private-source downloads remain protected; the private archive helper and web UI
-remain future work. Docker packaging is implemented, with separately approved
-deployment described in [container setup](CONTAINER.md). Existing seeding/removal
-policies stay intact.
+Guard assesses public torrents owned by the configured Sonarr instances.
+`guard.py` and `public.py` are dry-run entry points. The scheduled live worker
+requires a confirmed Docker scope or a [standalone grant](UNATTENDED-TRIAL.md).
+Private archive handling and a web UI are future work.
 
-For a queue item whose hash matches qBittorrent's torrent ID, Guard verifies
-the reported infohashes, including the shortened v2 ID where applicable.
-It reads each affected episode's paginated grab history back to two minutes
-before the torrent was added, regardless of how many hashes it has. It compares
-hashes without regard to case and selects the newest matching grab for each
-episode. A lower-ID grab with an equal or later timestamp and a conflicting
-indexer or downloader blocks cleanup for manual review. The selected
-grab must name the uniquely configured, bound downloader before Guard trusts its
-indexer. A different or missing downloader name blocks cleanup.
-A private indexer on any matching queue row also blocks cleanup, even when grab
-history says the source is public. A public queue value alone cannot establish
-that a torrent is eligible. Fresh assessment repeats the queue check.
-A second queue group under a verified alias holds the whole torrent, even
-when both groups belong to the same Sonarr instance. Guard maps all verified
-hashes to the torrents that claim them. Any hash claimed by multiple torrents
-blocks cleanup. If a listed torrent's identity cannot be verified, Guard cannot
-rule out a collision and holds cleanup.
+## Start a scheduled pass
 
-Fresh checks bind the verified identities into the ownership fingerprint and
-retain them in the action context. Prior-attempt lookup checks overlapping
-hashes for both active and archived records using the Sonarr label and the
-durable Sonarr/downloader binding. Renaming an owner preserves its existing holds. A legacy record contributes
-only its stored hash. Recovery and the final metadata retry check use
-qBittorrent's bulk torrent list to check every advertised hash, even for legacy
-single-hash records. When rows omit the infohash fields, Guard uses the same
-per-torrent properties fallback as assessment, within the current phase
-deadline. Verified hashes for a stable torrent can carry over to the next pass
-through private batch state. Guard checks the current downloader, primary hash,
-addition time and size before reuse. Each infohash supplied by the bulk list
-must also agree with the cache. A disagreement requires fresh properties that
-agree with the supplied fields. The cache expires after one hour, and a
-torrent waiting for metadata needs a fresh read. If a large group of unresolved
-magnets exhausts this shared scan, Guard reports
-`torrent_identity_scan_time_limit_reached` and holds cleanup. If the available
-identity evidence cannot rule out a match, torrent absence stays unknown. Guard checks failure and replacement history against both
-the saved and currently verified hashes. A new alias alone does not establish a
-replacement.
+1. Test the configured Sonarr connections to qBittorrent. If either owner in a
+   two-instance configuration is unavailable or its downloader test fails,
+   Guard waits for the next cycle. No cleanup is sent directly to qBittorrent.
+2. Read the Sonarr queues, including unmapped items, and match each eligible
+   queue entry to the current qBittorrent torrent. Verify the queue hash and
+   aliases, category, exact pinned downloader binding and series/episode IDs.
+3. Identify the current grab's indexer from Sonarr's history. Apply the
+   [source policy](SOURCE-POLICY.md) for that Sonarr owner. Skip private,
+   unidentified or ambiguous sources, unowned downloads and incompatible
+   endpoint/client/category combinations.
+4. Check qBittorrent's current file list and selection against the
+   [file policy](../README.md#file-policy). Keep healthy torrents, including
+   those with only harmless unselected extras. Pause or stop status alone
+   does not fail a torrent. Apply the separate [metadata-timeout policy](METADATA-RETRY.md)
+   to eligible downloads that are still retrieving metadata.
 
-Fresh read-only assessment and a private SQLite journal are now implemented.
-Indexer eligibility follows the configured [source policy](SOURCE-POLICY.md):
-new containers treat identified sources as public except private exclusions;
-legacy allowlists remain supported. Private matches and missing, malformed or
-ambiguous source identity are protected before manifest assessment. A policy
-change needs review and a new grant for standalone live workers. Preserve the journal.
-Dispatch/recovery behaviour is tested using simulations and mocked production
-adapters. Enable
-`--check-safeguards` to exercise rechecks against the APIs. New preview entries go
-into `preview-journal.sqlite3` so they have their own capacity.
+Connectivity uses Sonarr's non-saving downloader test with temporary blank
+categories. Sonarr resolves its own saved credentials from the provider ID.
+The expected blank-category warning alone is accepted with an otherwise
+successful test. Other diagnostics, redirects and outages stop the pass.
+Sonarr may update its own connection-health status during the test.
+
+Docker and the provided timers wait ten minutes after a cycle finishes.
+The cycle uses a shared three-minute deadline, bounded requests and pagination,
+and a worker lock. Assessment, verification, recovery and dispatch each have
+time reserved. Private cursors rotate through large queues and pending recovery,
+including after a timeout or restart.
+
+## Ownership and source checks
+
+- Require exact client IDs and uniquely bound endpoints. Equivalent default-port
+  URLs compare equal. An endpoint change invalidates earlier evidence.
+- Validate torrent hashes, including hybrid torrent aliases. An alias used by a
+  second queue group or claimed by multiple torrents makes ownership ambiguous.
+  If identity cannot be verified, Guard holds the action. qBittorrent properties
+  are a fallback when the bulk list lacks infohash fields. Batch state can
+  reuse verified identity while the downloader, primary hash, addition time
+  and size match, and the one-hour cache is still fresh.
+- Read each affected episode's bounded grab history using normalized hashes.
+  The selected grabs must agree on the bound downloader and indexer and match
+  the current torrent addition time within two minutes. Tied or conflicting
+  evidence holds cleanup. A private indexer on a matching queue row vetoes
+  cleanup even if grab history says public. A queue's public label alone
+  cannot authorize an action.
+- Require a complete, structurally valid file list. Malformed IDs, incomplete
+  responses, changed ownership or changed file selections cannot establish a
+  valid candidate. Several episode rows for one torrent can produce one action.
 
 ## Live file-policy cleanup
 
-After explicit live authorization, a verified public file-policy failure
-qualifies for the owning Sonarr's Remove and Blocklist action. See the [file rules](../README.md)
-for the complete policy. [Metadata retry](METADATA-RETRY.md) has its own policy.
-
-1. Require successful Sonarr-side connectivity diagnostics for both owners; wait
-   until the next ten-minute cycle during maintenance, without downloader-only
-   cleanup. Read and validate both queues, explicit downloader binding, Sonarr grab
-   provenance, content identity and public-source classification.
-   Numeric ownership/content IDs must be positive JSON integers, not booleans,
-   floats or coercible strings. History events must be known integer enums or
-   their exact named forms; malformed event values cannot establish grab
-   provenance or confirm outcomes. These checks repeat before dispatch and
-   during context capture, including the final refreshed baseline.
-2. Assess a complete qBittorrent manifest under the agreed failure rules. Do not
-   infer failure from paused/stopped state, size alone or warning text.
-   Separately, the agreed public metadata-timeout rule can fail active
-   `metaDL`/`forcedMetaDL` attempts after 30 elapsed minutes since addition, requiring
-   zero progress, unknown size and a successfully read empty manifest. It is a
-   metadata failure, not a malware verdict; private/unidentified sources remain
-   protected. Contradictory/missing information skips. Metadata arriving before
-   dispatch changes the fingerprint and cancels the timeout action.
-3. Under the worker lock, repeat the ownership, binding, source, age and queue
-   checks. Check the visible Sonarr grabs for the exact queue download ID.
-   After the final Sonarr read, verify the current qBittorrent identity and file
-   manifest. Any change or visible scope conflict holds the action.
-4. Send one request through the owning Sonarr instance, using one current queue
-   ID for the torrent, even if it represents several episode rows:
+1. Under the worker lock, repeat assessment for the candidate using both
+   Sonarr queues. Check the owning Sonarr's current connection and version.
+   Review the visible grab history for the exact queue download ID and hold
+   conflicting sources, clients, episodes or malformed evidence.
+2. As the last remote check before sending, reread the target torrent and
+   its complete manifest from qBittorrent. Require the same addition time,
+   hash identity, category and failing manifest. Revalidate the approved
+   scope and the fresh assessment immediately before dispatch.
+3. Send one request to the owning Sonarr. Select one current queue ID for the
+   torrent, even if it has several episode rows.
 
    ```text
    DELETE /api/v3/queue/{currentQueueId}
@@ -97,331 +76,112 @@ for the complete policy. [Metadata retry](METADATA-RETRY.md) has its own policy.
    changeCategory=false
    ```
 
-5. Sonarr requests removal of the torrent and its download data, records the
-   failure and blocklist, and applies its own retry settings. A response only
-   confirms acceptance of the action. Guard logs an uncertain response and
-   reassesses whatever is still queued on the next scheduled pass.
-6. Evaluate each new grab on its own evidence. This covers repeat grabs and
-   replacements from another public indexer. File cleanup needs no action journal,
-   repeat counter or separate search. Keep existing journals for metadata and recovery.
+4. Sonarr asks the downloader to remove the torrent and data, marks the release
+   failed and blocklists it. Sonarr applies its own failed-download retry
+   settings when deciding whether to search again. Guard assesses whatever is
+   queued at the next scheduled pass, including a re-grab or a different public
+   release. Each pass uses current evidence, without an action journal,
+   retry count or separate Guard search.
 
-## Partial results and recovery
+The cycle continues as Sonarr grabs replacements. A healthy grab stays in the
+queue. The episode may remain missing when Sonarr has no eligible release.
 
-An HTTP timeout or success code alone cannot establish the result. Queue
-disappearance alone is insufficient. Historical remove-and-blocklist records
-are still reconciled against failure and blocklist evidence.
+The live request refuses redirects and has no automatic HTTP retry. If a pass
+is interrupted or the response is lost, the next pass checks the current queue
+and files. A torrent that is still present can qualify again after fresh
+verification. If Sonarr already removed it, that pass simply has no matching
+torrent to act on. Sonarr's failure and blocklist history is the place to check
+whether its native action completed.
 
-| Observed situation | Required future recovery |
+### File-policy blocklist scope
+
+This is the same action as Sonarr's queue UI. Guard holds visible history
+conflicts and verifies that the torrent under assessment is from an eligible
+public source. Sonarr chooses the internal grab used for blocklisting. In
+Sonarr 4.0.20.3014, the public history API can omit deleted episodes that
+the internal lookup still sees. A new grab can also arrive after the final
+read across the two services. [History repository](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/History/HistoryRepository.cs) · [Sonarr's failure selection](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs#L53-L60)
+
+### Read the outcome
+
+| Result | Meaning |
 | --- | --- |
-| No request sent yet | Fresh checks before any later attempt |
-| Sonarr or its qBittorrent connection unavailable | Wait ten minutes; recheck via Sonarr; no downloader-only fallback |
-| Request sent, response lost | Mark uncertain; reconcile APIs/history only, never blindly resend |
-| Torrent removed, failure/blocklist unconfirmed | Partial action; stop and report, do not blindly repeat |
-| Failure/blocklist confirmed, retry not yet observed | Wait and inspect native command/history state; do not submit a duplicate search |
-| No suitable replacement available | Report replacement pending; this alone does not leave a confirmed cleanup unresolved |
-| Unexpected category/client/source/identity change | Cancel new mutations and require reassessment |
-| Restart during any stage | Reconcile journal and observed evidence before proceeding |
-
-The future journal must distinguish intent, uncertain response, verified removal,
-verified failure/blocklist, replacement pending/observed and unresolved/manual
-review. It must protect credentials, bound retention and preserve exact content
-identity. Do not mark a stage successful because its API request returned 2xx.
-File-deletion completion cannot be proven by torrent disappearance alone; define
-appropriate client-side verification without adding broad filesystem access.
+| `would_fail` | The assessment found a file-policy failure or eligible metadata timeout. In dry-run this is a proposal. |
+| `sonarr_remove_blocklist_accepted` | Sonarr accepted Guard's native request. Data deletion, replacement and import need separate confirmation in the relevant application. |
+| `held` | A safety or authorization check stopped dispatch. The reason is in the routine action report. |
+| `uncertain` | A file-cleanup request may have reached Sonarr. The next pass starts with current queue and torrent evidence. |
+| `waiting` | The cycle could not proceed, for example due to maintenance or unavailable authorization. |
 
 ## Current preview contract
 
-File-policy candidates preview Sonarr's native remove-and-blocklist action.
-[Metadata retries](METADATA-RETRY.md) separately preview removal without blocklisting
-and an affected-episode search after confirmed removal. Protected, kept and unidentified
-torrents receive no request preview. A preview grants no dispatch permission.
+A dry-run file-policy candidate previews the native remove-and-blocklist request.
+A metadata candidate previews removal without blocklisting and a conditional
+affected-episode search. Protected, kept or unidentified downloads have no
+request preview. A preview sends no cleanup or search request.
 
-`safety.py` compares ownership and manifest fingerprints from fresh assessment,
-checks public eligibility and a ten-second maximum snapshot age. Metadata
-timeouts also require both retry switches. Manifest fingerprints include names, sizes, indices and priorities, but not
-changing download progress; filenames themselves are not journaled. A fresh read
-still cannot eliminate the small race with external changes before a future
-mutation. Production execution must recheck directly before dispatch.
-
-Ownership binds both normalized endpoints: the owning Sonarr instance and the
-monitored qBittorrent server. Changing Sonarr's host, scheme, effective port or
-base path invalidates the reviewed fingerprint and approval even if the new
-server returns identical IDs and content. Equivalent default-port spelling does
-not change identity. Earlier snapshots lacking this binding must be freshly
-assessed; existing journal evidence is not silently rewritten to match.
-
-The external journal uses transactional, fully synchronized SQLite with a unique
-mode/instance/hash key for legacy and single-test records. New preview/simulation
-keys also include the attempt fingerprint. Preview rows never enter dispatch
-states. Simulation rows commit `dispatch_recorded` before invoking the fake sender. Recovery from that
-stage, a lost response or restart reconciles observations only and never invokes
-the sender again. After observed removal, explicitly negative failure/blocklist
-evidence requires manual review; unknown results remain uncertain. Contradictions
-of historical positive evidence also require manual review. Confirmed failure
-and blocklisting without replacement or data-deletion evidence stays pending.
-Complete requires all five positive observations. A missing
-response, 2xx status or disappeared queue item is never sufficient by itself.
-
-Journal records omit raw endpoints, file paths, titles and credentials. The
-private directory/database requirements, bounded row count and preservation of
-unresolved records are intentional. Corrupt journals fail closed instead of
-being reset. The separately gated sender and read-only verifier extend these
-requirements without enabling the normal CLI to mutate anything.
-
-Journal recovery stores three distinct views: historical positive `confirmed`
-flags, merged last-known `observation` values, and `current_observation` with an
-availability flag. An outage leaves historical and last-known evidence intact
-while marking the current view unavailable. Omitted/unknown fields in later
-partial responses preserve previous values. Explicit negative results update the
-last-known view; a negative contradicting a historical confirmation requires
-manual review without deleting that confirmation (for public-attempt cleanup,
-only contradictions in cleanup fields affect its stage). Completion requires all five
-positive results in the current snapshot, never just a historical union.
-Schema migration preserves existing observations and initializes historical
-confirmations from them; it cannot reconstruct evidence already lost before
-the migration.
+With `guard.py --check-safeguards`, eligible dry-run assessments receive a fresh
+recheck and may be saved to the separate `preview-journal.sqlite3`. The recheck
+compares ownership and manifest fingerprints and requires a snapshot no more
+than ten seconds old. Manifest fingerprints use names, sizes, indices and
+priorities. Download progress is intentionally excluded, and filenames are
+never stored in the journal. Metadata timeouts also require the retry settings
+to be verified.
 
 ## Production verification and sender gates
 
-Guard accepts numeric Sonarr 4.x versions reported by `/api/v3/system/status`.
-Sonarr 5.x, other major versions and missing or malformed versions hold production
-verification and actions. API response validation still applies to each 4.x
-operation. Responses with duplicate JSON keys are treated as unavailable evidence.
+The live worker and production preflight require Sonarr 4.x and validate the
+server response and client binding. Sonarr 5.x, missing or malformed versions,
+and inconsistent responses hold the operation. `production.py --preflight
+INSTANCE TORRENT_HASH` checks the visible grab scope for file cleanup and uses the
+read-only outcome verifier for metadata. It neither prepares an operation nor
+sends a removal or search.
 
-`production.py --preflight INSTANCE HASH` rereads an eligible file-policy
-candidate or metadata timeout and checks the Sonarr version and client binding.
-For file cleanup it verifies the visible Sonarr grab scope. For metadata the
-read-only outcome verifier reports replacement-grab observations and checks
-qBittorrent torrent absence, new
-Sonarr failure history, new blocklist records and newer replacement grabs for
-the affected episodes. Recovery reads bounded, paginated history for each
-affected episode, including the whole second containing dispatch. An incomplete
-history read leaves the history outcomes unknown. Queue disappearance alone
-cannot establish outcomes.
-Blocklist reads use Sonarr's descending date order and stop once they reach
-records older than the evidence window. Exceeding the page limit within that
-window leaves the evidence unknown. Some older Sonarr 4.x releases, including
-[v4.0.0.748](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs),
-return a global blocklist when Guard requests a single series. If entries from
-other series are seen and the read reaches the page limit, Guard reports
-`sonarr_unscoped_blocklist_limit_reached` for a required baseline, or holds
-the replacement search when the evidence is unavailable after removal. A 4.x release
-with series filtering, such as
-[v4.0.20.3014](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs),
-reduces the volume of unrelated entries. Guard correlates torrent blocklist entries
-using protocol, a release-title digest, indexer, series, episode IDs and newly
-added record IDs. Failure history must also match the original hash.
-### File-policy blocklist scope
+`production.py --observe INSTANCE TORRENT_HASH` can update the observations
+for a stored single-test operation without sending a removal or search.
+The single-test and separately gated per-attempt sender interfaces are
+disabled in the repository code. They do not configure or authorize the
+scheduled live worker.
 
-File cleanup uses the same action as Sonarr's queue UI. Guard holds visible
-conflicting history, private sources, unrelated episodes and unknown ownership.
-Sonarr decides which internal grab to blocklist. On v4.0.20.3014, the public
-history API can omit a deleted episode that Sonarr still considers internally.
-The native action has the same limit when used manually. [History repository](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/History/HistoryRepository.cs)
-[Newer selection](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs#L53-L60)
-[Older selection](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/NzbDrone.Core/Download/FailedDownloadService.cs#L115-L128)
+### Journal-based metadata and recovery
 
-### Ownership and outcome checks
+[Metadata retry](METADATA-RETRY.md) owns the journal-based flow. It records
+intent before removing a stalled metadata download without blocklisting. A
+separate affected-episode search requires current removal evidence, a fresh
+authorization check, and checks that no replacement is already queued or
+grabbed. Recovery can update observations after a timeout or restart and sends
+no request. If the journal cannot be read or verified, metadata actions wait.
+Approved native file-policy cleanup can continue.
 
-An explicitly conflicting indexer in a matching queue row also holds
-cleanup. A missing queue indexer can be established by verified grab history.
-After a standalone owner is renamed, recovery can use the stored binding
-when exactly one configured owner matches. A subsequent cleanup for the
-same hash requires a new download addition and verified grabs for every
-affected episode after the previous dispatch time.
-For replacement reporting, Guard combines episode coverage from different-hash
-grabs and same-hash re-grabs verified by a later qBittorrent addition and newer
-matching Sonarr grab IDs after dispatch. Only same-hash re-grab evidence for
-every episode can prove original absence when that hash remains listed under a
-new addition time. Legacy contexts lacking incarnation
-evidence retain hash-absence checks. Client-name
-digests bind matching history records to the configured downloader. A plausible
-failure with a missing or malformed downloader name, download hash or release
-title leaves failure unknown. Read-only recovery can then check again.
-Without a usable qBittorrent identity lookup, an unfamiliar hash may be an
-alias of the original torrent. That uncertainty blocks confirmation of a new
-replacement and keeps a matching failure under the unfamiliar hash unresolved.
-A newer same-hash grab also leaves replacement unknown when qBittorrent cannot
-verify the torrent's addition time.
+The journal also preserves legacy action records. It keeps historical positive
+confirmations, merged last-known observations and the current observation
+separately. Missing or partial observations do not erase earlier evidence.
+Historical positives alone do not prove a current outcome. Existing unresolved
+records and archive entries retain their evidence. A later known-valid metadata
+attempt can be evaluated with a new torrent addition and grab evidence. See
+[unattended authorization](UNATTENDED-TRIAL.md) and [journal retention](JOURNAL-RETENTION.md).
 
-Dispatch time is stored with intent, and matching result events must be at or
-after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's
-truncated timestamps are interpreted as intervals at their published precision.
-An interval overlapping dispatch (including the same whole second) is unknown,
-not false or confirmed: the API cannot establish ordering inside that interval.
-Timestamps more than two minutes ahead of the worker's clock remain uncertain.
-No blanket one-second tolerance accepts potentially pre-dispatch evidence.
-Unknown failure/blocklist evidence after removal remains uncertain; explicit
-negative or contradictory evidence still requires review. Missing
-timestamps, API outages, malformed identities or clock disagreement prevent
-positive confirmation. These checks establish observed results, not proof that
-every concurrent manual action was caused by the guard.
-
-For new sends, the coordinator now waits across the next whole UTC second after
-the durably stored fractional intent time. This prevents ordinary whole-second
-Sonarr results from overlapping that intent when clocks agree. It does not round
-intent down or introduce an acceptance tolerance. The wait has a 1.1-second
-monotonic bound; a stalled/backward wall clock fails closed. Freshness/approval
-are checked after waiting, then the full candidate is reread and version-bound
-context recaptured. A transaction unions refreshed pre-send baseline IDs with
-the original IDs, preserving identity, original window, intent and observations.
-Only an armed coordinator at dispatch-recorded stage may extend these baselines;
-recovery never calls that operation. Final connection/version/endpoint, age,
-expiry and clock-boundary checks follow this commit immediately before sending.
-Events already present during the wait are therefore excluded from outcomes.
-
-The UTC clocks must remain synchronized; changing display timezone does not
-solve clock skew. Ambiguous historical results remain unknown under the same
-verifier rules. Existing held tests are not reset or automatically relabelled;
-their resolution requires separate explicit review, not another removal request.
-
-Production observations always leave `data_deleted` unknown because no supported
-API proves download-side deletion. Consequently the production verifier cannot
-claim complete verification without a separately designed independent proof.
-No filesystem/share access was added, and no library path can be deleted.
-
-The manual sender requires a currently disabled code release gate, a separate explicit
-non-dry-run invocation, an armed single-test journal and a short-lived approval
-for one hash/instance and exact evidence fingerprints. It takes the worker lock,
-captures baselines and performs a final fresh check before recording dispatch.
-`production.py` has no live CLI mode or approval generator. The separately granted
-`routine.py` worker is described in [unattended trial](UNATTENDED-TRIAL.md).
-Request redirects and
-retries are refused. Under the worker lock, recovery cancels an abandoned
-`prepared` production record that has no dispatch timestamp and records
-`abandoned_before_dispatch`. Its original approval remains consumed. Once
-dispatch intent is recorded, recovery only observes outcomes. The read-only
-`--observe INSTANCE HASH` command uses the stored operation context.
-
-### Repeated hashes and download attempts
-
-Assessment binds the newest grab ID for each affected episode to the current
-qBittorrent addition time (within 120 seconds; missing dates, clock skew or a
-larger gap fail closed). The newest episode grabs must agree on one classified
-source. This prevents older sources for a repeated hash making the current
-source ambiguous, without treating an old grab as authority for a manual re-add.
-The bounded time correlation is not proof against concurrent manual operations.
-
-An attempt fingerprint binds the instance/hash, addition time and current grab
-IDs. Ownership/fresh rechecks include it: a re-grab during validation cancels the
-old proposal. Preview and simulation journals use separate records for successive
-attempts. A changed preview assessment gets its own evidence revision within
-the same attempt. The journal keeps earlier preview records and reuses a legacy
-record when its evidence matches. Filename changes alone are not new attempts.
-
-The disabled single-test sender deliberately retains its one-action-per-hash
-key. A re-grab cannot reuse a consumed approval, bypass a manual-review record or
-trigger another live deletion. The separate disabled per-attempt sender and
-dry-run timer templates do not enable routine live scheduling or grant approval. The next
-manual dry-run can assess a new bad attempt, but cannot remove it. A same-hash
-re-grab is not reported as a useful verified replacement.
-
-### Per-attempt sender and maintenance boundary
-
-The `public_attempt` namespace keys operations by mode, instance, hash, attempt
-fingerprint and approval digest. Its separate false release gate, armed journal,
-non-dry-run invocation and exact expiring approval are all mandatory. Both the
-addition time and all current grab IDs must advance beyond earlier resolved
-operations; addition must also be after the earlier dispatch intent. Unresolved
-legacy or per-attempt production records hold the same attempt, not unrelated
-candidates. Definitely unsent cancelled/blocked records can be followed by a new
-exact approval after maintenance, preserving both records. Recovery never sends.
-Both sender modes perform this related-record check before preparing a new
-action; a single-test approval cannot bypass a hold on the same attempt or repeat a
-resolved incarnation. Recovery of an already-recorded operation is read-only.
-
-A confirmed successor may be handled despite an older unresolved record only
-with a different attempt fingerprint, strictly later downloader addition and
-latest affected-episode grab timestamps, and unchanged endpoint/client binding.
-Known earlier grab IDs must advance too. Legacy records without grab IDs need
-the same strictly later timestamp proof. Hash/name/file matches alone do not
-release holds; historical records are never erased or relabelled. Grab timestamps
-are now included in fresh ownership evidence. See the trial document for details.
-
-For this namespace only, `cleanup_resolved` requires all three cleanup positives
-in one current observation: original absence, failure and blocklisting. A union
-of historical partial observations cannot resolve it. Replacement availability
-and file deletion are separate outcomes. Only contradictions in the three cleanup
-fields hold cleanup for review; later replacement progress cannot undo cleanup
-resolution. Historical replacement evidence remains preserved. `data_deleted` remains unknown; this
-stage is not `complete` and must not be presented as full end-to-end verification.
-Existing single-test/manual-review rows and their evidence are not reset.
-
-The always-dry-run `public.py` CLI performs connectivity checks and candidate
-assessment/fresh proposals BEFORE pending recovery, in a bounded, locked cycle
-with the existing fair cursor. If the first torrent stalls until the assessment
-deadline, a separate cursor hint starts the next cycle after that torrent. The
-timed-out torrent stays unassessed and can be retried on a later pass. Fresh
-proposal verification has its own rotation cursor, so a slow candidate cannot
-take first turn every cycle when the initial scan finishes the whole queue.
-Both dry-run and live cycles reserve time for recovery after verification.
-Recovery is limited to five records per cycle,
-five seconds per observation and thirty seconds overall, capped by the remaining
-run deadline with two seconds left for persistence. Each adapter temporarily
-inherits the observation deadline too, preventing caught timeouts from starting
-another long request; previous deadlines are restored afterward. Its separately
-validated, durable `recovery_after` cursor rotates across pending keys and
-survives restarts, even with no assessment candidates. Deferred/unobserved records
-remain held; recovery never discards their evidence. Holds cleared after
-assessment are reassessed next cycle. A slow recovery backlog cannot consume the
-assessment opportunity or keep restarting at its first record.
-`maintenance.py` uses Sonarr's reviewed non-saving provider test with blank
-temporary categories, avoiding its category-creation branch. Original provider
-ID/connection fields resolve Sonarr's own masked credentials. No settings are
-saved, but Sonarr's native provider health status may change as part of testing.
-The known blank-category warning alone is accepted, identified by Sonarr's own
-`isWarning` field (its generic severity can still say `error` for this warning).
-Other warnings/errors, redirects, outages or malformed responses make the cycle
-wait. Connectivity is
-rechecked by disabled senders before preparation, before intent, and after commit.
-Sonarr owns file-policy and metadata removal and any eligible episode search.
-
-Timer templates under `deploy/` run only the dry-run CLI at ten-minute intervals
-after completion; they are not installed/enabled. No long sleeps or catch-up
-bursts are used. The two-minute torrent age minimum remains. No automatic record
-purge is implemented: the private journal refuses new records at its bound rather
-than discarding unresolved evidence. Long-term retention needs separate review;
-the disabled [housekeeping candidate](JOURNAL-RETENTION.md) preserves resolved
-records in an indexed archive still consulted by safety checks. No worker invokes
-it automatically, and it never purges or exports unresolved evidence.
-
-The dispatch-intent commit is followed by a fresh version request. Only after that
-request completes are the final candidate snapshot's age and approval expiration
-checked again. A slow commit or slow status response cannot carry an expired
-approval/stale snapshot into the sender. Version drift, status outages or failed
-post-commit expiry checks leave a durable `dispatch_blocked` record, preserving
-identity, context, historical evidence and an allowlisted stop reason. This stage
-means the request was not sent and is terminal for automatic processing. A crash
-before a blocked result is recorded instead leaves dispatch intent requiring
-read-only reconciliation; it never permits blind re-sending.
-
-`reports.py` renders these results for humans and emits versioned JSON data. This
-is the boundary a future read-only web UI can consume. Runtime titles are optional
-text stdout only; JSON events and rotating logs omit them.
+For journal verification, new outcomes must be tied to the recorded dispatch
+and the affected episodes. Incomplete history leaves evidence unknown. Some
+older Sonarr 4.x builds return a global blocklist despite a series filter.
+An oversized response can hold metadata with
+`sonarr_unscoped_blocklist_limit_reached`. [Older blocklist controller](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs) · [Series-filtered controller](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs)
 
 ## Verification before enabling live operation
 
-- Tests must prove fresh rechecks cancel changed candidates and no download,
-  search, settings or priority mutations occur in dry-run. Sonarr's non-saving
-  connection diagnostic POST is the only new diagnostic exception.
-- Mock each partial-operation outcome and restart point; prove reconciliation
-  prevents duplicate removal or replacement requests.
-- Check installed-version semantics in a controlled integration test using one
-  explicitly approved public torrent, after reviewing the dry-run proposal.
-- Confirm failure/blocklist, torrent/data removal and replacement outcome through
-  independent evidence. Keep private, manual and healthy downloads protected.
-- Obtain explicit approval for live operation only after the workflow is agreed.
+- In dry-run, verify connectivity, both owners' public/private source rules,
+  proposed file and metadata actions and safe handling of healthy or unowned
+  torrents.
+- Use mocked services to test the exact Sonarr request, changed manifests and
+  scopes, a fresh pass after a failed request or re-grab, and continued file
+  cleanup with no usable journal. Test metadata no-replay separately.
+- A controlled live check can confirm Sonarr's failure history, blocklist and
+  replacement, and the torrent/data removal in the downloader. Approval for a
+  live check is separate from a passing source or container test.
 
 ## Source basis
 
-The v4 queue operation calls client removal with data deletion and then marks the
-tracked download failed. Its native retry handler checks the two configuration
-switches and chooses episode or season searches. Verified against the installed
-version's source tag; no production DELETE/search was used to test this.
-
-- [Queue controller](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs)
-- [Failure service](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs)
+- [Queue removal controller](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs)
+- [Failed-download service](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs)
 - [Native retry handler](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/RedownloadFailedDownloadService.cs)
 - [Provider test endpoint](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/ProviderControllerBase.cs)
 - [qBittorrent connection/category tests](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/Clients/QBittorrent/QBittorrent.cs)
-- [Provider test status updates](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/DownloadClientFactory.cs)

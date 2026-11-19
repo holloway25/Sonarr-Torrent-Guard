@@ -1,153 +1,138 @@
 # Sonarr Torrent Guard
 
-Licensed under the [GNU General Public License version 3 only](LICENSE)
-(`GPL-3.0-only`). Copyright (C) 2026 Sonarr Torrent Guard contributors.
-Distributed without warranty; see the licence for its full terms.
+Sonarr Torrent Guard checks torrents that Sonarr has sent to qBittorrent. In live
+mode, a verified bad public torrent triggers the owning Sonarr's **Remove and
+Blocklist** action. Sonarr handles the removal, blocklist and replacement search.
+Guard checks the next grab on a later scheduled pass.
 
-A standard-library Python public-download checker. The normal command reports
-proposals only. A separately gated single-test sender and read-only production
-verifier exist for review; both sender release gates are disabled. No live requests
-are currently enabled by default. The routine CLI requires explicit scope-bound
-trial or ongoing permission. For verified public file-policy failures, Guard
-asks Sonarr to remove and blocklist the torrent and handle its own replacement
-search. Metadata timeouts follow a separate policy. No resume, extraction,
-priority change or filesystem cleanup is implemented.
+## How a scheduled pass works
 
-## Docker / Unraid
+1. **Check connections.** Guard asks the configured Sonarr instances to test
+   their qBittorrent connection. If a required connection is unavailable, the
+   scheduled worker waits for the next pass. Docker and the provided service
+   timers wait ten minutes after a cycle finishes.
+2. **Identify the torrent and its owner.** The torrent must match a Sonarr queue
+   item, the expected category and pinned download client, and the current
+   grab history. Guard uses each owner's [indexer policy](docs/SOURCE-POLICY.md).
+   It skips configured private indexers, manual or unowned downloads, and
+   missing or conflicting ownership or source evidence.
+3. **Check the files.** Guard reads the complete file list and selection from
+   qBittorrent. It rechecks the owner, source and current files before a live
+   removal. A healthy torrent stays in the queue.
+4. **Let Sonarr act.** For a verified file failure, Guard sends one native
+   Remove and Blocklist request to the owning Sonarr. Sonarr requests removal
+   of the torrent and download data, records the blocklist entry and applies
+   its own retry settings. A timeout or restart is handled by checking the
+   current queue on the next pass. Each replacement or re-grab is assessed
+   from its current evidence, including a grab from another public indexer.
 
-A non-root Docker image and GitHub build/publish workflow are implemented.
-Runtime environment variables supply connections and credentials; nothing private
-is baked into the image. Persistent appdata keeps journal/config/logs across
-updates. The container defaults to dry-run. `STGUARD_MODE=live` only allows
-qualifying public file cleanup and metadata retries. Existing installs confirm their scope once at cutover
-and again only if it changes. Publishing never deploys it. See
-[container setup](docs/CONTAINER.md) before activation or migration.
-Retention application remains separately disabled.
+File cleanup needs no SQLite action journal, repeat counter or separate search.
+The worker does save private batch cursors so large queues get a fair turn.
+See the [public workflow](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup) for the
+exact request, Sonarr's history limits and how to read the result.
 
-## Setup
+## File policy
 
-Linux and Python 3.9+ are required. Configure the operating system's local
-timezone for reporting; no particular regional timezone is required. The download
-share is not needed for this milestone. Use `config.example.json` as the schema,
-but enter live credentials only in a file outside the checkout. Set its mode to
-600 and its parent directory to 700. Indexer names exactly match Sonarr history.
+| File list or selection | Result |
+| --- | --- |
+| Any `.exe` or `.scr`, selected or unselected | Fail |
+| A selected `.lnk`, `.arj`, `.zipx`, `.001`, `.rar`, `.gz`, `.lz`, `.lzh`, `.uue` or `.iso` | Fail |
+| Every file is unselected | Fail |
+| Only `.txt` or `.nfo` files are selected, regardless of size | Fail |
+| Selected media with unselected shortcut or archive extras | Keep if no failure rule matches |
+| Other manifests with selected files | Keep if no failure rule matches |
 
-Each instance must have `download_client_binding` with the expected Sonarr client
-ID and its exact endpoint. The pinned endpoint must match both the monitored
-qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. The pinned
-ID selects the client before uniqueness checks, so other clients using the same
-category do not interfere; duplicate records for the pinned ID remain invalid.
-Default ports are normalized. Each Sonarr owner needs a distinct normalized
-URL and category. Missing or changed bindings hold cleanup. If a downloader
-uses proxy aliases, configure a shared verified endpoint. Credentials and
-bindings stay in the external configuration.
+Paused or stopped public torrents can still fail a file rule. The state alone
+never causes a failure. Guard leaves incomplete manifests and unknown states
+alone, and the default minimum torrent age is two minutes. Guard uses file names
+and selection for this policy and reads no payload contents.
+
+### Metadata timeouts
+
+A separate rule applies to a verified public download still in `metaDL` or
+`forcedMetaDL` after 30 minutes since addition. It requires zero progress,
+unknown size and a successfully read empty file list. This branch asks Sonarr
+to remove the download without blocklisting. After confirming removal and
+checking for an existing replacement, Guard can request one affected-episode
+search. This workflow and its read-only recovery use the private SQLite journal.
+If the journal is unavailable, approved live file cleanup can still run.
+See [metadata retry](docs/METADATA-RETRY.md).
+
+## Install and run
+
+### Docker or Unraid
+
+Follow [container setup](docs/CONTAINER.md) for a dedicated appdata directory,
+private connection settings and first-start checks. The image runs as a non-root
+user. It needs access to the Sonarr and qBittorrent APIs and its own appdata
+directory. A media library or download mount is unnecessary.
+
+Start with the default `STGUARD_MODE=dry-run`. Review the proposed actions
+and private-indexer settings for each Sonarr owner. Set `STGUARD_MODE=live`
+when the reviewed configuration is ready. Existing installs may require a
+one-time scope confirmation. Changes to that scope require confirmation again.
+
+Use the [reviewed release process](docs/DEPENDENCY-MAINTENANCE.md) to approve a
+candidate before it becomes `latest`. A source commit, a published candidate and
+an installed container can each be on different versions.
+
+### Standalone
+
+Use Linux and Python 3.9 or newer. Guard uses Python's standard library. Copy
+[the configuration example](config.example.json) to a location outside the
+checkout, set its permissions to `0600` and its parent directory to `0700`,
+and fill in the connection details privately. Set the local timezone for reports.
+
+Set the expected Sonarr download-client ID and qBittorrent endpoint for each
+owner. The endpoint must match the monitored qBittorrent URL and the client's
+Sonarr settings, including scheme, port and base path. Sonarr owners must use
+distinct normalized endpoints and categories. Default ports are normalized.
 
 ```sh
 python3 guard.py --config /path/outside/checkout/connections.json
+python3 public.py --config /path/outside/checkout/connections.json
 ```
 
-Text reports are the default: counts, readable reasons, per-instance retry
-settings and clearly marked proposed actions. Use `--format json` for versioned
-JSON-line events suitable for future UI/scheduler integration. Optional
-`--show-titles` displays escaped torrent titles only in text stdout, never in
-JSON events or log files. Runtime reports must stay outside the repository.
+Both commands are dry-run. `guard.py` reports file-policy and metadata
+assessments. `public.py` also checks Sonarr-side connectivity and observes pending
+journal entries. Its Sonarr diagnostic does not save configuration or change
+the torrent queue, but Sonarr may update its own connection-health status.
 
-Use `--check-safeguards` to perform a second, targeted read-only assessment for
-eligible candidates and record it in a private `preview-journal.sqlite3` beside
-the external configuration. Manual-only candidates skip the recheck and receive
-no preview entry. Both Sonarr queues are reread to preserve duplicate
-ownership checks. Endpoint/category/source/content identities and complete file
-selections must still match, and the new snapshot must be at most ten seconds
-old. Metadata timeouts also require verified retry settings. The journal records preview checks only; this
-option cannot send removal, blocklist or replacement requests.
+Use `--format json` with `guard.py` for JSON-line reporting.
+`--show-titles` displays escaped titles only in the text output.
+`--log-file PATH` writes rotating JSON logs to a private location.
+`--check-safeguards` adds a targeted dry-run recheck and stores eligible preview
+evidence in a separate `preview-journal.sqlite3` beside the configuration.
 
-Optional `--log-file /path/outside/checkout/guard.log` enables one-MiB rotation
-with three backups. Keep runtime files outside Git. No service or schedule is
-installed. The planned interval is ten minutes. A process lock beside
-the configuration prevents overlaps and releases on process exit.
+The optional dry-run and live service templates are in `deploy/`. Standalone
+live operation requires `routine.py --live` and a private scope-bound grant.
+See [standalone authorization](docs/UNATTENDED-TRIAL.md).
 
-The active log and retained numbered backups have mode 600, including newly
-created files after rollover under a permissive process umask. Log symlinks are
-refused. Ownership/category/client mismatches do not consume the torrent work
-allowance. Eligible hashes rotate across both instances using an atomically
-saved, mode-600 `batch-state.json` beside the external config. The next run resumes
-after the last assessed key, so later candidates get turns even after restarts or
-queue reordering. Exceeding the work allowance reports deferred hashes explicitly.
+## Read the results
 
-Requests have timeouts, response-size/page limits and a shared three-minute
-wall-clock request/assessment deadline enforced by Linux interval signals,
-including slowly streamed bodies. API calls run in the main thread. Cross-origin
-redirects and HTTPS downgrades are refused; equivalent default-port redirects
-are accepted. Failed runs do not imply any live action occurred.
-In `guard.py`, the only POST is qBittorrent authentication; assessment uses GET.
-The new maintenance-aware cycle also uses a non-saving Sonarr diagnostic POST,
-described below. TLS certificates
-are verified. New container configurations treat identified indexers as public
-unless listed as private; missing or ambiguous source identity stays protected.
-Legacy files retain public allowlists until explicitly migrated. See
-[source policy](docs/SOURCE-POLICY.md) for private aliases and migration safeguards.
+- `would_fail` is an assessment. Review the proposed Sonarr action in dry-run.
+- `sonarr_remove_blocklist_accepted` means Sonarr accepted the live file-cleanup
+  request. It does not establish that the torrent data was deleted or that a
+  replacement was downloaded or imported.
+- `held` means validation stopped the action. Inspect the reported reason.
+  `uncertain` means the request may have reached Sonarr. Check Sonarr and the
+  current queue to see what happened.
+- A missing or unusable action journal produces a separate metadata hold. The
+  live worker can still check current files and process eligible file failures.
 
-## Public policy
+[Production preflight](docs/PUBLIC-WORKFLOW.md#production-verification-and-sender-gates)
+can check one candidate without sending a removal or search:
 
-Ownership requires the correct Sonarr queue hash, category, configured download
-client bound to the actual monitored endpoint, known series/episode and matching
-grab-history provenance. Names alone
-are insufficient. Multiple episode rows produce one proposal per torrent.
-Private exceptions are protected before file assessment. Source classification
-uses the configured policy, not a tracker privacy-flag lookup. Maintain the private
-exceptions for both owners, including separate freeleech aliases.
+```sh
+python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
+```
 
-| Manifest / selection | Decision |
-| --- | --- |
-| Any `.exe` or `.scr`, selected or not | Would fail |
-| Selected `.lnk`, `.arj`, `.zipx`, `.001`, `.rar`, `.gz`, `.lz`, `.lzh`, `.uue` or `.iso` | Would fail |
-| Every file unselected | Would fail |
-| Only `.txt`/`.nfo` selected, regardless of size | Would fail |
-| Selected media plus unselected `.lnk` or archive extras | Keep |
-| Other manifests with selected files | Keep |
+Keep connection settings, grants, logs, journals and backups outside Git.
+Runtime logs omit credentials, raw endpoints, release titles, filenames and
+download paths. See [journal retention](docs/JOURNAL-RETENTION.md) for the
+read-only retention preview and limits.
 
-The same conditions apply to paused/stopped public torrents. Stopping alone is
-never failure. No torrent is resumed. Existing seeding/removal policies remain
-in charge of healthy torrents. Unknown/transitional states, incomplete manifests,
-age under two minutes, ambiguous identity and failed API requests skip or abort
-assessment. This is policy checking, not malware scanning.
-
-The separate agreed metadata-timeout rule applies only to confirmed public
-Sonarr attempts still actively retrieving metadata (`metaDL`/`forcedMetaDL`)
-30 minutes after addition, with zero progress, unknown size and an empty file
-list. It does not depend on qBittorrent's potentially stalled active-time counter.
-Paused/stopped, private, unidentified/ambiguous and inconsistent cases remain protected. This
-records a metadata failure, not a malware finding, and uses the same fresh
-checks and Sonarr-only cleanup. Metadata arriving before dispatch cancels the
-timeout proposal. See the unattended trial document for the full conditions.
-
-Metadata timeouts use Sonarr removal **without blocklisting**,
-followed by one explicitly journaled episode search after confirmed removal.
-There is no three-attempt escalation. Sonarr selects the replacement using its
-normal rules; it may choose the same release again. The separate metadata-retry
-policy gate is enabled. Sender gates and explicit live mode still apply. Docker
-uses its mode switch and standalone routine workers use a private grant.
-Live file-policy cleanup uses the owning Sonarr's Remove and Blocklist action,
-which requests removal of both the torrent and its download data. Guard uses
-the current queue and manifest on every pass, including for a re-grab or a grab
-from another public indexer. It needs no SQLite journal or repeat counter for
-these decisions. See [public cleanup](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup)
-and [metadata retry](docs/METADATA-RETRY.md).
-
-JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
-state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
-endpoints, titles, filenames and download paths. Schema version 1 has readiness,
-assessment and summary events. A `would_fail` report does not mean Sonarr has
-failed the release.
-
-Read-only readiness checks inspect both failed-download retry switches. Disabled,
-missing or unreadable switches block the proposed replacement workflow; this
-program does not change settings. Request previews are data only. The API adapter
-never sends DELETE or replacement searches. See
-[public workflow](docs/PUBLIC-WORKFLOW.md) for the request sequence,
-verification and recovery requirements.
-
-## Verification and privacy
+## Verify changes
 
 ```sh
 python3 -m unittest discover -s tools/tests -t . -v
@@ -155,204 +140,16 @@ python3 tools/privacy_check.py --all
 git config core.hooksPath .githooks
 ```
 
-The optional hook checks staged content; CI checks tracked content and runs tests.
-All automated tests and their shared mock fixtures live under `tools/tests/`,
-separate from the application source. Run the commands above from the repository
-root; a single module can also be run with `python3 -m unittest tools.tests.test_guard`.
-The privacy checker is a guardrail, not proof that all identifying data is absent.
-Manually inspect staged content and author name/email before any commit. Use a
-privacy-safe Git author identity. Never track local handoff notes, configuration,
-logs, state, payloads, personal identities or deployment details.
+CI runs the source tests, privacy checks and offline container tests. The live
+file-cleanup tests use fake services to check the exact Sonarr request, a later
+public re-grab, protection of private and ambiguous torrents, and operation
+without an action journal. An offline pass verifies request construction and
+safety checks. A live integration check verifies behavior on an installed setup.
 
-`safety.py` also implements a simulation-only journal/recovery harness. Tests
-commit dispatch intent before a fake sender runs, interrupt/restart processing,
-and reconcile independently supplied observations without resending. Completion
-requires separate positive evidence of removal, data deletion, failure,
-blocklisting and replacement. Unknown/partial results stay unresolved or require
-manual review. The disabled single-test sender reuses the durable intent and
-reconciliation logic; the production verifier is described below.
+## License and design reference
 
-Recovery keeps historical positive confirmations separately from last-known
-results and the current observation's availability. Outages, absent fields and
-unknown values do not erase earlier evidence. Explicit contradictions require
-manual review (only cleanup fields affect the new per-attempt cleanup stage).
-A union of old/partial positives cannot prove completion: all
-required results must be positive in one current observation. Existing journals
-are migrated additively, preserving their stored evidence.
-
-The journal requires an owner-private directory and mode-600 database/sidecars.
-SQLite transactions use FULL synchronization. Evidence is limited to instance,
-hash and ownership/manifest fingerprints; no titles, paths, endpoints or secrets.
-Preview and simulation records are separate and cannot enable live mode. It
-retains at most 1000 active rows and refuses new ones at capacity; it never silently
-deletes unresolved evidence. Changed stored evidence requires review. Do not
-delete the journal to force a retry. Backups and exports must also stay outside Git.
-The [journal-retention candidate](docs/JOURNAL-RETENTION.md) adds a bounded indexed
-archive that remains visible to safety checks; archive application is disabled
-and is not automatically invoked by workers or constructors.
-
-## Production preflight and disabled single-test sender
-
-```sh
-python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
-```
-
-Preflight rereads eligible candidates and checks Sonarr 4.x. For file-policy
-candidates it verifies the visible grab evidence for native remove and blocklist.
-For metadata it reports read-only outcomes including replacement-grab evidence.
-Preflight creates no dispatch journal
-entry or approval.
-The verifier matches failure history by original hash and episode identity. New
-replacement grabs must have different valid hashes for the affected episodes and
-the same bound client, or a corroborated newer incarnation of the same hash.
-An observed grab is not a verified safe download or import. Blocklist API records have no hash: new IDs are correlated
-by original release-title digest, indexer, series and episodes. Pre-existing
-records never count as new results. After dispatch, event dates must also be at
-or after the durably recorded dispatch time; unsynchronized clocks can prevent
-confirmation and require review.
-
-`production.py` accepts Sonarr 4.x and holds live actions if the major version,
-client, or endpoint is unexpected. Older 4.x builds can return a global
-blocklist even when Guard requests one series. An oversized global response
-can hold an action. See the [blocklist compatibility notes](docs/PUBLIC-WORKFLOW.md).
-API failures leave affected observations unknown.
-The API cannot prove download-side data deletion; `data_deleted` stays unknown,
-so API-only reconciliation cannot mark an operation completely verified. No
-download or library share is mounted/scanned for this purpose.
-
-The single-test coordinator requires all of: an enabled code release gate
-(currently false), an explicit non-dry-run invocation separate from normal CLI,
-a single-test-enabled private journal, and a human approval bound to one instance,
-hash, ownership/manifest fingerprints, nonce and expiry within five minutes. No
-approval file is created by the app. There is no single-test CLI live switch. It takes the
-worker lock, captures baselines, rechecks immediately before intent/dispatch,
-commits the exact queue operation context and dispatch timestamp, and sends only
-the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
-Sonarr owns the downloader operation and native file-policy retry. Guard's
-separate affected-episode search applies to eligible metadata removals.
-
-After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
-version, then revalidates the saved final snapshot's freshness and approval expiry
-immediately before calling the transport. Commit latency and version-check latency
-cannot bypass those checks. A failed check preserves the intent/context in the
-terminal `dispatch_blocked` stage with an allowlisted `stop_reason`; it sends
-nothing and cannot automatically retry that record. The recorded dispatch time
-denotes durable intent, not proof that a request reached the server.
-
-To avoid manufacturing timestamp ambiguity on normally synchronized clocks,
-the disabled senders wait until the next whole UTC second after durable intent
-before sending. The wait is bounded to 1.1 seconds. They then recheck the complete
-candidate and capture/commit extended baseline IDs before final connectivity,
-version, endpoint, freshness and expiry checks. IDs already observed during the
-wait cannot become outcome evidence. Identity, intent time, original observation
-window and older baseline IDs are preserved. A backward/stalled clock, changed
-files or expired approval stops without sending. The verifier is not relaxed:
-same-second overlapping events remain unknown, and clock skew can still prevent
-confirmation. This does not prove that concurrent manual actions were caused by
-the guard. There is no retrospective rewrite/automatic release of existing
-timestamp holds; those require a separately reviewed resolution.
-
-Existing single-test records, including prepared/uncertain records, only enter
-read-only recovery, never a second send. Following any future approved test:
-
-```sh
-python3 production.py --config /path/outside/checkout/connections.json --observe INSTANCE TORRENT_HASH
-```
-
-This reconciles a recorded single-test operation without approval or dispatch.
-Preview/simulation journal namespaces cannot authorize a single test. Production
-context stores only exact IDs, public indexer identity, times and digests, not raw
-release titles, endpoint addresses or credentials. Live integration and independent
-file-deletion confirmation remain required before any activation decision.
-
-## Ten-minute public cycle and maintenance safeguards
-
-```sh
-python3 public.py --config /path/outside/checkout/connections.json
-```
-
-This bounded CLI is always dry-run, even if a release flag is changed. It first
-asks both owning Sonarr instances to test their configured qBittorrent connection.
-If either is unavailable/unverified, it returns `waiting` with a 600-second retry
-interval; it never falls back to downloader-only cleanup. When available, it
-assesses candidates first with fresh checks and the existing fair batch cursor.
-Only afterward does it reconcile a rotating slice of pending action evidence:
-at most five records, five seconds per observation, and thirty seconds total
-within the remaining cycle deadline (leaving two seconds for final persistence).
-Adapter deadlines also enforce each observation's bound if an API branch catches
-a timeout. Recovery's independent cursor is saved beside the assessment cursor
-and survives restarts, including runs without candidates. Unresolved actions
-hold only that instance/hash, even when their recovery is deferred. A hold cleared
-by recovery can be reassessed on the next cycle; no stale proposal is dispatched.
-
-`maintenance.py` uses the reviewed Sonarr version's non-saving download-client
-test endpoint, not cached absence of health warnings. Temporary test categories
-are blank to prevent category creation, and the original provider ID resolves
-Sonarr's own stored/masked credentials. It never substitutes guard credentials,
-saves settings, changes file priorities or adds/removes torrents. Sonarr may
-update its native connection-health status. Redirects, unexpected warnings/errors,
-outages and malformed responses mean wait. Only the expected blank-category
-warning is accepted alongside an otherwise successful test. The older `guard.py`
-assessment CLI remains GET-only apart from qBittorrent session login.
-
-The disabled `execute_public_attempt` coordinator adds a separate release gate,
-armed journal and exact short-lived approval requirement. It does not authorize
-itself from the scheduler. Each action binds the attempt and approval digest;
-a later confirmed grab needs a new approval and newer addition/grab identities.
-Uncertain, prepared or manual-review production records prevent another cleanup
-of that same attempt through either sender mode, including single-test actions.
-An independently confirmed newer grab can supersede an older hold without
-rewriting historical evidence; see the unattended trial rules below.
-Definite unsent cancelled/blocked records are preserved;
-after maintenance a new exact approval may prepare a distinct operation, never
-resend from recovery or reuse the old approval. Final connectivity/version,
-endpoint binding, snapshot freshness and approval checks run after intent commit.
-
-For these new attempt records, `cleanup_resolved` requires current positive
-original-incarnation absence, failure and blocklisting. It does not claim file
-deletion, a safe replacement or import; those remain separately reported. Legacy
-single-test records retain their original stages and one-action-per-hash rule.
-The 1000-active-row bound remains fail-closed; no records are automatically purged or
-uncertain evidence discarded. An explicit, disabled housekeeping candidate can
-move old confirmed records into a safety-aware indexed archive; see
-[journal retention](docs/JOURNAL-RETENTION.md). Activation requires review. Ongoing permission is still needed
-before unattended long-term activation.
-
-`deploy/` contains optional user-service and ten-minute timer templates for this
-dry-run CLI. They are not installed or enabled. The timer waits ten minutes after
-each completed cycle, avoids catch-up bursts and cannot enable either sender.
-Paths are templates; review them for the chosen installation before any use.
-
-## Unattended entry point
-
-`routine.py --live` uses a separate explicit, owner-private authorization grant
-bound to the configured scope. Trial grants last at most seven days and also
-bind the exact application code. A standalone ongoing grant can follow reviewed code updates within its existing scope after explicit opt-in.
-There is no installed/enabled grant by default. It uses the same coordinator and
-Sonarr-only cleanup checks, not a scheduled human-test script. Logs record each
-action and grant digest; old uncertain evidence is preserved, while a strictly
-newer confirmed grab may be handled independently. Separate live user-unit
-templates are provided but not automatically installed. See
-[unattended trial](docs/UNATTENDED-TRIAL.md) for exact permission, supersession,
-maintenance, expiry, reporting and capacity boundaries.
-
-## Remaining milestones
-
-- Validate controlled dry-run candidates.
-- Review Sonarr v5 before extending support. Guard uses Sonarr 4.x's v3 API.
-- Review the disabled sender and production verifier, then explicitly approve a
-  controlled single-torrent integration test separately. Define independent data
-  deletion confirmation. Guard/public commands remain dry-run. The standalone routine worker
-  requires explicit live mode and a valid scope-bound grant (an unexpired
-  trial or separately approved ongoing permission).
-- Longer term: define private split-RAR selection, share access, safe extraction, atomic
-  publication, positive import confirmation and exact helper-file cleanup.
-- Validate the existing container image and Unraid template in a separately
-  approved deployment; packaging is implemented, but packaging checks do not
-  establish live integration behaviour. Add a read-only web UI using report
-  events after the public workflow is settled.
-
-Design reference: [qBittorrent checker](https://github.com/sergiobaiao/qbittorrent-checker).
-This is an independent implementation; no upstream script or exclusion list is
-bundled. Any future source reuse requires licensing review. This project is
-licensed under GPL-3.0-only; see [LICENSE](LICENSE).
+Licensed under the [GNU General Public License version 3 only](LICENSE)
+(`GPL-3.0-only`). Copyright (C) 2026 Sonarr Torrent Guard contributors.
+Distributed without warranty. This is an independent implementation with
+[qBittorrent checker](https://github.com/sergiobaiao/qbittorrent-checker) as a
+design reference.

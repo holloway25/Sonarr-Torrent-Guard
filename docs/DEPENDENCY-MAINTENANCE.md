@@ -56,9 +56,9 @@ still need maintenance.
 - Application-code changes still need review. The three-day schedule changes only
   GitHub maintenance, not any host's polling schedule or runtime settings.
 
-Python-family and Debian-release upgrades are deliberate, review-gated migrations,
-not routine dependency refreshes. The pinned Trixie base was verified as Python
-3.15.1. CI checks the actual interpreter and OS family, trusted CA loading, runs
+Python-family and Debian-release upgrades require a reviewed migration. Compatible
+Python patch releases and Trixie package updates follow the maintenance path.
+CI checks the configured runtime family and trusted CA loading, runs
 the full suite inside the new image and exercises configuration/startup and
 bounded shutdown. Automatic release rejects previous Python-family or Bookworm
 baselines: the first Trixie image needs explicit reviewed promotion before
@@ -101,7 +101,23 @@ tested image before recording its digest. The run summary reports the index or
 list digest, which both release workflows copy directly to `latest`. A private GitHub job token is used only by the registry-publish
 step; application/API credentials are never involved.
 
-## Automatic dependency release; manual application review
+## Application release review
+
+1. Review the source change on `main` and check that **Checks** and **Container**
+   passed for it. Ordinary push builds exercise the container in CI and skip
+   publication.
+2. Run **Container** on `main` with `publish: true`. Record the source revision,
+   publication run ID and exact candidate digest from the run.
+3. Review that published candidate. For startup, authorization or journal
+   changes, rehearse an offline upgrade from the previous released image using
+   populated test appdata. Verify that the configured scope and journal
+   evidence survive and that native file cleanup works with an unavailable
+   journal.
+4. Run **Promote reviewed image** on `main` with that digest, the publication run
+   ID and `review_approved: true`. An independently managed host updater can then
+   pull `latest`.
+
+## Automatic dependency release
 
 PRs are not automatically merged. After a successful published maintenance build
 on `main`, **Release tested dependency refresh** runs automatically. It verifies

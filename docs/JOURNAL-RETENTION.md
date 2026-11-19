@@ -5,6 +5,8 @@ no service/timer or automatic worker call is added. Deployment and application
 need explicit approval after review. Review changes to an authorized running checkout before deployment.
 Changes to safety.py affect the code digest checked by trial grants. Housekeeping never
 extends permission, changes queue/client settings or sends network requests.
+The action journal covers metadata retry and retained historical actions. Native
+file-policy cleanup proceeds from current evidence independently of retention.
 
 Deploy the archive-aware worker FIRST, and verify its authorization,
 before enabling or applying archival. Never move production rows while an older
@@ -14,7 +16,7 @@ private consistent backup during the separately approved deployment.
 
 ## Conservative policy
 
-- Keep up to 1,000 active action rows. At capacity, Guard holds new actions.
+- Keep up to 1,000 active action rows. At capacity, Guard holds new journal-based actions.
 - Archive only confirmed resolved production records whose last update is at
   least 30 days old. Batch size ranges from 1 to 100 and defaults to 100.
 - Eligible stages are `cleanup_resolved` in the public-attempt namespace, and
@@ -31,8 +33,8 @@ private consistent backup during the separately approved deployment.
   No oldest-record eviction, purge, expiry or silent unlimited growth.
 
 These are proposed conservative defaults, not a newly approved infinite runtime.
-If unresolved or excluded records fill the active journal, it still stops new
-actions. An operator must investigate rather than deleting evidence to resume.
+If unresolved or excluded records fill the active journal, it holds new
+journal-based actions. Preserve the evidence while investigating the hold.
 
 ## Archive design
 

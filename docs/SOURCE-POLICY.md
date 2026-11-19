@@ -16,8 +16,9 @@ Missing, empty/whitespace, malformed or conflicting source identity still blocks
 assessment. The source must come from the exact Sonarr grab bound to the current
 download and content. Unknown identity is different from an identified but
 unlisted name: the latter is now public by policy. Manual additions without that
-history, wrong clients/categories/endpoints, private matches, healthy media and
-normal completed/stopped torrents remain protected by the existing checks.
+history, wrong clients/categories/endpoints, private matches, and healthy
+downloads remain protected. Paused or stopped status alone is insufficient for
+cleanup.
 
 For file configuration:
 

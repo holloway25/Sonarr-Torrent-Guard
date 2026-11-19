@@ -1,9 +1,9 @@
 # Metadata-only removal and retry
 
-The reviewed policy gate `METADATA_RETRY_RELEASE_ENABLED` is enabled, but does
-not authorize requests on its own. Manual/test sender gates remain disabled;
-Docker requires explicit live mode. Standalone routine execution also requires
-a valid scope-bound v3 grant. Ordinary commands stay dry-run.
+Metadata retry is available to explicitly authorized live workers. Docker
+requires live mode and a matching scope. Standalone operation requires a valid
+scope-bound v3 grant. The worker also needs a usable action journal. A metadata
+journal hold still allows approved public file cleanup.
 
 ## Policy
 
@@ -25,10 +25,8 @@ timeouts may therefore lead to repeated searches until the trial expires or the
 existing bounded journal reaches capacity and fails closed.
 
 File-policy failures use Sonarr's [native remove-and-blocklist action](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
-Existing
-blocklist entries are not removed or bypassed: Sonarr can reject the same known
-hash across indexers for the series. No direct qBittorrent deletion, file deletion,
-selection, resume, tracker/DHT change, indexer selection or scoring change is added.
+Sonarr still applies its existing blocklist, including known hash matches
+across indexers for the series. Sonarr owns removal and replacement selection.
 
 ## Requests and evidence
 

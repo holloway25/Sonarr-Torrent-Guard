@@ -120,13 +120,16 @@ normal startup to recover. [SQLite rollback recovery](https://www.sqlite.org/loc
 
 Journal-based operations require both records to agree with the database.
 If the journal cannot be used, an approved live worker can still perform
-file-policy cleanup from the current queue. It reports the metadata hold and
-preserves the existing journal files. Checks and scope approval still validate
-the journal read-only before accepting any journal-based operation.
+file-policy cleanup from the current queue. It preserves the existing journal
+files and reports `container_metadata_waiting` at startup or
+`metadata_journal_waiting` in the cycle summary. `--check-config` validates
+the journal without writing it. Scope approval validates it and can initialize
+or bind it before saving the approval.
 Existing installs with a matching journal and marker acquire the independent
 binding automatically. An uninitialized legacy journal without prior live
 approval can still be adopted. A previously approved install lacking both
-identity records must recover its matching journal and marker first.
+identity records needs its matching journal and marker before metadata actions
+can resume.
 Keep the configuration, scope, journal, marker and binding together when
 backing up or restoring. Metadata removal and search verify that the opened
 journal is still in place before sending.
@@ -140,10 +143,11 @@ Do not replace this directory when updating an image or reset it to bypass holds
 
 ## Scheduler and health
 
-The Python PID1 scheduler runs one cycle, then waits600 seconds after completion.
-No overlapping cycles or catch-up bursts. Dry-run uses existing public assessment
-and read-only recovery, including Sonarr's non-saving connection diagnostic; no
-removal, blocklisting or searches. Maintenance waits retry on later cycles.
+The scheduler runs one cycle, then waits 600 seconds after completion.
+Cycles do not overlap or catch up in bursts. Dry-run uses Sonarr's non-saving
+connection diagnostic, reports proposed actions and can update journal observations
+from read-only recovery. Removal, blocklisting and searches require live mode.
+Maintenance waits are retried on later cycles.
 `--once` runs one cycle. `--check-config` validates the candidate configuration
 and live scope without sending API requests or saving the configuration or scope.
 A lifetime lock prevents another container using the SAME appdata; it cannot
@@ -164,8 +168,8 @@ stop is required. This is a bound on
 application waiting, not a guarantee against an uninterruptible kernel/storage
 stall or other containers delaying array shutdown. Do not change Unraid's array
 unmount/parity safety settings to compensate for an application shutdown fault.
-Durable intent/no-replay evidence survives
-in appdata. Restarting preserves holds on uncertain actions.
+Appdata preserves journal-based metadata holds across restarts. File-policy
+cleanup starts each pass from the current queues and file manifests.
 
 Health means a recent scheduler heartbeat, NOT healthy API connectivity, valid
 permission or completed cleanup. Check sanitized cycle logs for waits/errors.
@@ -174,17 +178,19 @@ Docker log rotation on the host too. No automatic journal archival is enabled.
 
 ## Live mode and cutover
 
-`STGUARD_MODE=live` permits qualifying file-policy cleanup and metadata retries
-through the owning Sonarr. Unset the variable or set it
-to `dry-run` for reporting only. Apply a mode change by recreating the
+`STGUARD_MODE=live` allows the owning Sonarr's native Remove and Blocklist
+action for verified bad public files. Sonarr handles its own replacement.
+[Metadata retry](METADATA-RETRY.md) is available separately through the same live
+worker when journal checks pass. Unset the variable or set it to `dry-run`
+for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.
 
 Fresh appdata records the configured cleanup scope on the first live start.
-Subsequent image updates reuse that record while the scope and rule match.
-An install with existing appdata from an older release holds live cleanup until
-you confirm its scope, even if its mode already says `live`. Old grant files
-remain available for standalone installations or rollback.
+Subsequent image updates reuse the approved record while the scope and rule
+match. Older installs without an accepted scope may report
+`container_live_scope_confirmation_required` even if their mode says `live`.
+Use the confirmation procedure below when the worker reports that hold.
 
 Changing scope, including removing a private indexer exception, holds live
 cleanup until you confirm the new settings. A missing, unreadable or changed
@@ -266,8 +272,9 @@ Before applying the template on Unraid:
    pinned client IDs; keep mode `dry-run`. An empty private list excludes no
    identified indexers; verify all private aliases before enabling live actions.
    Do not substitute example defaults for actual ownership/source verification.
-4. Start it and inspect connectivity, proposals and sanitized wait reasons.
-   It must send no removal/blocklist/search requests. Stop/restart it while idle
+4. Start it in dry-run and inspect connectivity, file-policy proposals, metadata
+   proposals and wait reasons. Confirm that known private and healthy torrents
+   are skipped or kept. Stop/restart it while idle
    and active, check prompt exit rather than forced kill, and confirm config and
    journal/cursor evidence survive. Do not disturb unrelated containers or array.
 5. Keep the new appdata separate from the current worker's appdata until cutover.
