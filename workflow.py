@@ -1,30 +1,21 @@
 """Read-only readiness checks and request previews; contains no live executor."""
 
 
-# Sonarr's public history can omit grabs used by the blocklist operation.
-# The old journalled test senders require equivalent blocklisting evidence.
-# Scheduled file cleanup uses Sonarr's native queue action explicitly.
-BLOCKLIST_SCOPE_VERIFIABLE = False
-BLOCKLIST_MANUAL_REASON = "sonarr_blocklist_scope_unverifiable"
 FILE_FAILURE_REASONS = ("contains_exe", "contains_scr", "blocked_file_selected",
                         "all_files_unselected", "only_txt_nfo_selected")
 
 
 def file_policy_removal(report):
     reasons = report.get("reasons", ())
-    return (not BLOCKLIST_SCOPE_VERIFIABLE and report.get("decision") == "would_fail"
+    return (report.get("decision") == "would_fail"
             and isinstance(reasons, (list, tuple)) and bool(reasons)
             and all(reason in FILE_FAILURE_REASONS for reason in reasons))
 
 
-def removal_without_blocklist(context):
-    return context.get("file_cleanup") is True or context.get("metadata_retry", {}).get("blocklist") is False
-
-
 def manual_handling_reason(report):
     if (report.get("decision") == "would_fail" and report.get("reasons") != ["metadata_timeout"]
-            and not BLOCKLIST_SCOPE_VERIFIABLE and not file_policy_removal(report)):
-        return BLOCKLIST_MANUAL_REASON
+            and not file_policy_removal(report)):
+        return "unsupported_failure_reason"
     return None
 
 

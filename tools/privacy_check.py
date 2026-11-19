@@ -69,14 +69,22 @@ def main():
         if (leaf.startswith("handoff") or leaf.endswith(".env") or leaf.startswith(".env.")
                 or (leaf.startswith("connections") and leaf.endswith(".json"))
                 or leaf.startswith((".guard-", ".batch-")) or leaf == ".connections-validation.json"
-                or leaf in ("config.json", "batch-state.json", "routine-authorization.json",
-                            "container-live-scope.json", "container-live-journal.json", "container-status.json",
-                            "container-journal-binding.json")
-                or leaf.endswith((".log", ".lock", ".zip", ".sqlite3")) or ".sqlite3-" in leaf or ".log." in leaf
+                or (leaf.startswith("container-") and leaf.endswith(".json"))
+                or leaf in ("config.json", "batch-state.json", "routine-authorization.json")
+                or leaf.endswith((".log", ".lock", ".zip")) or ".log." in leaf
                 or any(x in ("local", "downloads", "staging") for x in parts)):
             issues.append((name, "prohibited runtime or handoff artifact"))
         data = Path(name).read_bytes() if args.all else git("show", ":" + name)
-        text = data.decode("utf-8", errors="replace")
+        if name == "assets/sonarr-torrent-guard-darker.png" and data.startswith(b"\x89PNG\r\n\x1a\n"):
+            text = data.decode("utf-8", errors="replace")
+        else:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeError:
+                text = None
+            if text is None or "\x00" in text:
+                issues.append((name, "unexpected binary file"))
+                continue
         for reason, pattern in patterns.items():
             if re.search(pattern, text):
                 issues.append((name, reason))

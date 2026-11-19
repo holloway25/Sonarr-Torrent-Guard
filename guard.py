@@ -124,11 +124,7 @@ class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         if config_path is not None:
             state_files = ("connections.json", ".connections-validation.json", "guard.lock", "batch-state.json",
                            "routine-authorization.json", "container-live-scope.json", "container-status.json",
-                           "container-journal-binding.json",
-                           "container-live-journal.json", "preview-journal.sqlite3", "preview-journal.sqlite3-journal",
-                           "preview-journal.sqlite3-wal", "preview-journal.sqlite3-shm",
-                           "container-worker.lock", "action-journal.sqlite3", "action-journal.sqlite3-journal",
-                           "action-journal.sqlite3-wal", "action-journal.sqlite3-shm")
+                           "container-worker.lock")
             reserved = {(config_path.parent / name).resolve() for name in state_files}
             reserved.add(config_path.resolve())
         if authorization_path is not None:
@@ -196,10 +192,7 @@ def load_batch_state(path):
             if os.name != "nt" and mode & 0o077:
                 raise GuardError("invalid_batch_state")
             validate_identity_cache(state["identity_cache"])
-        if "recovery_after" in state:
-            from safety import valid_digest
-            if not valid_digest(state["recovery_after"]):
-                raise ValueError()
+        state.pop("recovery_after", None)  # Ignore the retired cursor in previously written state.
         return state
     except FileNotFoundError:
         return {}

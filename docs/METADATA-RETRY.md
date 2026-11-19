@@ -65,9 +65,8 @@ response or missing removal evidence stops the follow-up search. A lost search
 response is logged as uncertain. An interruption can leave a removed torrent
 without a new search. Subsequent passes assess what is currently queued.
 
-Guard holds evidence for the two requests in memory during one pass. The
-worker uses no database, replay queue or attempt counter, and it never reads
-the log to decide what to do.
+Guard holds evidence for the two requests in memory during one pass. Later
+passes use current evidence from Sonarr and qBittorrent.
 
 - [Sonarr queue removal](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs)
 - [Sonarr command submission](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Commands/CommandController.cs)

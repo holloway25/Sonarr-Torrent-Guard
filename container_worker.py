@@ -260,7 +260,7 @@ def main():
                 print(json.dumps({"event": "container_live_scope_confirmed", "actions_sent": False}))
                 return 0
             if mode == "live":
-                ContainerAuthorization(load_config(path), path, bind_journal=False)
+                ContainerAuthorization(load_config(path), path)
             signal.signal(signal.SIGTERM, stop_worker)
             signal.signal(signal.SIGINT, stop_worker)
             while not STOP.is_set():

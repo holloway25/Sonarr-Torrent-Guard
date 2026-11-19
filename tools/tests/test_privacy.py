@@ -19,7 +19,7 @@ class PrivacyFilenameTests(unittest.TestCase):
                  "nested/connections.production.json", ".connections-validation.json",
                  "nested/.guard-sample", "nested/routine.log.1")
         newly_ignored = ("nested/.batch-example", "nested/container-status.json",
-                         "nested/container-journal-binding.json")
+                         "nested/container-runtime.json")
         names += newly_ignored
         for name in names:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -38,6 +38,20 @@ class PrivacyFilenameTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertIn("prohibited runtime or handoff artifact", result.stdout)
                     self.assertNotIn("opaque-value", result.stdout + result.stderr)
+
+    def test_unexpected_binary_file_is_rejected_in_staged_and_tracked_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "private-state"
+            target.write_bytes(b"private-data\x00state")
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            subprocess.run(["git", "add", "--", target.name], cwd=root, check=True)
+            for flags in ([], ["--all"]):
+                result = subprocess.run([sys.executable, str(CHECKER), *flags],
+                                        cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("private-state: unexpected binary file", result.stdout)
+                self.assertNotIn("private-data", result.stdout + result.stderr)
 
     def test_private_environment_file_is_ignored_and_forced_credential_assignments_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

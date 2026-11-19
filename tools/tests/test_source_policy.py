@@ -144,7 +144,6 @@ class SourcePolicyTests(unittest.TestCase):
         f.config["sonarr"]["HD"]["indexers"] = {"mode": "private_exclusions", "private": ["Private Source"]}
         f.grab["data"]["indexer"] = "New Public Source"
         f.report = run(f.config, f.qb, f.apis)[0]
-        f.journal.allow_public_attempt = True
         now = time.time()
         grant = {"enabled": True, "rule": RULE, "grant_id": "c" * 64, "issued_at": now - 1,
                  "expires_at": now + 3600, "scope_digest": scope_digest(f.config), "code_digest": code_digest()}
@@ -152,14 +151,10 @@ class SourcePolicyTests(unittest.TestCase):
 
     def test_routine_sender_accepts_unlisted_source_only_under_explicit_grant(self):
         f, _, authority = self.production_fixture()
-        def results(*args):
-            f.results()
-            for row in f.s.routes["/api/v3/blocklist"]["records"]:
-                row["indexer"] = "New Public Source"
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=results) as send:
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
-        self.assertEqual(row["stage"], "cleanup_resolved")
+                "production._send_queue_delete", ) as send:
+            row = production.execute_native_file_removal(f.config, f.qb, f.apis, f.report, authority, f.lock_path)
+        self.assertIsNone(row)
         send.assert_called_once()
 
     def test_routine_rejects_private_missing_and_malformed_sources(self):
@@ -193,12 +188,11 @@ class SourcePolicyTests(unittest.TestCase):
         calls = []
         def connection(*args):
             calls.append(1)
-            if len(calls) == 3:
-                f.config["sonarr"]["HD"]["indexers"]["private"].append("New Public Source")
+            f.config["sonarr"]["HD"]["indexers"]["private"].append("New Public Source")
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production.require_connectivity", side_effect=connection), patch("production._send_queue_delete") as send:
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
-        self.assertIn(row["stage"], ("cancelled", "dispatch_blocked"))
+            with self.assertRaises(SafetyError):
+                production.execute_native_file_removal(f.config, f.qb, f.apis, f.report, authority, f.lock_path)
         send.assert_not_called()
 
 

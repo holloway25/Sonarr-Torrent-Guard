@@ -26,9 +26,8 @@ Guard checks the next grab on a later scheduled pass.
    current queue on the next pass. Each replacement or re-grab is assessed
    from its current evidence, including a grab from another public indexer.
 
-Dry-run and live operation work without SQLite. The logs record proposals or
-actions for inspection. Guard saves private batch cursors so large queues get
-a fair turn.
+The logs record dry-run proposals and live actions. Guard saves private batch
+cursors so large queues get a fair turn.
 See the [public workflow](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup) for the
 exact request, Sonarr's history limits and how to read the result.
 
@@ -104,7 +103,7 @@ Use `--format json` with `guard.py` for JSON-line reporting.
 `--show-titles` displays escaped titles only in the text output.
 `--log-file PATH` writes rotating JSON logs to a private location.
 `--check-safeguards` adds a targeted dry-run recheck and includes its result in
-the report without creating a preview database.
+the report.
 
 The optional dry-run and live service templates are in `deploy/`. Standalone
 live operation requires `routine.py --live` and a private scope-bound grant.
@@ -124,8 +123,7 @@ See [standalone authorization](docs/UNATTENDED-TRIAL.md).
 
 Docker and the supplied service templates write `dry-run.log` for would-remove
 proposals and `routine.log` for live actions. Both logs rotate. Logs are never
-read back to decide what to remove. Older SQLite files in appdata can be kept as
-historical records.
+read back to decide what to remove.
 
 [Production preflight](docs/PUBLIC-WORKFLOW.md#production-verification-and-sender-gates)
 can check one candidate without sending a removal or search:
@@ -134,10 +132,8 @@ can check one candidate without sending a removal or search:
 python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
 ```
 
-Keep connection settings, grants, logs, journals and backups outside Git.
-Runtime logs omit credentials, raw endpoints, release titles, filenames and
-download paths. [Legacy journal tools](docs/JOURNAL-RETENTION.md) are available
-for inspecting records from older releases.
+Keep connection settings, grants, logs and backups outside Git. Runtime logs
+omit credentials, raw endpoints, release titles, filenames and download paths.
 
 ## Verify changes
 
@@ -149,9 +145,8 @@ git config core.hooksPath .githooks
 
 CI runs the source tests, privacy checks and offline container tests. The live
 file-cleanup tests use fake services to check the exact Sonarr request, a later
-public re-grab, protection of private and ambiguous torrents, and operation
-without an action journal. An offline pass verifies request construction and
-safety checks. A live integration check verifies behavior on an installed setup.
+public re-grab, and protection of private and ambiguous torrents. An offline
+pass verifies request construction and safety checks. A live integration check verifies behavior on an installed setup.
 
 ## License and design reference
 

@@ -239,13 +239,11 @@ class ContainerTests(unittest.TestCase):
         cycle.assert_called_once_with("live", self.path / "connections.json")
         self.assertFalse((self.path / "routine-authorization.json").exists())
 
-    def test_new_cleanup_rule_requires_one_confirmation_and_ignores_old_database(self):
+    def test_new_cleanup_rule_requires_one_confirmation(self):
         env = dict(self.env, STGUARD_MODE="live")
         config = worker.runtime_config(env)
         scope = worker.container_scope_record(config)
         worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, dict(scope, rule="public-sonarr-cleanup-v3"))
-        journal = self.path / "action-journal.sqlite3"
-        journal.write_bytes(b"corrupt older journal")
         for command in ("--check-config", "--once"):
             result, cycle, error = self.run_mode(env, command)
             self.assertEqual(result, 1)
@@ -259,8 +257,6 @@ class ContainerTests(unittest.TestCase):
             result, cycle, _ = self.run_mode(dict(env, STGUARD_MODE=mode), "--once")
             self.assertEqual(result, 0)
             cycle.assert_called_once_with(mode, self.path / "connections.json")
-        self.assertEqual(journal.read_bytes(), b"corrupt older journal")
-        self.assertFalse((self.path / "preview-journal.sqlite3").exists())
 
     def test_environment_preserves_existing_owner_labels(self):
         config = worker.runtime_config(self.env)

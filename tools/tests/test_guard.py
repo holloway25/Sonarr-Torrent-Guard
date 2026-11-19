@@ -805,7 +805,7 @@ class TransportTests(unittest.TestCase):
             os.link(config, hardlink)
             for path, reason in (
                     (config, "log_destination_reserved"),
-                    (root / "action-journal.sqlite3-wal", "log_destination_reserved"),
+                    (root / "container-status.json", "log_destination_reserved"),
                     (root / "routine-authorization.json", "log_destination_reserved"),
                     (hardlink, "log_destination_not_private_file")):
                 with self.subTest(path=path.name), contextlib.redirect_stderr(io.StringIO()) as errors, patch(

@@ -10,7 +10,7 @@ import subprocess
 
 BASE = "python:3.15-slim-trixie"
 IMAGE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",
-               "authorization.py", "routine.py", "workflow.py", "reports.py", "retention.py",
+               "authorization.py", "routine.py", "workflow.py", "reports.py",
                "container_worker.py", "LICENSE")
 BUILD_POLICY_FILES = (".dockerignore", ".github/workflows/container.yml",
                       ".github/workflows/promote-image.yml", ".github/workflows/release-dependencies.yml",

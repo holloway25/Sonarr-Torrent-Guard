@@ -53,6 +53,6 @@ operator confirms the new scope. See [container setup](CONTAINER.md#live-mode-an
   obsolete public entries that overlap with a private exception.
 
 Before running with a changed policy, review the exact private exceptions for
-both Sonarr owners and retain the complete journal. Standalone workers need a
+both Sonarr owners and retain the action logs. Standalone workers need a
 grant for the new scope. Docker workers require a scope confirmation. You can
 review the changed policy in `dry-run` before confirming it.

@@ -80,8 +80,7 @@ timeout or restart.
    failed and blocklists it. Sonarr applies its own failed-download retry
    settings when deciding whether to search again. Guard assesses whatever is
    queued at the next scheduled pass, including a re-grab or a different public
-   release. Each pass uses current evidence, without an action journal,
-   retry count or separate Guard search.
+   release. Each pass uses current evidence. Sonarr owns file-policy retries.
 
 The cycle continues as Sonarr grabs replacements. A healthy grab stays in the
 queue. The episode may remain missing when Sonarr has no eligible release.
@@ -149,17 +148,14 @@ replacement is already queued or grabbed. A later pass never resumes an earlier
 search request. Dry-run logs proposals, and live mode logs action outcomes.
 Both use private rotating files. The logs are not inputs to Guard's decisions.
 
-Existing database files can remain in appdata for historical reference.
-[Legacy journal tools](JOURNAL-RETENTION.md) are separate from scheduled operation.
-
 ## Verification before enabling live operation
 
 - In dry-run, verify connectivity, both owners' public/private source rules,
   proposed file and metadata actions and safe handling of healthy or unowned
   torrents.
 - Use mocked services to test the exact Sonarr request, changed manifests and
-  scopes, a fresh pass after a failed request or re-grab, and continued file
-  cleanup without SQLite. Test that an interrupted metadata pass cannot replay a search.
+  scopes, a fresh pass after a failed request or re-grab, and log output.
+  Test that an interrupted metadata pass cannot replay a search.
 - A controlled live check can confirm Sonarr's failure history, blocklist and
   replacement, and the torrent/data removal in the downloader. Approval for a
   live check is separate from a passing source or container test.

@@ -4,7 +4,7 @@ GitHub's Container workflow tests source/privacy, builds an official Python-base
 image and runs offline non-root/read-only smoke checks. Normal builds use the
 reviewed base pin; maintenance resolves a fresh digest in the same compatible
 Python/distro family. Build context
-and COPY use exact source allowlists, plus the GPLv3 licence text. No config, grant, API key, login, journal,
+and COPY use exact source allowlists, plus the GPLv3 licence text. No config, grant, API key, login,
 logs, handoff, Git checkout, examples or tests are copied into the image. No
 credentials are build arguments. GitHub's short-lived registry token is used only
 for authorized publication, never passed into the image build.
@@ -102,9 +102,6 @@ ambiguous bindings or extra/missing owners require an explicit identity
 migration. Startup preserves the existing configuration on failure. File mode
 uses the supplied private configuration.
 
-Older appdata may contain an action journal, preview database or journal
-identity files. Current startup and scheduled checks leave those legacy files
-untouched. You can retain them for historical inspection or rollback.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.

@@ -63,7 +63,7 @@ the full suite inside the new image and exercises configuration/startup and
 bounded shutdown. Automatic release rejects previous Python-family or Bookworm
 baselines: the first Trixie image needs explicit reviewed promotion before
 three-day Python 3.15/Trixie maintenance can advance `latest`. Existing appdata,
-logs, journals and permissions are retained; changing the base is not authority
+logs and permissions are retained; changing the base is not authority
 to migrate or reset runtime state. Docker keeps its configured mode across updates.
 Standalone trial grants require refreshed code authorization for application changes.
 Standalone ongoing grants can follow reviewed updates within their scope after explicit opt-in.
@@ -83,7 +83,7 @@ this change does not upgrade the container host's operating system.
 - There are no application pip dependencies to download/cache. Commit-pinned
   Docker Buildx/build actions reuse GitHub-hosted image-layer cache for test builds.
   Only `main` push tests export cache; PRs and publishers do not write that cache.
-  No credentials, runtime config, appdata or journals are stored in it.
+  No credentials, runtime config or appdata are stored in it.
 - Cache is an optimization, not release evidence. Maintenance and explicitly
   published candidates always pull the compatible base and disable layer reuse
   for the build, ensuring package upgrades execute. All source/privacy tests,
@@ -112,8 +112,7 @@ step; application/API credentials are never involved.
    publication run ID and exact candidate digest from the run.
 3. Review that published candidate. For startup, authorization or cleanup
    changes, rehearse an offline upgrade from the previous released image using
-   populated test appdata. Check scope confirmation, log output and operation
-   with no database or a leftover legacy journal.
+   populated test appdata. Check scope confirmation, proposed actions and log output.
 4. Run **Promote reviewed image** on `main` with that digest, the publication run
    ID and `review_approved: true`. An independently managed host updater can then
    pull `latest`.
@@ -165,8 +164,7 @@ host or changes its schedule, appdata or services. Dependency-only image rebuild
 preserve the configured Docker mode and any standalone grants. For standalone
 workers, reviewed application updates retain an ongoing grant only when it explicitly
 allows code updates and its cleanup scope and rule still match. Other grants bind the exact code, and
-scope or rule changes require a newly approved grant. Existing resolved/unresolved journal evidence
-must be preserved during host updates.
+scope or rule changes require a newly approved grant.
 
 References: [Dependabot configuration](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configure-version-updates),
 [scheduling limits](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule),

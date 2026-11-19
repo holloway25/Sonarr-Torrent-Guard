@@ -12,14 +12,9 @@ import time
 from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config, run, recheck_candidate,
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
-from production import OutcomeVerifier, check_prior_attempts
-from safety import (SafetyError, check_fresh,
-                    metadata_journal_wait_reason, open_lock_file, reconcile)
-from workflow import file_policy_removal, manual_handling_reason
+from safety import SafetyError, check_fresh, open_lock_file
+from workflow import manual_handling_reason
 
-RECOVERY_LIMIT = 5
-RECOVERY_SECONDS = 30
-RECOVERY_ITEM_SECONDS = 5
 PERSIST_SECONDS = 2
 
 
@@ -38,51 +33,7 @@ def limit_adapter_deadlines(adapters, deadline):
                 del api.deadline
 
 
-def recover_pending(config, qb, apis, journal, batch_state, deadline):
-    """Recover a bounded, rotating slice while the caller holds guard.lock."""
-    keys = sorted(r[0] for r in journal.db.execute(
-        "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt') "
-        "AND (stage IN ('dispatch_recorded','uncertain','replacement_pending') "
-        "OR (stage = 'prepared' AND dispatched_at IS NULL))").fetchall())
-    after = batch_state.get("recovery_after", "")
-    keys = [k for k in keys if k > after] + [k for k in keys if k <= after]
-    end = min(deadline - PERSIST_SECONDS, time.monotonic() + RECOVERY_SECONDS)
-    recovered = []
-    adapters = [qb, *apis.values()]
-    for key in keys[:RECOVERY_LIMIT]:
-        if time.monotonic() >= end:
-            break
-        item_end = min(end, time.monotonic() + RECOVERY_ITEM_SECONDS)
-        try:
-            row = journal.get(key)
-            if row["stage"] == "prepared":
-                row = journal.transition(key, "prepared", "cancelled", stop_reason="abandoned_before_dispatch")
-            else:
-                # An observation branch can catch an alarm. Each subsequent
-                # request still has to respect the same recovery deadline.
-                try:
-                    with limit_adapter_deadlines(adapters, item_end), hard_deadline(item_end):
-                        verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
-                        observation = verifier.observe()
-                except Exception:
-                    observation = None
-
-                def observe():
-                    if observation is None:
-                        raise SafetyError("recovery_observation_unavailable")
-                    return observation
-
-                row = reconcile(journal, key, observe)
-            result = {"key": key, "stage": row["stage"], "confirmed": row["confirmed"]}
-            if row["stop_reason"] is not None:
-                result["stop_reason"] = row["stop_reason"]
-            recovered.append(result)
-        finally:
-            batch_state["recovery_after"] = key
-    return recovered
-
-
-def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False):
+def cycle(config, qb, apis, batch_state=None, *, reserve_dispatch=False):
     if batch_state is None:
         batch_state = {}
     adapters = [qb, *apis.values()]
@@ -91,13 +42,7 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
     deadline = min([d for d in deadlines if d is not None] + [started + 180])
     budget = deadline - started
     assessment_end = started + budget / 2
-    if reserve_dispatch:
-        verification_end = started + budget * (2 / 3 if journal is not None else 3 / 4)
-        recovery_end = started + budget * 3 / 4
-    else:
-        recovery_end = deadline
-        verification_end = deadline - (min(RECOVERY_SECONDS + PERSIST_SECONDS, budget / 4)
-                                       if journal is not None else PERSIST_SECONDS)
+    verification_end = started + budget * 3 / 4 if reserve_dispatch else deadline - PERSIST_SECONDS
     # Validate both owners before contacting the downloader. The shorter scan
     # deadline reserves time even when a large queue exhausts assessment.
     with limit_adapter_deadlines(adapters, assessment_end):
@@ -129,27 +74,11 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
                 with hard_deadline(verification_end):
                     fresh = recheck_candidate(report, config, qb, apis)
                     check_fresh(report, fresh)
-                    if journal is not None and not file_policy_removal(report):
-                        check_prior_attempts(journal, report, config=config)
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
-            except Exception as error:
-                reason = metadata_journal_wait_reason(error) if journal is not None else None
-                if reason is None:
-                    raise
-                report["safeguards"] = {"status": "held", "reason": reason, "live_enabled": False}
-    recovered = []
-    if journal is not None:
-        try:
-            recovered = recover_pending(config, qb, apis, journal, batch_state, recovery_end)
-        except Exception as error:
-            reason = metadata_journal_wait_reason(error)
-            if not reserve_dispatch or reason is None:
-                raise
-            recovered = [{"stage": "held", "stop_reason": reason}]
     return {"dry_run": True, "status": "assessed", "retry_after_seconds": RETRY_AFTER_SECONDS,
-            "live_sender_enabled": False, "recovery": recovered, "assessment": reports}
+            "live_sender_enabled": False, "assessment": reports}
 
 
 def main():
@@ -174,7 +103,7 @@ def main():
             batch_state = load_batch_state(batch_path)
             try:
                 with hard_deadline(deadline):
-                    result = cycle(config, qb, apis, None, batch_state)
+                    result = cycle(config, qb, apis, batch_state)
             finally:
                 save_batch_state(batch_path, batch_state)
     except (SafetyError, GuardError) as error:

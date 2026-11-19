@@ -1,4 +1,3 @@
-from contextlib import closing
 import copy
 import tempfile
 import datetime
@@ -9,18 +8,12 @@ from unittest.mock import Mock, patch
 
 import production
 from guard import GuardError, run
-from safety import Journal, SafetyError
+from safety import SafetyError
 from tools.tests.test_guard import FakeApi, manifest
 
 
 class ProductionTests(unittest.TestCase):
-    def setUp(self, *, blocklist_verifiable=True):
-        # Exercise historical file-action safeguards solely with synthetic
-        # blocklist parity and mocked outbound requests.
-        if blocklist_verifiable:
-            proof = patch("workflow.BLOCKLIST_SCOPE_VERIFIABLE", True)
-            proof.start()
-            self.addCleanup(proof.stop)
+    def setUp(self):
         for name, value in (("wait_for_event_boundary", None), ("event_boundary_reached", True)):
             boundary = patch("production." + name, return_value=value)
             boundary.start()
@@ -57,15 +50,17 @@ class ProductionTests(unittest.TestCase):
         self.apis = {"HD": self.s}
         self.report = run(self.config, self.qb, self.apis)[0]
         self.folder = tempfile.TemporaryDirectory()
-        self.journal = Journal(Path(self.folder.name)/"actions.sqlite3", allow_single_test=True)
-        self.approval = dict({k: self.report[k] for k in (
-            "instance", "hash", "ownership_fingerprint", "manifest_fingerprint")},
-            operation="sonarr_fail_remove_retry", expires_at=time.time() + 120, nonce="d" * 64)
-        self.context = production.capture_context(self.config, self.s, self.report, production.digest(self.approval["nonce"]))
+        self.lock_path = Path(self.folder.name) / "guard.lock"
+        self.context = self.capture(self.report)
 
     def tearDown(self):
-        self.journal.close()
         self.folder.cleanup()
+
+    def capture(self, report):
+        rows = self.s.routes["/api/v3/queue"]["records"]
+        queue_rows = [[row["id"], row["episodeId"], row["downloadId"].lower()]
+                      for row in rows if row["id"] in report["queue_ids"]]
+        return production.capture_context(self.config, self.s, dict(report, queue_rows=queue_rows))
 
     def results(self):
         stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -80,105 +75,6 @@ class ProductionTests(unittest.TestCase):
     def observe(self):
         return production.OutcomeVerifier(self.config, self.qb, self.apis, self.context).observe()
 
-    def identity_one_report(self):
-        # ID 1 exposes Python's True == 1 and 1.0 == 1 aliasing directly.
-        self.s.routes["/api/v3/queue"]["records"][0].update(seriesId=1, episodeId=1)
-        for row in self.s.routes["/api/v3/history"]["records"]:
-            row.update(seriesId=1, episodeId=1)
-        for row in self.s.routes["/api/v3/history/since"]:
-            row.update(seriesId=1, episodeId=1)
-        report = run(self.config, self.qb, self.apis)[0]
-        self.assertEqual(report["decision"], "would_fail")
-        approval = dict(self.approval, **{k: report[k] for k in (
-            "ownership_fingerprint", "manifest_fingerprint")})
-        return report, approval
-
-    def malformed_api_cases(self):
-        for route, fields in (("/api/v3/queue", ("downloadClientId", "seriesId", "episodeId")),
-                              ("/api/v3/history", ("eventType", "seriesId", "episodeId"))):
-            for field in fields:
-                for value in (True, False, 1.0, "1", None, 0, -1):
-                    yield route, field, value
-
-    def test_malformed_api_identity_never_sends_at_initial_or_postcommit_recheck(self):
-        baseline = copy.deepcopy(self.s.routes)
-        for phase in ("initial", "postcommit"):
-            for route, field, value in self.malformed_api_cases():
-                with self.subTest(phase=phase, route=route, field=field, value=value):
-                    self.s.routes = copy.deepcopy(baseline)
-                    report, approval = self.identity_one_report()
-                    def corrupt():
-                        self.s.routes[route]["records"][0][field] = value
-                    if phase == "initial":
-                        corrupt()
-                    with tempfile.TemporaryDirectory() as folder:
-                        journal = Journal(Path(folder) / "actions.sqlite3", allow_single_test=True)
-                        try:
-                            original = journal.transition
-                            def transition(*args, **kwargs):
-                                row = original(*args, **kwargs)
-                                if phase == "postcommit" and args[1:3] == ("prepared", "dispatch_recorded"):
-                                    corrupt()
-                                return row
-                            with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                                    journal, "transition", side_effect=transition), patch(
-                                    "production._send_queue_delete") as sender:
-                                if phase == "initial":
-                                    with self.assertRaises((GuardError, SafetyError)):
-                                        production.execute_single_test(self.config, self.qb, self.apis,
-                                                                       journal, report, approval)
-                                    self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
-                                else:
-                                    row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                                         journal, report, approval)
-                                    self.assertEqual(row["stage"], "dispatch_blocked")
-                                sender.assert_not_called()
-                        finally:
-                            journal.close()
-
-    def test_context_capture_independently_rejects_malformed_grab_types_before_send(self):
-        baseline = copy.deepcopy(self.s.routes)
-        capture = production.capture_context
-        for route, field, value in self.malformed_api_cases():
-            if route != "/api/v3/history":
-                continue
-            with self.subTest(field=field, value=value):
-                self.s.routes = copy.deepcopy(baseline)
-                report, approval = self.identity_one_report()
-                def corrupt_capture(*args, **kwargs):
-                    row = self.s.routes[route]["records"][0]
-                    valid = row[field]
-                    row[field] = value
-                    try:
-                        return capture(*args, **kwargs)
-                    finally:
-                        row[field] = valid
-                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                        "production.capture_context", side_effect=corrupt_capture), patch(
-                        "production._send_queue_delete") as sender:
-                    with self.assertRaises((GuardError, SafetyError)):
-                        production.execute_single_test(self.config, self.qb, self.apis,
-                                                       self.journal, report, approval)
-                    sender.assert_not_called()
-                self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
-
-    def test_numeric_and_named_grabs_with_valid_integer_identity_can_send(self):
-        baseline = copy.deepcopy(self.s.routes)
-        for event in (1, "grabbed"):
-            with self.subTest(event=event), tempfile.TemporaryDirectory() as folder:
-                self.s.routes = copy.deepcopy(baseline)
-                self.s.routes["/api/v3/history"]["records"][0]["eventType"] = event
-                report, approval = self.identity_one_report()
-                journal = Journal(Path(folder) / "actions.sqlite3", allow_single_test=True)
-                try:
-                    with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                            "production._send_queue_delete") as sender:
-                        production.execute_single_test(self.config, self.qb, self.apis,
-                                                       journal, report, approval)
-                        sender.assert_called_once_with(self.s, 7)
-                finally:
-                    journal.close()
-
     def hybrid_report(self, *, blocklist_evidence=False):
         v1 = "b" * 40
         v2 = self.hash + "c" * 24
@@ -192,55 +88,6 @@ class ProductionTests(unittest.TestCase):
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["decision"], "would_fail")
         return report
-
-    def test_renaming_owner_keeps_an_unresolved_hold_for_same_binding(self):
-        previous = self.journal.prepare(self.report, mode="single_test", context=self.context)
-        self.journal.transition(previous["key"], "prepared", "dispatch_recorded")
-        self.journal.transition(previous["key"], "dispatch_recorded", "uncertain")
-        self.config["sonarr"]["Renamed HD"] = self.config["sonarr"].pop("HD")
-        apis = {"Renamed HD": self.s}
-        current = run(self.config, self.qb, apis)[0]
-        self.assertEqual(current["decision"], "would_fail")
-        approval = dict(self.approval, **{key: current[key] for key in (
-            "instance", "ownership_fingerprint", "manifest_fingerprint")})
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
-            with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
-                production.execute_single_test(self.config, self.qb, apis, self.journal, current, approval)
-        send.assert_not_called()
-        self.assertEqual(self.journal.get(previous["key"])["stage"], "uncertain")
-
-    def test_malformed_client_settings_and_contradictory_queue_name_cannot_send(self):
-        fields = self.s.routes["/api/v3/downloadclient"][0]["fields"]
-        original = copy.deepcopy(fields)
-        queue_row = self.s.routes["/api/v3/queue"]["records"][0]
-        for problem in ("duplicate_category", "non_text_base", "other_client_name", "null_client_name"):
-            with self.subTest(problem=problem):
-                fields[:] = copy.deepcopy(original)
-                queue_row.pop("downloadClient", None)
-                if problem == "duplicate_category":
-                    fields.append({"name": "tvCategory", "value": "another-category"})
-                elif problem == "non_text_base":
-                    next(field for field in fields if field["name"] == "urlBase")["value"] = []
-                else:
-                    queue_row["downloadClient"] = "A Different Client" if problem == "other_client_name" else None
-                self.assertEqual(run(self.config, self.qb, self.apis)[0]["decision"], "skip")
-                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete") as send, self.assertRaises(SafetyError):
-                    production.execute_single_test(self.config, self.qb, self.apis,
-                                                   self.journal, self.report, self.approval)
-                send.assert_not_called()
-
-    def test_hybrid_hashes_bind_history_and_send_only_through_sonarr(self):
-        report = self.hybrid_report(blocklist_evidence=True)
-        approval = {**self.approval, **{key: report[key] for key in (
-            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
-        self.assertEqual(report["hash"], self.hash)
-        self.assertEqual(report["hash_aliases"], sorted([self.hash, "b" * 40, self.hash + "c" * 24]))
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete") as sender:
-            production.execute_single_test(self.config, self.qb, self.apis,
-                                           self.journal, report, approval)
-            sender.assert_called_once_with(self.s, 7)
 
     def test_hybrid_private_source_and_newer_private_grab_are_protected(self):
         self.hybrid_report()
@@ -267,63 +114,6 @@ class ProductionTests(unittest.TestCase):
                 self.assertEqual(report["reason"], "unconfirmed_grab_download_client")
                 self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
 
-    def test_final_context_blocks_a_grab_whose_downloader_changed(self):
-        original = production.capture_context
-        calls = 0
-
-        def capture(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                # Same ID and source, different downloader. Queue data stays valid.
-                self.grab["data"]["downloadClientName"] = "Other Downloader"
-            return original(*args, **kwargs)
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.capture_context", side_effect=capture), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(calls, 2)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_final_baseline_rejects_a_changed_grab_downloader(self):
-        conflicting = dict(self.grab, data={**self.grab["data"], "downloadClientName": "Other Downloader"})
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.history_since", side_effect=[[self.grab], [conflicting]]), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_single_hash_history_checks_newer_private_grab_regardless_of_case(self):
-        more_recent = datetime.datetime.fromtimestamp(
-            self.report["download_added_on"] + 5, datetime.timezone.utc).isoformat()
-        private = dict(self.grab, id=6, downloadId=self.hash.lower(), date=more_recent,
-                       data={**self.grab["data"], "indexer": "Private Source"})
-        original = self.s.call
-
-        def case_sensitive_history(route, params=None):
-            if route != "/api/v3/history":
-                return original(route, params)
-            self.assertEqual(params.get("episodeId"), self.grab["episodeId"])
-            self.assertEqual(params.get("seriesIds"), self.grab["seriesId"])
-            rows = [private, self.grab]
-            if params.get("downloadId"):
-                rows = [row for row in rows if row["downloadId"] == params["downloadId"]]
-            return {"records": rows, "totalRecords": len(rows)}
-
-        with patch.object(self.s, "call", side_effect=case_sensitive_history):
-            report = run(self.config, self.qb, self.apis)[0]
-            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
-                production.capture_context(self.config, self.s, self.report, production.digest(self.approval["nonce"]))
-        self.assertEqual(report["decision"], "skip")
-        self.assertEqual(report["reason"], "private_source_protected")
-
     def test_private_indexer_on_any_matching_queue_row_vetoes_public_history(self):
         queue = self.s.routes["/api/v3/queue"]
         extra = dict(queue["records"][0], id=8)
@@ -338,27 +128,6 @@ class ProductionTests(unittest.TestCase):
                 self.assertEqual(report["reason"], "private_queue_source_protected")
                 self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
 
-    def test_private_queue_source_appearing_at_final_recheck_blocks_removal(self):
-        queue_row = self.s.routes["/api/v3/queue"]["records"][0]
-        refresh = production.recheck_candidate
-        calls = 0
-
-        def recheck(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 3:
-                queue_row["indexer"] = "  PRIVATE SOURCE  "
-            return refresh(*args, **kwargs)
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.recheck_candidate", side_effect=recheck), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(calls, 3)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-
     def test_explicit_queue_source_conflicts_hold_even_when_history_is_public(self):
         queue = self.s.routes["/api/v3/queue"]["records"][0]
         for mode in ("public_allowlist", "private_exclusions"):
@@ -372,17 +141,6 @@ class ProductionTests(unittest.TestCase):
                     self.assertEqual(report["decision"], expected)
                     if expected == "skip":
                         self.assertEqual(report["reason"], "conflicting_queue_source_protected")
-
-    def test_unlisted_queue_indexer_appearing_at_final_recheck_blocks_removal(self):
-        def change():
-            self.s.routes["/api/v3/queue"]["records"][0]["indexer"] = "Unlisted Source"
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        sender.assert_not_called()
 
     def test_hash_only_torrent_properties_cannot_verify_identity(self):
         self.qb.routes["/api/v2/torrents/properties"] = {"hash": self.hash}
@@ -426,50 +184,6 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(canonical["reason"], "ambiguous_alias_queue_ownership")
         self.assertFalse(any(report["decision"] == "would_fail" for report in reports))
         self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
-
-    def test_hybrid_recovery_uses_bulk_info_and_holds_on_incomplete_evidence(self):
-        report = self.hybrid_report(blocklist_evidence=True)
-        self.context = production.capture_context(self.config, self.s, report,
-                                                  production.digest(self.approval["nonce"]))
-        self.results()
-        listed = [{"hash": format(n, "040x"), "infohash_v1": format(n, "040x"),
-                   "infohash_v2": ""} for n in range(1, 201)]
-        self.qb.routes["/api/v2/torrents/info"] = listed
-        self.qb.calls.clear()
-        self.assertIs(self.observe()["torrent_absent"], True)
-        self.assertEqual([route for route, _ in self.qb.calls], ["/api/v2/torrents/info"])
-        listed.append({"hash": "d" * 40, "infohash_v1": "b" * 40,
-                       "infohash_v2": "d" * 64, "added_on": report["download_added_on"]})
-        self.assertIs(self.observe()["torrent_absent"], False)
-        del listed[-1]["infohash_v2"]
-        self.assertIsNone(self.observe()["torrent_absent"])
-
-    def test_hybrid_mapping_changes_invalidate_pre_dispatch_evidence(self):
-        report = self.hybrid_report()
-        approval = {**self.approval, **{key: report[key] for key in (
-            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
-        original = copy.deepcopy(self.qb.routes["/api/v2/torrents/properties"])
-        for field, value in (("infohash_v1", "d" * 40),
-                             ("infohash_v2", self.hash + "d" * 24)):
-            with self.subTest(field=field):
-                self.qb.routes["/api/v2/torrents/properties"] = {**original, field: value}
-                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete") as sender:
-                    with self.assertRaises(SafetyError):
-                        production.execute_single_test(self.config, self.qb, self.apis,
-                                                       self.journal, report, approval)
-                    sender.assert_not_called()
-
-    def test_hybrid_outcome_uses_alias_for_failure_not_replacement(self):
-        report = self.hybrid_report(blocklist_evidence=True)
-        self.context = production.capture_context(self.config, self.s, report,
-                                                  production.digest(self.approval["nonce"]))
-        self.results()
-        self.s.routes["/api/v3/history/since"][2]["downloadId"] = self.hash + "c" * 24
-        outcome = self.observe()
-        self.assertIs(outcome["failed"], True)
-        self.assertIs(outcome["torrent_absent"], True)
-        self.assertIs(outcome["replacement_observed"], False)
 
     def test_hybrid_other_instance_owner_blocks_cleanup(self):
         self.hybrid_report()
@@ -516,37 +230,6 @@ class ProductionTests(unittest.TestCase):
                 self.assertEqual(report["reason"], "ambiguous_torrent_hash_identity")
                 self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
 
-    def test_final_recheck_holds_when_another_torrent_claims_the_primary_hash(self):
-        torrents = self.qb.routes["/api/v2/torrents/info"]
-        other = "d" * 40
-
-        def add_collision(*args):
-            torrents.append(dict(torrents[0], hash=other, infohash_v1=self.hash, infohash_v2=other + "e" * 24))
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.wait_for_event_boundary", side_effect=add_collision), patch(
-                "production._send_queue_delete") as send:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        send.assert_not_called()
-
-    def test_hybrid_context_final_baseline_checks_all_verified_hashes(self):
-        report = self.hybrid_report(blocklist_evidence=True)
-        approval = {**self.approval, **{key: report[key] for key in (
-            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
-        date = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=2)
-        private = dict(self.grab, id=7, date=date.isoformat(), downloadId=self.hash,
-                       data={**self.grab["data"], "indexer": "Private Source"})
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.history_since", side_effect=[[self.grab], [self.grab, private]]), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, report, approval)
-            sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
     def digit_hash_report(self):
         self.hash = "1" * 40
         self.grab["downloadId"] = self.hash
@@ -562,27 +245,6 @@ class ProductionTests(unittest.TestCase):
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["decision"], "skip")
         self.assertEqual(report["reason"], "invalid_history_download_id")
-
-    def test_context_capture_rejects_numeric_history_download_id(self):
-        report = self.digit_hash_report()
-        approval = {**self.approval, **{key: report[key] for key in (
-            "hash", "ownership_fingerprint", "manifest_fingerprint")}}
-        capture = production.capture_context
-
-        def capture_with_numeric_id(*args, **kwargs):
-            self.grab["downloadId"] = int(self.hash)
-            try:
-                return capture(*args, **kwargs)
-            finally:
-                self.grab["downloadId"] = self.hash
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.capture_context", side_effect=capture_with_numeric_id), patch(
-                "production._send_queue_delete") as sender:
-            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
-                production.execute_single_test(self.config, self.qb, self.apis,
-                                               self.journal, report, approval)
-            sender.assert_not_called()
 
     def test_newer_private_grab_never_falls_back_to_older_public_grab(self):
         self.digit_hash_report()
@@ -611,113 +273,6 @@ class ProductionTests(unittest.TestCase):
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["decision"], "skip")
         self.assertEqual(report["reason"], "conflicting_grab_source_order")
-
-    def test_final_capture_holds_grabs_with_conflicting_source_order(self):
-        capture = production.capture_context
-        history_since = production.history_since
-        private = self.conflicting_grab_order()
-        for route in ("/api/v3/history", "/api/v3/history/since"):
-            with self.subTest(route=route):
-                calls = 0
-                self.s.routes["/api/v3/history"] = {"totalRecords": 1, "records": [self.grab]}
-
-                def capture_final(*args, **kwargs):
-                    nonlocal calls
-                    calls += 1
-                    if calls == 2 and route == "/api/v3/history":
-                        self.s.routes[route] = {"totalRecords": 2, "records": [self.grab, private]}
-                    return capture(*args, **kwargs)
-
-                def baseline(*args, **kwargs):
-                    rows = history_since(*args, **kwargs)
-                    return [*rows, private] if calls == 2 and route.endswith("/since") else rows
-
-                with tempfile.TemporaryDirectory() as folder, closing(Journal(
-                        Path(folder) / "actions.sqlite3", allow_single_test=True)) as journal, patch(
-                        "production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                        "production.capture_context", side_effect=capture_final), patch(
-                        "production.history_since", side_effect=baseline), patch(
-                        "production._send_queue_delete") as sender:
-                    report = run(self.config, self.qb, self.apis)[0]
-                    approval = dict(self.approval, ownership_fingerprint=report["ownership_fingerprint"])
-                    row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                         journal, report, approval)
-                    sender.assert_not_called()
-                self.assertEqual(calls, 2)
-                self.assertEqual(row["stage"], "dispatch_blocked")
-                self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_final_history_read_blocks_newer_private_grab_before_delete(self):
-        capture = production.capture_context
-        private = dict(self.grab, id=self.grab["id"] + 1,
-                       data={**self.grab["data"], "indexer": "Private Source"})
-        calls = 0
-
-        def inject_on_final_capture(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                self.s.routes["/api/v3/history"] = {
-                    "totalRecords": 2, "records": [self.grab, private]}
-            return capture(*args, **kwargs)
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.capture_context", side_effect=inject_on_final_capture), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(calls, 2)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_final_baseline_history_blocks_newer_private_grab_before_delete(self):
-        history_since = production.history_since
-        private = dict(self.grab, id=self.grab["id"] + 1,
-                       data={**self.grab["data"], "indexer": "Private Source"})
-        calls = 0
-
-        def inject_into_final_baseline(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            rows = history_since(*args, **kwargs)
-            return [*rows, private] if calls == 2 else rows
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.history_since", side_effect=inject_into_final_baseline), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(calls, 2)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_final_baseline_rejects_different_hash_for_approved_history_id(self):
-        conflicting = dict(self.grab, downloadId="b" * 40)
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.history_since", side_effect=[[self.grab], [conflicting]]), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_numeric_history_download_id_cannot_confirm_outcomes(self):
-        report = self.digit_hash_report()
-        self.context = production.capture_context(self.config, self.s, report,
-                                                  production.digest(self.approval["nonce"]))
-        self.results()
-        history = self.s.routes["/api/v3/history/since"]
-        history[2]["downloadId"] = "2" * 40
-        self.assertIs(self.observe()["replacement_observed"], True)
-        history[2]["downloadId"] = int("2" * 40)
-        history[1]["downloadId"] = int(self.hash)
-        observed = self.observe()
-        self.assertIs(observed["replacement_observed"], False)
-        self.assertIsNone(observed["failed"])
-        self.assertIs(observed["blocklisted"], True)
 
     def test_malformed_outcome_event_type_never_confirms_failure_or_replacement(self):
         for index, values in ((1, (True, 4.0, "4", None)), (2, (True, 1.0, "1", None))):
@@ -819,14 +374,6 @@ class ProductionTests(unittest.TestCase):
         self.assertFalse(result["failed"])
         self.assertFalse(result["blocklisted"])
 
-    def test_single_test_regrab_cannot_reuse_consumed_approval(self):
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=TimeoutError()) as sender:
-            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.report["attempt_fingerprint"] = "e" * 64
-            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            sender.assert_called_once()
-
     def test_missing_event_timestamps_are_unknown_not_confirmations(self):
         self.results()
         del self.s.routes["/api/v3/history/since"][1]["date"]
@@ -920,7 +467,7 @@ class ProductionTests(unittest.TestCase):
         self.s.routes["/api/v3/history/since"] = [
             dict(self.grab, id=20, date=date),
             dict(self.grab, id=21, episodeId=4, downloadId="b" * 40, date=date)]
-        context = dict(self.context, episode_ids=[3, 4])
+        context = dict(self.context, episode_ids=[3, 4], queue_rows=[*self.context["queue_rows"], [8, 4, self.hash]])
         observed = production.OutcomeVerifier(self.config, self.qb, self.apis, context).observe()
         self.assertIs(observed["replacement_observed"], True)
         self.assertIsNone(observed["torrent_absent"])
@@ -952,7 +499,7 @@ class ProductionTests(unittest.TestCase):
             return {"records": rows[(page - 1) * 100:page * 100], "totalRecords": count}
 
         with patch.object(self.s, "call", side_effect=paginated) as wrapped:
-            context = production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+            context = self.capture(self.report)
             self.assertEqual(context["baseline_blocklist_ids"], [1])
             self.assertEqual([c.args[1]["page"] for c in wrapped.call_args_list
                               if c.args[0] == "/api/v3/blocklist"], [1])
@@ -960,22 +507,14 @@ class ProductionTests(unittest.TestCase):
                 row["date"] = recent
             wrapped.reset_mock()
             with self.assertRaisesRegex(GuardError, "^pagination_limit_reached$"):
-                production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+                self.capture(self.report)
             self.assertEqual(sum(c.args[0] == "/api/v3/blocklist" for c in wrapped.call_args_list), 20)
             for row in rows:
                 row["seriesId"] = 99
             wrapped.reset_mock()
             with self.assertRaisesRegex(GuardError, "^sonarr_unscoped_blocklist_limit_reached$"):
-                production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+                self.capture(self.report)
             self.assertEqual(sum(c.args[0] == "/api/v3/blocklist" for c in wrapped.call_args_list), 20)
-
-    def test_file_cleanup_blocklist_evidence_still_requires_every_affected_episode(self):
-        self.results()
-        context = dict(self.context, episode_ids=[3, 4])
-        verifier = production.OutcomeVerifier(self.config, self.qb, self.apis, context)
-        self.assertIs(verifier.observe()["blocklisted"], False)
-        self.s.routes["/api/v3/blocklist"]["records"][0]["episodeIds"].append(4)
-        self.assertIs(verifier.observe()["blocklisted"], True)
 
     def test_partial_outage_does_not_erase_other_verified_results(self):
         self.results()
@@ -990,84 +529,6 @@ class ProductionTests(unittest.TestCase):
         self.qb.routes["/api/v2/torrents/info"] = [{}]
         self.assertIsNone(self.observe()["torrent_absent"])
 
-    def test_observe_cli_requires_existing_journal_and_respects_the_container_marker(self):
-        import contextlib
-        import io
-        import json
-
-        from safety import ACTION_JOURNAL_FILE, CONTAINER_JOURNAL_MARKER
-
-        directory = Path(self.folder.name)
-        path = directory / ACTION_JOURNAL_FILE
-        marker = directory / CONTAINER_JOURNAL_MARKER
-        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
-
-        def observe_cli(expected):
-            with contextlib.redirect_stderr(io.StringIO()) as error, patch(
-                    "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
-                    "production.Api") as api:
-                self.assertEqual(production.main(), 1)
-            self.assertEqual(json.loads(error.getvalue())["error"], expected)
-            api.return_value.login.assert_not_called()
-
-        observe_cli("no_recorded_single_test")
-        self.assertFalse(path.exists())
-        with closing(Journal(path)) as journal:
-            actual = journal.installation_id(create=True)
-        before = path.read_bytes()
-        observe_cli("container_journal_marker_missing")
-        marker.write_text(json.dumps({"journal_id": "b" * 64}))
-        marker.chmod(0o600)
-        observe_cli("container_journal_identity_mismatch")
-        marker.write_text(json.dumps({"journal_id": actual}))
-        observe_cli("no_recorded_single_test")
-        self.assertEqual(path.read_bytes(), before)
-        path.unlink()
-        observe_cli("container_journal_missing")
-        self.assertFalse(path.exists())
-
-    def test_observe_cli_finds_original_journal_entry_after_owner_rename(self):
-        import contextlib
-        import io
-        import json
-
-        from safety import ACTION_JOURNAL_FILE
-
-        directory = Path(self.folder.name)
-        path = directory / ACTION_JOURNAL_FILE
-        with closing(Journal(path, allow_single_test=True)) as journal:
-            row = journal.prepare(self.report, mode="single_test", context=self.context)
-            journal.transition(row["key"], "prepared", "dispatch_recorded")
-        self.results()
-        self.qb.login = Mock()
-        self.config["sonarr"]["Renamed"] = self.config["sonarr"].pop("HD")
-        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
-        with contextlib.redirect_stdout(io.StringIO()) as output, patch(
-                "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
-                "production.Api", side_effect=[self.qb, self.s]):
-            self.assertEqual(production.main(), 0)
-        result = json.loads(output.getvalue())
-        self.assertEqual(result["instance"], "HD")
-        self.assertIs(result["current_observation"]["failed"], True)
-        self.assertIs(result["current_observation"]["blocklisted"], True)
-
-    def test_observe_cli_cannot_reconcile_while_sender_holds_worker_lock(self):
-        import contextlib
-        import fcntl
-        import io
-        import json
-
-        directory = Path(self.folder.name)
-        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
-        with (directory / "guard.lock").open("a") as lock, contextlib.redirect_stderr(io.StringIO()) as error, patch(
-                "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
-                "production.Api") as api, patch("production.Journal") as journal:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            self.assertEqual(production.main(), 1)
-        self.assertEqual(json.loads(error.getvalue())["error"], "another_run_is_active")
-        api.return_value.login.assert_not_called()
-        journal.assert_not_called()
-
     def test_context_has_no_raw_release_title_endpoint_or_credentials(self):
         text = str(self.context)
         for value in (self.grab["sourceTitle"], "example.invalid", "REPLACE_ME"):
@@ -1075,72 +536,11 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             production.validate_context(dict(self.context, password="not allowed"))
 
-    def test_final_blocklist_scope_uses_all_grabs_for_the_exact_queue_download_id(self):
-        original = self.s.call
-        queries = []
-        other = dict(self.grab, id=6, episodeId=4, date=(datetime.datetime.fromisoformat(
-            self.grab["date"]) + datetime.timedelta(seconds=1)).isoformat(),
-            data={**self.grab["data"], "indexer": "Private Source"})
-
-        def call(route, params=None):
-            if route == "/api/v3/history" and params and "downloadId" in params:
-                queries.append(params)
-                if len(queries) == 2:
-                    return {"records": [other, self.grab], "totalRecords": 2}
-            return original(route, params)
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "sonarr_blocklist_scope_unverified")
-        self.assertEqual(len(queries), 2)
-        for query in queries:
-            self.assertEqual(query["downloadId"], self.grab["downloadId"])
-            self.assertEqual(query["eventType"], 1)
-            self.assertNotIn("episodeId", query)
-            self.assertNotIn("seriesIds", query)
-        sender.assert_not_called()
-
-    def test_blocklist_scope_holds_extra_episode_seen_only_in_recent_history(self):
-        original = self.s.call
-        other = dict(self.grab, id=6, episodeId=4)
-        recent_reads = 0
-
-        def call(route, params=None):
-            nonlocal recent_reads
-            if route == "/api/v3/history/since":
-                recent_reads += 1
-                if recent_reads == 2:
-                    return [self.grab, other]
-            return original(route, params)
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "sonarr_blocklist_scope_unverified")
-        sender.assert_not_called()
-
-    def test_blocklist_scope_holds_missing_or_changed_release_evidence(self):
-        original = self.s.call
-        for records in ([], [dict(self.grab, sourceTitle="A different release")],
-                        [dict(self.grab, data={**self.grab["data"], "indexer": "Other Source"})]):
-            with self.subTest(records=len(records)):
-                def call(route, params=None):
-                    if route == "/api/v3/history" and params and "downloadId" in params:
-                        return {"records": records, "totalRecords": len(records)}
-                    return original(route, params)
-
-                with patch.object(self.s, "call", side_effect=call), self.assertRaisesRegex(
-                        SafetyError, "^sonarr_blocklist_scope_unverified$"):
-                    production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
-
     def test_context_title_comes_from_current_grab_not_older_same_hash(self):
         date = datetime.datetime.fromisoformat(self.grab["date"]) - datetime.timedelta(seconds=1)
         old = dict(self.grab, id=4, date=date.isoformat(), sourceTitle="An older display title")
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [old, self.grab]}
-        context = production.capture_context(self.config, self.s, self.report, production.digest("approval"))
+        context = self.capture(self.report)
         self.assertEqual(context["release_title_digest"], production.digest(self.grab["sourceTitle"]))
 
     def test_endpoint_drift_and_unreviewed_version_stop_observation(self):
@@ -1152,240 +552,10 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             self.observe()
 
-    def test_release_gate_and_dry_run_and_journal_gate_all_block_sender(self):
-        with patch("production._send_queue_delete") as send:
-            with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):
-                production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            with patch("production.SINGLE_TEST_RELEASE_ENABLED", True):
-                self.config["dry_run"] = True
-                with self.assertRaises(SafetyError):
-                    production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-                self.config["dry_run"] = False
-                self.journal.allow_single_test = False
-                with self.assertRaises(SafetyError):
-                    production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            send.assert_not_called()
-
-    def test_approval_expiry_and_exact_target_are_required(self):
-        for change in ({"expires_at": time.time()-1}, {"expires_at": time.time()+1000},
-                       {"hash": "b"*40}, {"manifest_fingerprint": "b"*64}, {"instance": "UHD"}):
-            with self.subTest(change=change), self.assertRaises(SafetyError):
-                production.validate_approval(dict(self.approval, **change), self.report)
-        production.validate_approval(self.approval, self.report)
-
-    def test_changed_sonarr_endpoint_invalidates_original_approval_before_send(self):
-        self.config["sonarr"]["HD"]["url"] = "https://other-sonarr.example.invalid"
-        refreshed = run(self.config, self.qb, self.apis)[0]
-        with self.assertRaisesRegex(SafetyError, "approval_expired_or_target_mismatch"):
-            production.validate_approval(self.approval, refreshed)
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete") as sender:
-            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
-                production.execute_single_test(self.config, self.qb, self.apis,
-                                               self.journal, self.report, self.approval)
-            sender.assert_not_called()
-
-    def test_sonarr_endpoint_drift_during_final_recheck_cancels_dispatch(self):
-        original = production.recheck_candidate
-        checks = []
-        def recheck(*args):
-            checks.append(1)
-            if len(checks) == 2:
-                self.config["sonarr"]["HD"]["url"] = "https://other-sonarr.example.invalid"
-            return original(*args)
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.recheck_candidate", side_effect=recheck), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis,
-                                                 self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "cancelled")
-            sender.assert_not_called()
-
-    def test_controlled_sender_records_intent_then_sends_exactly_once(self):
-        stages = []
-        def send(api, queue_id):
-            self.assertIs(api, self.s)
-            self.assertEqual(queue_id, 7)
-            key = production.digest(["single_test", "HD", self.hash])
-            stages.append(self.journal.get(key)["stage"])
-            self.results()
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete", side_effect=send) as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(stages, ["dispatch_recorded"])
-            self.assertEqual(row["stage"], "replacement_pending")
-            self.assertIsNone(row["observation"].get("data_deleted"))
-            self.journal.close()
-            self.journal = Journal(Path(self.folder.name)/"actions.sqlite3", allow_single_test=True)
-            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            sender.assert_called_once()
-
-    def test_lost_response_is_never_retried(self):
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete", side_effect=TimeoutError()) as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "uncertain")
-            production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            sender.assert_called_once()
-
-    def test_final_recheck_change_cancels_before_send(self):
-        original_recheck = production.recheck_candidate
-        checks = []
-        def recheck(*args):
-            fresh = original_recheck(*args)
-            checks.append(1)
-            if len(checks) == 2:
-                fresh["assessment"]["manifest_fingerprint"] = "e"*64
-            return fresh
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production.recheck_candidate", side_effect=recheck), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "cancelled")
-            self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-            sender.assert_not_called()
-
-    def test_approval_expiring_during_preparation_cancels_before_send(self):
-        def capture(*args):
-            self.approval["expires_at"] = time.time() - 1
-            return self.context
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production.capture_context", side_effect=capture), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "cancelled")
-            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
-            sender.assert_not_called()
-
-    def test_worker_overlap_blocks_sender(self):
-        import fcntl
-        with open(Path(self.folder.name)/"guard.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete") as sender:
-                with self.assertRaisesRegex(SafetyError, "another_run_is_active"):
-                    production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-                sender.assert_not_called()
-
-    def after_dispatch_commit(self, effect):
-        original = self.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[1:3] == ("prepared", "dispatch_recorded"):
-                effect()
-            return row
-        return transition
-
-    def test_approval_expiring_during_commit_preserves_unsent_record_after_restart(self):
-        def expire():
-            self.approval["expires_at"] = time.time() - 1
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(expire)), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "dispatch_blocked")
-            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
-            self.assertIsNotNone(row["dispatched_at"])
-            self.assertEqual(row["evidence"]["hash"], self.hash)
-            self.assertEqual(row["context"]["queue_id"], 7)
-            sender.assert_not_called()
-        self.journal.close()
-        self.journal = Journal(Path(self.folder.name)/"actions.sqlite3", allow_single_test=True)
-        self.assertEqual(self.journal.get(row["key"]), row)
-        observe = Mock()
-        self.assertEqual(production.reconcile(self.journal, row["key"], observe), row)
-        observe.assert_not_called()
-
-    def test_final_dispatch_rechecks_the_bound_journal_after_refreshing_baselines(self):
-        refresh = self.journal.refresh_baselines
-
-        def refresh_then_replace(*args):
-            row = refresh(*args)
-            check.side_effect = SafetyError("container_journal_identity_mismatch")
-            return row
-
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "refresh_baselines", side_effect=refresh_then_replace), patch.object(
-                self.journal, "check_current_file") as check, patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "container_journal_identity_mismatch")
-        sender.assert_not_called()
-
-    def test_snapshot_expiring_during_commit_blocks_send(self):
-        snapshots = []
-        original = production.recheck_candidate
-        def recheck(*args):
-            fresh = original(*args)
-            snapshots.append(fresh)
-            return fresh
-        def expire():
-            snapshots[-1]["assessment"]["checked_at"] = time.time()-11
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.recheck_candidate", side_effect=recheck), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(expire)), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "dispatch_blocked")
-            self.assertEqual(row["stop_reason"], "fresh_assessment_expired")
-            sender.assert_not_called()
-
-    def test_version_change_after_context_capture_blocks_final_send(self):
-        original = production.capture_context
-        def capture(*args, **kwargs):
-            result = original(*args, **kwargs)
-            self.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
-            return result
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.capture_context", side_effect=capture), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "dispatch_blocked")
-            self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
-            sender.assert_not_called()
-
-    def test_v4_update_during_commit_preserves_dispatch_and_observation(self):
-        def change():
-            self.s.routes["/api/v3/system/status"] = {"version": "4.1.2.3456"}
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
-                "production._send_queue_delete", side_effect=lambda *args: self.results()) as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-        sender.assert_called_once_with(self.s, 7)
-        self.assertTrue(row["current_observation"]["torrent_absent"])
-
-    def test_version_change_during_commit_blocks_send(self):
-        def change():
-            self.s.routes["/api/v3/system/status"] = {"version": "5.0.1"}
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
-            sender.assert_not_called()
-
-    def test_post_commit_version_outage_blocks_send(self):
-        def outage():
-            self.s.routes["/api/v3/system/status"] = TimeoutError()
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.journal, "transition", side_effect=self.after_dispatch_commit(outage)), patch(
-                "production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "dispatch_blocked")
-            self.assertEqual(row["stop_reason"], "dispatch_validation_failed")
-            sender.assert_not_called()
-
-    def test_approval_expiring_during_final_version_request_blocks_send(self):
-        original = self.s.call
-        def call(route, params=None):
-            key = production.digest(["single_test", "HD", self.hash])
-            row = self.journal.get(key)
-            if route == "/api/v3/system/status" and row is not None and row["stage"] == "dispatch_recorded":
-                self.approval["expires_at"] = time.time()-1
-            return original(route, params)
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
-                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
-            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
-            self.assertEqual(row["stage"], "dispatch_blocked")
-            self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
-            sender.assert_not_called()
-
     def test_sender_refuses_production_transport_when_release_gate_is_off(self):
         with patch("urllib.request.build_opener") as opener:
             with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):
-                production._send_queue_delete(self.s, 7)
+                production._send_queue_delete(self.s, 7, blocklist=True)
             opener.assert_not_called()
 
     def test_delete_transport_has_fixed_scope_and_never_follows_redirects(self):
@@ -1395,8 +565,8 @@ class ProductionTests(unittest.TestCase):
         response.__exit__ = Mock(return_value=False)
         opener = Mock()
         opener.open.return_value = response
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("urllib.request.build_opener", return_value=opener):
-            production._send_queue_delete(self.s, 7)
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener", return_value=opener):
+            production._send_queue_delete(self.s, 7, blocklist=True)
         request = opener.open.call_args.args[0]
         self.assertEqual(request.get_method(), "DELETE")
         self.assertIn("/api/v3/queue/7?", request.full_url)
@@ -1406,13 +576,80 @@ class ProductionTests(unittest.TestCase):
             production.RejectDeleteRedirect().redirect_request(None)
 
 
+    def test_single_hash_history_checks_newer_private_grab_regardless_of_case(self):
+        more_recent = datetime.datetime.fromtimestamp(
+            self.report["download_added_on"] + 5, datetime.timezone.utc).isoformat()
+        private = dict(self.grab, id=6, downloadId=self.hash.lower(), date=more_recent,
+                       data={**self.grab["data"], "indexer": "Private Source"})
+        original = self.s.call
+
+        def case_sensitive_history(route, params=None):
+            if route != "/api/v3/history":
+                return original(route, params)
+            self.assertEqual(params.get("episodeId"), self.grab["episodeId"])
+            self.assertEqual(params.get("seriesIds"), self.grab["seriesId"])
+            rows = [private, self.grab]
+            if params.get("downloadId"):
+                rows = [row for row in rows if row["downloadId"] == params["downloadId"]]
+            return {"records": rows, "totalRecords": len(rows)}
+
+        with patch.object(self.s, "call", side_effect=case_sensitive_history):
+            report = run(self.config, self.qb, self.apis)[0]
+            with self.assertRaisesRegex(SafetyError, "identity_or_manifest_changed"):
+                self.capture(self.report)
+        self.assertEqual(report["decision"], "skip")
+        self.assertEqual(report["reason"], "private_source_protected")
+
+
+    def test_hybrid_recovery_uses_bulk_info_and_holds_on_incomplete_evidence(self):
+        report = self.hybrid_report(blocklist_evidence=True)
+        self.context = self.capture(report)
+        self.results()
+        listed = [{"hash": format(n, "040x"), "infohash_v1": format(n, "040x"),
+                   "infohash_v2": ""} for n in range(1, 201)]
+        self.qb.routes["/api/v2/torrents/info"] = listed
+        self.qb.calls.clear()
+        self.assertIs(self.observe()["torrent_absent"], True)
+        self.assertEqual([route for route, _ in self.qb.calls], ["/api/v2/torrents/info"])
+        listed.append({"hash": "d" * 40, "infohash_v1": "b" * 40,
+                       "infohash_v2": "d" * 64, "added_on": report["download_added_on"]})
+        self.assertIs(self.observe()["torrent_absent"], False)
+        del listed[-1]["infohash_v2"]
+        self.assertIsNone(self.observe()["torrent_absent"])
+
+
+    def test_hybrid_outcome_uses_alias_for_failure_not_replacement(self):
+        report = self.hybrid_report(blocklist_evidence=True)
+        self.context = self.capture(report)
+        self.results()
+        self.s.routes["/api/v3/history/since"][2]["downloadId"] = self.hash + "c" * 24
+        outcome = self.observe()
+        self.assertIs(outcome["failed"], True)
+        self.assertIs(outcome["torrent_absent"], True)
+        self.assertIs(outcome["replacement_observed"], False)
+
+
+    def test_numeric_history_download_id_cannot_confirm_outcomes(self):
+        report = self.digit_hash_report()
+        self.context = self.capture(report)
+        self.results()
+        history = self.s.routes["/api/v3/history/since"]
+        history[2]["downloadId"] = "2" * 40
+        self.assertIs(self.observe()["replacement_observed"], True)
+        history[2]["downloadId"] = int("2" * 40)
+        history[1]["downloadId"] = int(self.hash)
+        observed = self.observe()
+        self.assertIs(observed["replacement_observed"], False)
+        self.assertIsNone(observed["failed"])
+        self.assertIs(observed["blocklisted"], True)
+
+
 class FileCleanupTests(unittest.TestCase):
     def setUp(self):
         self.f = ProductionTests()
-        self.f.setUp(blocklist_verifiable=False)
+        self.f.setUp()
         self.addCleanup(self.f.doCleanups)
         self.addCleanup(self.f.tearDown)
-        self.f.journal.allow_public_attempt = True
 
     def container_cycle(self, folder, send, *, mode="live"):
         from contextlib import redirect_stdout
@@ -1478,7 +715,7 @@ class FileCleanupTests(unittest.TestCase):
                 self.assertEqual(len(result["actions"]), 1)
                 action, = result["actions"]
                 self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
-                self.assertFalse((Path(folder) / "action-journal.sqlite3").exists())
+
                 send.assert_called_once()
 
     def test_live_container_rejects_healthy_private_ambiguous_and_dry_run_candidates(self):
@@ -1507,17 +744,14 @@ class FileCleanupTests(unittest.TestCase):
                         self.assertIn("ambiguous_instance_ownership", {r.get("reason") for r in result["assessment"]})
                 send.assert_not_called()
 
-    def test_file_removal_leaves_existing_journal_untouched_and_does_not_read_sonarr_blocklist(self):
+    def test_file_removal_does_not_read_sonarr_blocklist_or_retry_settings(self):
         f = self.f
         f.s.routes["/api/v3/config/downloadclient"]["autoRedownloadFailed"] = False
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
-            path = folder / "action-journal.sqlite3"
-            path.write_bytes(b"leftover database contents")
             f.s.calls.clear()
             send = Mock(side_effect=self.sonarr_transport)
             result = self.container_cycle(folder, send)
-            self.assertEqual(path.read_bytes(), b"leftover database contents")
         action, = result["actions"]
         self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
         self.assertNotIn("/api/v3/blocklist", {route for route, _ in f.s.calls})
@@ -1531,7 +765,7 @@ class FileCleanupTests(unittest.TestCase):
         f.grab["date"] = datetime.datetime.fromtimestamp(torrent["added_on"], datetime.timezone.utc).isoformat()
         f.qb.routes["/api/v2/torrents/files"] = []
 
-    def test_metadata_timeout_removes_without_blocklisting_and_searches_without_a_journal(self):
+    def test_metadata_timeout_removes_without_blocklisting_and_searches_once(self):
         import json
         from urllib.parse import parse_qs, urlsplit
 
@@ -1555,16 +789,34 @@ class FileCleanupTests(unittest.TestCase):
             response.__exit__ = Mock(return_value=False)
             return response
 
-        with tempfile.TemporaryDirectory() as folder, patch(
-                "routine.Journal", side_effect=AssertionError("scheduled work must not open a journal")):
+        with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
             send = Mock(side_effect=transport)
             result = self.container_cycle(folder, send)
-            self.assertFalse((folder / "action-journal.sqlite3").exists())
+
             self.assertEqual(self.container_cycle(folder, send)["actions"], [])
         action, = result["actions"]
         self.assertEqual((action["stage"], action["search_command_id"]), ("retry_requested", 42))
         self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST"])
+
+    def test_later_cycle_never_replays_a_search_after_unverified_removal(self):
+        f = self.f
+        self.make_metadata_timeout()
+
+        def accepted(api, queue_id, *, blocklist):
+            self.assertIs(blocklist, False)
+            f.qb.routes["/api/v2/torrents/info"] = []
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "production._send_queue_delete", side_effect=accepted) as remove, patch(
+                "production._send_episode_search") as search:
+            with patch.object(production.OutcomeVerifier, "observe", side_effect=SafetyError("service_unavailable")):
+                result = self.container_cycle(Path(folder), Mock())
+            action, = result["actions"]
+            self.assertEqual(action["stage"], "retry_removal_unverified")
+            self.assertEqual(self.container_cycle(Path(folder), Mock())["actions"], [])
+        remove.assert_called_once()
+        search.assert_not_called()
 
     def test_new_stateless_metadata_pass_keeps_a_pre_removal_replacement_veto(self):
         f = self.f
@@ -1587,7 +839,7 @@ class FileCleanupTests(unittest.TestCase):
         remove.assert_called_once()
         search.assert_not_called()
 
-    def test_public_dry_run_logs_would_remove_without_using_or_creating_a_database(self):
+    def test_public_dry_run_logs_would_remove_and_sends_nothing(self):
         import json
         from contextlib import redirect_stdout
         from io import StringIO
@@ -1598,20 +850,16 @@ class FileCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
             path = folder / "dry-run.log"
-            old = folder / "action-journal.sqlite3"
-            old.write_bytes(b"historical database")
             args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
             with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
                     "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
-                    "public.recover_pending", side_effect=AssertionError("dry run must not recover a journal")), patch(
                     "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
                 self.assertEqual(public.main(), 0)
             entry, = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual((entry["event"], entry["hash"]), ("would_remove", f.hash))
             self.assertIn("contains_exe", entry["reasons"])
             self.assertIn("time", entry)
-            self.assertEqual(old.read_bytes(), b"historical database")
-            self.assertFalse((folder / "preview-journal.sqlite3").exists())
+
             transport.assert_not_called()
 
     def test_file_removal_with_lost_response_retries_on_next_pass_only_if_still_queued(self):
@@ -1627,7 +875,7 @@ class FileCleanupTests(unittest.TestCase):
             self.assertEqual(second["actions"][0]["stage"], "sonarr_remove_blocklist_accepted")
             third = self.container_cycle(folder, send)
             self.assertEqual(third["actions"], [])
-            self.assertFalse((folder / "action-journal.sqlite3").exists())
+
         self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
 
     def test_live_container_removes_a_new_bad_grab_from_another_public_indexer(self):
@@ -1737,19 +985,17 @@ class FileCleanupTests(unittest.TestCase):
         args = ["production.py", "--config", "connections.json", "--preflight", "HD", f.hash]
         with patch("sys.argv", args), patch("production.load_config", return_value=f.config), patch(
                 "production.Api", side_effect=[f.qb, f.s]), patch(
-                "production.capture_context", wraps=production.capture_context) as capture, patch(
-                "production.Journal") as journal, redirect_stdout(StringIO()) as output:
+                "production.capture_context", wraps=production.capture_context) as capture, redirect_stdout(StringIO()) as output:
             self.assertEqual(production.main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["preflight"], "verified")
         self.assertIs(result["live_sender_enabled"], False)
         self.assertEqual(result["operation"], "sonarr_remove_and_blocklist")
         capture.assert_not_called()
-        journal.assert_not_called()
 
-    def test_transport_blocks_file_action_even_when_other_release_gates_are_enabled(self):
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
-            with self.assertRaisesRegex(SafetyError, "^sonarr_blocklist_scope_unverifiable$"):
+    def test_transport_blocks_file_action_when_only_metadata_is_enabled(self):
+        with patch("production.METADATA_RETRY_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
+            with self.assertRaisesRegex(SafetyError, "^live_execution_disabled$"):
                 production._send_queue_delete(self.f.s, 7, blocklist=True)
         opener.assert_not_called()
 

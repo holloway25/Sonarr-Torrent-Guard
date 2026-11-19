@@ -10,7 +10,7 @@ import time
 
 from guard import (GuardError, endpoint_key, load_config, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
                    unique_config_keys)
-from safety import CONTAINER_JOURNAL_BINDING, CONTAINER_JOURNAL_MARKER, SafetyError, valid_digest
+from safety import SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v4"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
@@ -58,45 +58,6 @@ def read_grant(path):
         return json.loads(data, object_pairs_hook=unique_config_keys)
     except Exception:
         raise SafetyError("routine_authorization_unavailable") from None
-
-
-def read_container_journal_id(directory, *, required=False):
-    path = directory / CONTAINER_JOURNAL_MARKER
-    if not path.exists() and not path.is_symlink():
-        if required:
-            raise SafetyError("container_journal_marker_missing")
-        return None
-    reason = "container_journal_identity_mismatch"
-    try:
-        record = read_grant(path)
-    except SafetyError:
-        raise SafetyError(reason) from None
-    if not isinstance(record, dict) or set(record) != {"journal_id"} or not valid_digest(record["journal_id"]):
-        raise SafetyError(reason)
-    return record["journal_id"]
-
-
-def read_container_journal_binding(directory):
-    path = directory / CONTAINER_JOURNAL_BINDING
-    if not path.exists() and not path.is_symlink():
-        return None
-    reason = "container_journal_identity_mismatch"
-    try:
-        record = read_grant(path)
-    except SafetyError:
-        raise SafetyError(reason) from None
-    if (not isinstance(record, dict) or set(record) not in ({"journal_id"}, {"journal_id", "unbound_digest"})
-            or not all(valid_digest(value) for value in record.values())):
-        raise SafetyError(reason)
-    return record
-
-
-def read_bound_container_journal_id(directory):
-    marker = read_container_journal_id(directory, required=True)
-    binding = read_container_journal_binding(directory)
-    if binding != {"journal_id": marker}:
-        raise SafetyError("container_journal_identity_mismatch")
-    return marker
 
 
 def read_config_scope(path, reason):
@@ -167,11 +128,6 @@ class RoutineAuthorization:
     def expires_at(self):
         return self.value["expires_at"]
 
-    def execution_expiry(self):
-        """Even an ongoing grant delegates at most 120 seconds to one action."""
-        expiry = time.time() + 120
-        return expiry if self.value.get("authorization_mode") == "ongoing" else min(expiry, self.value["expires_at"])
-
     @classmethod
     def load(cls, path, config, *, config_path):
         path = Path(path).absolute()
@@ -211,25 +167,14 @@ class ContainerAuthorization:
     mode = "container"
     expires_at = None
 
-    def __init__(self, config, config_path, *, bind_journal=True):
+    def __init__(self, config, config_path):
         self._config_path = config_path.absolute()
         self._path = self._config_path.parent / CONTAINER_SCOPE_FILE
         self._scope = container_scope_record(config)
-        self.journal_id = None
-        if bind_journal and os.environ.get("STGUARD_MODE") == "live":
-            self.journal_id = read_bound_container_journal_id(self._path.parent)
         self.identifier = digest({"mode": self.mode, **self._scope})
-        if bind_journal:
-            self.validate(config)
-        else:
-            self.validate_scope(config)
+        self.validate(config)
 
     def validate(self, config, report=None):
-        self.validate_scope(config, report)
-        if read_bound_container_journal_id(self._path.parent) != self.journal_id:
-            raise SafetyError("container_journal_identity_mismatch")
-
-    def validate_scope(self, config, report=None):
         if os.environ.get("STGUARD_MODE") != "live":
             raise SafetyError("live_execution_disabled")
         if config.get("minimum_age_seconds", 120) < 120:
@@ -240,6 +185,3 @@ class ContainerAuthorization:
         if read_config_scope(self._config_path, reason) != self._scope["scope_digest"]:
             raise SafetyError(reason)
         validate_candidate(config, report)
-
-    def execution_expiry(self):
-        return time.time() + 120

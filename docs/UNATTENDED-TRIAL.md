@@ -68,8 +68,7 @@ The worker acts on current candidates and checks replacements on later passes.
 [File-policy cleanup](PUBLIC-WORKFLOW.md#live-file-policy-cleanup) uses Sonarr's
 native Remove and Blocklist action. [Metadata retry](METADATA-RETRY.md) uses
 removal without blocklisting and may request an affected-episode search during
-the same pass. Each pass uses current evidence without SQLite or an attempt
-history. Logs include the grant digest for inspection.
+the same pass. Logs include the grant digest for inspection.
 
 An older v3 grant requires a new reviewed grant under v4 because selected
 blocked file types now qualify for cleanup. A reviewed code update also
@@ -90,7 +89,7 @@ The worker logs each finished/held action immediately and a cycle summary to
 owner-private rotating `routine.log` beside the configuration. The active log
 and its backup paths must be separate from the configuration, grant
 and other reserved state files. The worker also prints a
-sanitized summary for the service journal. If the shared three-minute deadline
+sanitized summary for system service logs. If the shared three-minute deadline
 or a handled error interrupts the live pass, the summary says `interrupted`
 and includes the actions already reported. The worker saves a separate live
 dispatch cursor before each attempt, so an interruption gives the next

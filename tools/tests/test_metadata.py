@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from guard import run, recheck_candidate
 import production
-from safety import Journal, SafetyError, check_fresh, reconcile
+from safety import SafetyError, check_fresh
 from workflow import preview_failure
 from reports import human_report, json_events
 from tools.tests import test_guard as guard_fixtures
@@ -92,8 +92,7 @@ class MetadataTests(unittest.TestCase):
 class MetadataSenderTests(unittest.TestCase):
     def setUp(self):
         self.f = production_fixtures.ProductionTests()
-        self.f.setUp(blocklist_verifiable=False)
-        self.f.journal.allow_public_attempt = True
+        self.f.setUp()
         self.t = self.f.qb.routes["/api/v2/torrents/info"][0]
         # Fixture's torrent is ten minutes old; use a matching older grab.
         self.t["added_on"] -= 1800
@@ -102,8 +101,6 @@ class MetadataSenderTests(unittest.TestCase):
         self.t.update(state="metaDL", progress=0, total_size=-1, time_active=1800)
         self.f.qb.routes["/api/v2/torrents/files"] = []
         self.f.report = run(self.f.config, self.f.qb, self.f.apis)[0]
-        self.f.approval.update(ownership_fingerprint=self.f.report["ownership_fingerprint"],
-                               manifest_fingerprint=self.f.report["manifest_fingerprint"])
         gate = patch("production.METADATA_RETRY_RELEASE_ENABLED", True)
         gate.start()
         self.addCleanup(gate.stop)
@@ -137,14 +134,13 @@ class MetadataSenderTests(unittest.TestCase):
                     self.assertEqual((assessed["decision"], assessed["reason"]),
                                      ("skip", "conflicting_grab_source_order"))
                     with self.assertRaisesRegex(SafetyError, "^candidate_no_longer_eligible$"):
-                        production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
-            self.assertEqual(f.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+                        production.execute_live_metadata_retry(f.config, f.qb, f.apis, f.report, authority, f.lock_path)
             remove.assert_not_called()
             search.assert_not_called()
 
             older = datetime.datetime.fromisoformat(f.grab["date"]) - datetime.timedelta(seconds=1)
             f.s.routes[history] = {"totalRecords": 2, "records": [dict(tied[0], date=older.isoformat()), f.grab]}
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+            row = production.execute_live_metadata_retry(f.config, f.qb, f.apis, f.report, authority, f.lock_path)
         self.assertEqual(row["stage"], "retry_requested")
         remove.assert_called_once_with(f.s, 7, blocklist=False)
         search.assert_called_once()
@@ -175,118 +171,88 @@ class MetadataSenderTests(unittest.TestCase):
                 f.qb, "call", side_effect=qb), patch.object(f.s, "call", side_effect=sonarr), patch(
                 "production._send_queue_delete", side_effect=remove) as send, patch(
                 "production._send_episode_search", return_value=41):
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+            row = production.execute_live_metadata_retry(f.config, f.qb, f.apis, f.report, authority, f.lock_path)
         self.assertEqual(row["stage"], "retry_requested")
         send.assert_called_once_with(f.s, 7, blocklist=False)
 
-    def test_final_metadata_recheck_holds_changed_target_after_last_sonarr_read(self):
+    def test_final_metadata_check_holds_a_download_that_started(self):
         f = self.f
-        authority = self.routine_authority()
-        original = dict(self.t)
-        verify, refresh = production.require_sonarr_v4, f.journal.refresh_baselines
-        cases = [
-            ({"state": "downloading", "progress": .15, "total_size": 100}, guard_fixtures.manifest(("episode.mkv", 1))),
-            ({"added_on": self.t["added_on"] + 1}, []),
-            ({"progress": .15}, []),
-            ({"category": "other"}, []),
-            ({}, guard_fixtures.manifest(("episode.mkv", 0))),
-            ({}, None),
-        ]
-        for changes, files in cases:
-            with self.subTest(changes=changes, files=files):
-                self.t.clear()
-                self.t.update(original)
-                f.qb.routes["/api/v2/torrents/files"] = []
-                refreshed = False
+        capture = production.capture_context
 
-                def mark_refresh(*args):
-                    nonlocal refreshed
-                    row = refresh(*args)
-                    refreshed = True
-                    return row
+        def capture_then_start(*args):
+            context = capture(*args)
+            self.t.update(state="downloading", progress=0.15, total_size=100)
+            f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("episode.mkv", 1))
+            return context
 
-                def change_after_final_sonarr_read(*args):
-                    version = verify(*args)
-                    if refreshed:
-                        self.t.update(changes)
-                        f.qb.routes["/api/v2/torrents/files"] = files
-                    return version
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production.capture_context", side_effect=capture_then_start), patch(
+                "production._send_queue_delete") as remove, patch("production._send_episode_search") as search:
+            with self.assertRaisesRegex(SafetyError, "^metadata_timeout_no_longer_confirmed$"):
+                self.execute()
+        remove.assert_not_called()
+        search.assert_not_called()
+
+    def test_final_history_rejects_malformed_potential_replacements(self):
+        import copy
+
+        f = self.f
+        sonarr, downloader = copy.deepcopy(f.s.routes), copy.deepcopy(f.qb.routes)
+        observe = production.OutcomeVerifier.observe
+        for change, reason in (
+                ({"seriesId": None}, "replacement_history_identity_invalid"),
+                ({"episodeId": "3"}, "replacement_history_identity_invalid"),
+                ({"eventType": None}, "replacement_history_event_invalid"),
+                ({"data": {}}, "replacement_client_unknown"),
+                ({}, "replacement_already_grabbed")):
+            with self.subTest(change=change):
+                f.s.routes, f.qb.routes = copy.deepcopy(sonarr), copy.deepcopy(downloader)
+
+                def observe_then_add_grab(verifier):
+                    result = observe(verifier)
+                    stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+                    grab = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
+                    grab.update(change)
+                    f.s.routes["/api/v3/history/since"] = [f.grab, grab]
+                    return result
 
                 with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
-                        f.journal, "refresh_baselines", side_effect=mark_refresh), patch(
-                        "production.require_sonarr_v4", side_effect=change_after_final_sonarr_read), patch(
-                        "production._send_queue_delete") as remove, patch("production._send_episode_search") as search:
-                    row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
-                self.assertTrue(refreshed)
-                self.assertEqual(row["stage"], "dispatch_blocked")
-                self.assertEqual(row["stop_reason"], "metadata_timeout_no_longer_confirmed")
-                remove.assert_not_called()
+                        production.OutcomeVerifier, "observe", observe_then_add_grab), patch(
+                        "production._send_queue_delete", side_effect=self.removed), patch(
+                        "production._send_episode_search") as search:
+                    result = self.execute()
+                self.assertEqual((result["stage"], result["stop_reason"]), ("retry_search_blocked", reason))
                 search.assert_not_called()
 
-    def test_malformed_release_title_holds_only_its_own_metadata_attempt(self):
-        from contextlib import closing
+    def test_standalone_scope_change_after_removal_blocks_search(self):
+        import copy
         from pathlib import Path
-        import tempfile
-
-        import routine
 
         f = self.f
         authority = self.routine_authority()
-        other_hash = "b" * 40
-        valid_title = "  Example Show S01E02  "
-        other_torrent = dict(self.t, hash=other_hash)
-        first_queue, = f.s.routes["/api/v3/queue"]["records"]
-        other_queue = dict(first_queue, id=8, downloadId=other_hash.upper(), episodeId=4)
-        other_grab = dict(f.grab, id=6, downloadId=other_hash.upper(), episodeId=4, sourceTitle=valid_title)
-        f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, other_grab]}
+        folder = Path(f.folder.name)
+        config_path = folder / "connections.json"
+        grant_path = folder / "routine-authorization.json"
+        config = copy.deepcopy(f.config)
+        config["dry_run"] = True
+        config["qbittorrent"].update(username="REPLACE_ME", password="REPLACE_ME")
+        config_path.write_text(json.dumps(config))
+        grant_path.write_text(json.dumps(authority.value))
+        grant_path.chmod(0o600)
+        loaded = type(authority).load(grant_path, f.config, config_path=config_path)
 
-        for invalid in ("", "  	 ", None, [], {"title": valid_title}):
-            with self.subTest(title=invalid), tempfile.TemporaryDirectory() as folder, closing(
-                    Journal(Path(folder) / "test.sqlite3", allow_public_attempt=True)) as journal:
-                f.grab["sourceTitle"] = invalid
-                f.qb.routes["/api/v2/torrents/info"] = [self.t, other_torrent]
-                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [first_queue, other_queue]}
-                f.s.routes["/api/v3/blocklist"] = {"totalRecords": 0, "records": []}
-                reports = run(f.config, f.qb, f.apis)
-                proposal = {"assessment": [dict(report, safeguards={"status": "fresh_attempt_verified"})
-                                           for report in reports], "recovery": []}
+        def remove_then_protect(*args, **kwargs):
+            self.removed()
+            policy = config["sonarr"]["HD"]["indexers"]
+            policy.update(public=[], private=["Public Source", "Private Source"])
+            config_path.write_text(json.dumps(config))
 
-                def remove(api, queue_id, *, blocklist):
-                    self.assertEqual(queue_id, 8)
-                    self.assertFalse(blocklist)
-                    f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                    f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [first_queue]}
-                    stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
-                    f.s.routes["/api/v3/blocklist"] = {"totalRecords": 1, "records": [
-                        {"id": 1, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source",
-                         "sourceTitle": valid_title, "date": stamp.isoformat(), "protocol": "torrent"}]}
-
-                with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete", side_effect=remove) as send, patch(
-                        "production._send_episode_search") as search:
-                    result = routine.cycle(f.config, f.qb, f.apis, journal, authority, {}, proposal)
-                self.assertEqual(result["status"], "completed")
-                first, second = result["actions"]
-                self.assertEqual((first["hash"], first["stage"], first["stop_reason"]),
-                                 (f.hash, "held", "ambiguous_release_title_evidence"))
-                self.assertEqual((second["hash"], second["stage"]), (other_hash, "manual_review"))
-                self.assertIs(second["current_observation"]["blocklisted"], True)
-                self.assertEqual(journal.get(second["key"])["context"]["release_title_digest"],
-                                 production.digest(valid_title))
-                send.assert_called_once_with(f.s, 8, blocklist=False)
-                search.assert_not_called()
-
-    def test_metadata_arriving_before_dispatch_cancels_even_if_new_file_is_bad(self):
-        f = self.f
-        def wait(*args):
-            self.t["state"] = "stalledUP"
-            f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production.wait_for_event_boundary", side_effect=wait), patch("production._send_queue_delete") as send:
-            row = production.execute_public_attempt(f.config, f.qb, f.apis, f.journal, f.report, f.approval)
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-        send.assert_not_called()
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove_then_protect), patch(
+                "production._send_episode_search") as search:
+            result = production.execute_live_metadata_retry(f.config, f.qb, f.apis, f.report, loaded, f.lock_path)
+        self.assertEqual(result["stop_reason"], "routine_authorization_expired_or_scope_changed")
+        search.assert_not_called()
 
     def removed(self, *args, **kwargs):
         self.f.qb.routes["/api/v2/torrents/info"] = []
@@ -294,175 +260,14 @@ class MetadataSenderTests(unittest.TestCase):
 
     def execute(self):
         f = self.f
-        return production.execute_public_attempt(f.config, f.qb, f.apis, f.journal, f.report, f.approval)
-
-    def test_metadata_removal_does_not_require_failure_or_blocklist_and_searches_once(self):
-        f = self.f
-        f.s.routes["/api/v3/system/status"] = {"version": "4.1.2.3456"}
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed) as send, patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-            self.assertEqual(self.execute(), row)
-        self.assertEqual(row["stage"], "retry_requested")
-        self.assertEqual(row["search_command_id"], 41)
-        self.assertEqual(row["context"]["metadata_retry"], {"blocklist": False, "search": "EpisodeSearch"})
-        self.assertTrue(row["confirmed"]["torrent_absent"])
-        self.assertFalse(row["current_observation"]["failed"])
-        self.assertFalse(row["current_observation"]["blocklisted"])
-        self.assertIsNone(row["current_observation"]["data_deleted"])
-        send.assert_called_once_with(f.s, 7, blocklist=False)
-        search.assert_called_once_with(f.s, [3])
-        reopened = Journal(f.journal.path)
-        try:
-            self.assertEqual(reopened.get(row["key"]), row)
-            observe = Mock()
-            self.assertEqual(reconcile(reopened, row["key"], observe), row)
-            observe.assert_not_called()
-        finally:
-            reopened.close()
+        return production.execute_live_metadata_retry(f.config, f.qb, f.apis, f.report, self.routine_authority(), f.lock_path)
 
     def test_metadata_retry_requires_separate_release_gate(self):
         with patch("production.METADATA_RETRY_RELEASE_ENABLED", False), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+                "production.ROUTINE_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
             with self.assertRaisesRegex(SafetyError, "metadata_retry_not_released"):
                 self.execute()
         send.assert_not_called()
-
-    def test_unconfirmed_removal_never_searches(self):
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=TimeoutError()), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "uncertain")
-        search.assert_not_called()
-
-    def test_lost_search_response_is_durable_and_never_retried(self):
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed) as remove, patch(
-                "production._send_episode_search", side_effect=TimeoutError()) as search:
-            row = self.execute()
-            self.assertEqual(self.execute(), row)
-        self.assertEqual(row["stage"], "retry_search_uncertain")
-        self.assertIsNone(row["search_command_id"])
-        remove.assert_called_once()
-        search.assert_called_once()
-        reopened = Journal(self.f.journal.path)
-        try:
-            with patch("production._send_episode_search") as search:
-                self.assertEqual(reconcile(reopened, row["key"], Mock()), row)
-            search.assert_not_called()
-        finally:
-            reopened.close()
-
-    def test_expired_approval_after_search_intent_blocks_search(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                f.approval["expires_at"] = time.time() - 1
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "approval_expired_or_target_mismatch")
-        search.assert_not_called()
-
-    def test_downloader_renamed_after_removal_blocks_extra_search(self):
-        f = self.f
-        original = f.journal.transition
-
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                client = f.s.routes["/api/v3/downloadclient"][0]
-                client["name"] = "Renamed Downloader"
-                event = dict(f.grab, id=8, downloadId="d" * 40,
-                             date=datetime.datetime.fromtimestamp(
-                                 row["dispatched_at"] + 1, datetime.timezone.utc).isoformat(),
-                             data={**f.grab["data"], "downloadClientName": client["name"]})
-                f.s.routes["/api/v3/history/since"].append(event)
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed) as remove, patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        remove.assert_called_once()
-        search.assert_not_called()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "identity_or_manifest_changed")
-
-    def test_changed_standalone_disk_scope_after_removal_blocks_search(self):
-        import json
-        from pathlib import Path
-        from authorization import RoutineAuthorization, RULE, code_digest, scope_digest
-
-        f = self.f
-        directory = Path(f.folder.name)
-        path = directory / "connections.json"
-        config = dict(f.config, dry_run=True, qbittorrent={
-            **f.config["qbittorrent"], "username": "REPLACE_ME", "password": "REPLACE_ME"})
-        path.write_text(json.dumps(config))
-        path.chmod(0o600)
-        grant = directory / "routine-authorization.json"
-        now = time.time()
-        grant.write_text(json.dumps({"enabled": True, "rule": RULE, "grant_id": "c" * 64,
-            "issued_at": now - 1, "expires_at": now + 3600, "scope_digest": scope_digest(config),
-            "code_digest": code_digest()}))
-        grant.chmod(0o600)
-        authority = RoutineAuthorization.load(grant, f.config, config_path=path)
-
-        def removed(*args, **kwargs):
-            self.removed()
-            changed = json.loads(path.read_text())
-            changed["sonarr"]["HD"]["indexers"] = {
-                "mode": "private_exclusions", "private": ["Public Source"]}
-            path.write_text(json.dumps(changed))
-
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=removed) as remove, patch(
-                "production._send_episode_search") as search:
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
-        remove.assert_called_once()
-        search.assert_not_called()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
-
-    def test_reviewed_version_drift_before_search_blocks_search(self):
-        def removed(*args, **kwargs):
-            self.removed()
-        original = self.f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                self.f.s.routes["/api/v3/system/status"] = {"version": "5.0.1"}
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=removed), patch.object(
-                self.f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
-        search.assert_not_called()
-
-    def test_reappearing_hash_or_new_queued_replacement_blocks_extra_search(self):
-        original = self.f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                self.f.qb.routes["/api/v2/torrents/info"] = [
-                    dict(self.t, infohash_v1=self.f.hash, infohash_v2="")]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                self.f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stop_reason"], "target_reappeared")
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        search.assert_not_called()
 
     def test_original_present_under_an_alternate_hash_stops_retry(self):
         f = self.f
@@ -472,34 +277,13 @@ class MetadataSenderTests(unittest.TestCase):
             self.removed()
             f.qb.routes["/api/v2/torrents/info"] = [hybrid]
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove_from_queue_only) as remove, patch(
                 "production._send_episode_search") as search:
             row = self.execute()
-        self.assertNotIn("hash_aliases", row["context"])
-        self.assertIs(row["current_observation"]["torrent_absent"], False)
-        self.assertEqual(row["stage"], "uncertain")
+        self.assertNotIn("hash_aliases", f.report)
+        self.assertEqual(row["stage"], "retry_removal_unverified")
         remove.assert_called_once()
-        search.assert_not_called()
-
-    def test_alternate_hash_reappearing_after_removal_blocks_search(self):
-        f = self.f
-        original = f.journal.transition
-        hybrid = dict(self.t, hash="b" * 40, infohash_v1=f.hash, infohash_v2="b" * 64)
-
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                f.qb.routes["/api/v2/torrents/info"] = [hybrid]
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertNotIn("hash_aliases", row["context"])
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "target_reappeared")
         search.assert_not_called()
 
     def test_new_queued_replacement_blocks_extra_search(self):
@@ -507,44 +291,12 @@ class MetadataSenderTests(unittest.TestCase):
             self.removed()
             self.f.s.routes["/api/v3/queue"] = {"totalRecords": 1,
                 "records": [{"id": 19, "seriesId": 2, "episodeId": 3}]}
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=removed), patch("production._send_episode_search") as search:
             row = self.execute()
         self.assertEqual(row["stage"], "retry_search_blocked")
         self.assertEqual(row["stop_reason"], "replacement_already_queued")
         search.assert_not_called()
-
-    def test_timeout_never_escalates_to_blocklist_and_new_attempts_need_new_grabs(self):
-        f = self.f
-        now = int(time.time())
-        rows = []
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed) as remove, patch(
-                "production._send_episode_search", return_value=41) as search:
-            for attempt in range(4):
-                stamp = now + attempt * 2000
-                if attempt:
-                    self.t["added_on"] = stamp - 1900
-                    f.grab.update(id=5 + attempt, date=datetime.datetime.fromtimestamp(
-                        self.t["added_on"], datetime.timezone.utc).isoformat())
-                    f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                    f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [{"id": 7,
-                        "downloadId": f.hash.upper(), "seriesId": 2, "episodeId": 3, "downloadClientId": 1}]}
-                with patch("time.time", return_value=stamp):
-                    f.report = run(f.config, f.qb, f.apis)[0]
-                    f.approval.update(ownership_fingerprint=f.report["ownership_fingerprint"],
-                        manifest_fingerprint=f.report["manifest_fingerprint"], nonce=str(attempt + 1) * 64,
-                        expires_at=stamp + 120)
-                    row = self.execute()
-                rows.append(row)
-                self.assertEqual(row["stage"], "retry_requested")
-                self.assertIs(row["context"]["metadata_retry"]["blocklist"], False)
-                with self.assertRaises(SafetyError):
-                    production.check_prior_attempts(f.journal, f.report, config=f.config)
-        self.assertEqual(len({r["key"] for r in rows}), 4)
-        self.assertEqual(remove.call_count, 4)
-        self.assertEqual(search.call_count, 4)
-        self.assertTrue(all(call.kwargs == {"blocklist": False} for call in remove.call_args_list))
 
     def test_preview_describes_remove_then_search_not_failure_and_blocklist(self):
         plan = preview_failure(self.f.report, {"status": "verified", "automatic_retry": True, "interactive_retry": True})
@@ -553,113 +305,16 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertEqual(plan["search_preview"]["body"], {"name": "EpisodeSearch", "episodeIds": [3]})
         self.assertIn("explicit_metadata_retry_authorization_required", plan["blockers"])
 
-    def test_crash_after_removal_does_not_cause_recovery_search(self):
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch(
-                "production.finish_replacement_search", side_effect=RuntimeError("simulated crash")):
-            with self.assertRaises(RuntimeError):
-                self.execute()
-        row = self.f.journal.related("HD", self.f.hash)[0]
-        self.assertEqual(row["stage"], "retry_removed")
-        reopened = Journal(self.f.journal.path)
-        try:
-            with patch("production._send_episode_search") as search:
-                self.assertEqual(reconcile(reopened, row["key"], Mock()), row)
-            search.assert_not_called()
-        finally:
-            reopened.close()
-
-    def test_crash_after_search_intent_never_replays_search(self):
-        original = self.f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                raise RuntimeError("simulated crash")
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                self.f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            with self.assertRaises(RuntimeError):
-                self.execute()
-        row = self.f.journal.related("HD", self.f.hash)[0]
-        self.assertEqual(row["stage"], "retry_search_recorded")
-        self.assertEqual(reconcile(self.f.journal, row["key"], Mock()), row)
-        search.assert_not_called()
-
     def test_preexisting_new_grab_suppresses_redundant_search(self):
         def removed(*args, **kwargs):
             self.removed()
             replacement = dict(self.f.grab, id=8, downloadId="b" * 40,
                 date=datetime.datetime.now(datetime.timezone.utc).isoformat())
             self.f.s.routes["/api/v3/history/since"] = [self.f.grab, replacement]
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=removed), patch("production._send_episode_search") as search:
             row = self.execute()
         self.assertEqual(row["stage"], "retry_superseded")
-        search.assert_not_called()
-
-    def test_partial_pack_replacement_veto_survives_a_later_empty_history_read(self):
-        f = self.f
-        self.assess_season_pack()
-        initial_history = f.s.routes["/api/v3/history/since"][:]
-        transition = f.journal.transition
-
-        def remove(*args, **kwargs):
-            self.removed()
-            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
-            grabbed = dict(f.grab, id=9, episodeId=4, downloadId="b" * 40, date=stamp.isoformat())
-            f.s.routes["/api/v3/history/since"] = [*initial_history, grabbed]
-
-        def disappear_after_observation(*args, **kwargs):
-            row = transition(*args, **kwargs)
-            if args[2] == "retry_removed":
-                f.s.routes["/api/v3/history/since"] = initial_history
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=remove) as delete, patch.object(
-                f.journal, "transition", side_effect=disappear_after_observation), patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_superseded")
-        self.assertIs(row["current_observation"]["replacement_observed"], False)
-        self.assertIs(row["current_observation"]["any_replacement_observed"], True)
-        self.assertIs(row["confirmed"]["any_replacement_observed"], True)
-        reopened = Journal(f.journal.path, read_only=True)
-        try:
-            self.assertEqual(reopened.get(row["key"]), row)
-        finally:
-            reopened.close()
-        delete.assert_called_once()
-        search.assert_not_called()
-
-    def test_same_hash_grab_suppresses_search_when_download_is_still_absent(self):
-        f = self.f
-        original_history = f.s.routes["/api/v3/history/since"][:]
-        transition = f.journal.transition
-
-        def remove(*args, **kwargs):
-            self.removed()
-            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
-            grabbed = dict(f.grab, id=9, date=stamp.isoformat())
-            f.s.routes["/api/v3/history/since"] = [*original_history, grabbed]
-
-        def discard_grab_after_observation(*args, **kwargs):
-            row = transition(*args, **kwargs)
-            if args[2] == "retry_removed":
-                f.s.routes["/api/v3/history/since"] = original_history
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=remove), patch.object(
-                f.journal, "transition", side_effect=discard_grab_after_observation), patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_superseded")
-        self.assertIs(row["current_observation"]["replacement_observed"], False)
-        self.assertIs(row["current_observation"]["any_replacement_observed"], False)
-        self.assertIs(row["current_observation"]["replacement_grab_observed"], True)
-        self.assertIs(f.journal.get(row["key"])["confirmed"]["replacement_grab_observed"], True)
         search.assert_not_called()
 
     def test_later_episode_history_failure_preserves_an_already_confirmed_grab(self):
@@ -686,61 +341,14 @@ class MetadataSenderTests(unittest.TestCase):
                 raise TimeoutError()
             return original(route, params)
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
                 f.s, "call", side_effect=episode_history), patch(
                 "production._send_queue_delete", side_effect=remove), patch(
                 "production._send_episode_search") as search:
             row = self.execute()
         self.assertEqual(failed_at, [4])
         self.assertEqual(row["stage"], "retry_superseded")
-        self.assertIsNone(row["current_observation"]["replacement_observed"])
-        self.assertTrue(row["confirmed"]["replacement_grab_observed"])
         search.assert_not_called()
-
-    def test_incomplete_initial_history_blocks_search_even_if_final_read_omits_the_grab(self):
-        from contextlib import closing
-        from pathlib import Path
-        import tempfile
-
-        f = self.f
-        queue = f.s.routes["/api/v3/queue"]
-        original = f.s.call
-        for total in (1, 2):
-            with self.subTest(total=total), tempfile.TemporaryDirectory() as folder, closing(
-                    Journal(Path(folder) / "test.sqlite3", allow_public_attempt=True)) as journal:
-                f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                f.s.routes["/api/v3/queue"] = queue
-                replacement = None
-
-                def remove(*args, **kwargs):
-                    nonlocal replacement
-                    self.removed()
-                    stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
-                    replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
-
-                def call(route, params=None):
-                    if replacement is not None and route == "/api/v3/history" and "eventType" not in params:
-                        return {"totalRecords": total, "records": [replacement]}
-                    # The unscoped final history read never repeats the grab.
-                    return original(route, params)
-
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
-                        f.s, "call", side_effect=call), patch(
-                        "production._send_queue_delete", side_effect=remove) as send, patch(
-                        "production._send_episode_search", return_value=41) as search:
-                    row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
-                    recovered = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
-                self.assertIs(row["current_observation"]["torrent_absent"], True)
-                self.assertEqual(recovered, row)
-                if total == 1:
-                    self.assertEqual(row["stage"], "retry_superseded")
-                    self.assertIs(row["current_observation"]["replacement_grab_observed"], True)
-                else:
-                    self.assertEqual(row["stage"], "retry_search_blocked")
-                    self.assertEqual(row["stop_reason"], "replacement_history_unavailable")
-                    self.assertIsNone(row["current_observation"]["replacement_grab_observed"])
-                send.assert_called_once()
-                search.assert_not_called()
 
     def test_metadata_preflight_reports_replacement_grab_observations(self):
         from contextlib import redirect_stdout
@@ -759,8 +367,7 @@ class MetadataSenderTests(unittest.TestCase):
 
         args = ["production.py", "--config", "connections.json", "--preflight", "HD", f.hash]
         with patch("sys.argv", args), patch("production.load_config", return_value=f.config), patch(
-                "production.Api", side_effect=[f.qb, f.s]), patch.object(f.s, "call", side_effect=call), patch(
-                "production.Journal") as journal, redirect_stdout(StringIO()) as output:
+                "production.Api", side_effect=[f.qb, f.s]), patch.object(f.s, "call", side_effect=call), redirect_stdout(StringIO()) as output:
             self.assertEqual(production.main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["preflight"], "verified")
@@ -769,7 +376,6 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertIs(observation.get("replacement_grab_observed"), True)
         self.assertIs(observation.get("any_replacement_observed"), True)
         self.assertIs(observation.get("replacement_grab_ambiguous"), False)
-        journal.assert_not_called()
 
     def test_later_page_timeout_preserves_the_grab_seen_on_the_first_page(self):
         f = self.f
@@ -793,388 +399,14 @@ class MetadataSenderTests(unittest.TestCase):
             rows = [replacement, *(dict(replacement, id=n, eventType="downloadFailed") for n in range(21, 120))]
             return {"records": rows, "totalRecords": 101}
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
                 f.s, "call", side_effect=paginated), patch(
                 "production._send_queue_delete", side_effect=remove), patch(
                 "production._send_episode_search") as search:
             row = self.execute()
         self.assertEqual(seen_pages, [1, 2])
         self.assertEqual(row["stage"], "retry_superseded")
-        self.assertIsNone(row["current_observation"]["replacement_observed"])
-        self.assertIs(row["confirmed"]["replacement_grab_observed"], True)
         search.assert_not_called()
-
-    def assert_coordinator_restart_does_not_replay(self, crash_stage):
-        f = self.f
-        original_finish = production.finish_replacement_search
-        original_transition = f.journal.transition
-        def finish(*args, **kwargs):
-            if crash_stage == "retry_removed":
-                raise RuntimeError("simulated crash")
-            return original_finish(*args, **kwargs)
-        def transition(*args, **kwargs):
-            row = original_transition(*args, **kwargs)
-            if args[2] == crash_stage:
-                raise RuntimeError("simulated crash")
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch(
-                "production.finish_replacement_search", side_effect=finish), patch.object(
-                f.journal, "transition", side_effect=transition):
-            with self.assertRaises(RuntimeError):
-                self.execute()
-        previous = f.journal.related("HD", f.hash)[0]
-        self.assertEqual(previous["stage"], crash_stage)
-        f.journal.close()
-        f.journal = Journal(f.journal.path, allow_public_attempt=True)
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete") as remove, patch("production._send_episode_search") as search:
-            recovered = self.execute()  # Actual coordinator entry, not just reconcile().
-        self.assertEqual(recovered, previous)
-        remove.assert_not_called()
-        search.assert_not_called()
-
-    def test_coordinator_restart_after_removal_never_sends_deferred_search(self):
-        self.assert_coordinator_restart_does_not_replay("retry_removed")
-
-    def test_coordinator_restart_after_search_intent_never_replays_either_request(self):
-        self.assert_coordinator_restart_does_not_replay("retry_search_recorded")
-
-    def test_disappearing_ambiguous_replacement_grab_still_holds_search(self):
-        f = self.f
-        route = "/api/v3/history/since"
-        baseline = f.s.routes[route][:]
-        original_transition = f.journal.transition
-
-        def remove(*args, **kwargs):
-            self.removed()
-            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
-            f.s.routes[route] = [*baseline, dict(
-                f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat(), data={})]
-
-        def transition(*args, **kwargs):
-            row = original_transition(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                f.s.routes[route] = baseline
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=remove), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertIs(row["confirmed"]["replacement_grab_ambiguous"], True)
-        self.assertIsNot(row["confirmed"].get("replacement_grab_observed"), True)
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "replacement_history_ambiguous")
-        self.assertIs(row["current_observation"]["torrent_absent"], True)
-        search.assert_not_called()
-
-    def test_retry_settings_are_reread_after_removal_and_search_intent(self):
-        import tempfile
-        from contextlib import closing
-        from pathlib import Path
-
-        f = self.f
-        route = "/api/v3/config/downloadclient"
-        ready = f.s.routes[route]
-        for fields in ({"autoRedownloadFailed": False}, {"autoRedownloadFailedFromInteractiveSearch": False},
-                       TimeoutError()):
-            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as folder, closing(
-                    Journal(Path(folder) / "test.sqlite3", allow_public_attempt=True)) as journal:
-                f.s.routes[route] = ready
-                f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [
-                    {"id": 7, "downloadId": f.hash.upper(), "seriesId": 2, "episodeId": 3, "downloadClientId": 1}]}
-                f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                original = journal.transition
-
-                def transition(*args, **kwargs):
-                    row = original(*args, **kwargs)
-                    if args[2] == "retry_search_recorded":
-                        f.s.routes[route] = dict(ready, **fields) if isinstance(fields, dict) else fields
-                    return row
-
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
-                        journal, "transition", side_effect=transition), patch(
-                        "production._send_queue_delete", side_effect=self.removed) as remove, patch(
-                        "production._send_episode_search") as search:
-                    row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
-                self.assertEqual(row["stage"], "retry_search_blocked")
-                self.assertEqual(row["stop_reason"], "retry_settings_not_ready")
-                self.assertIs(row["current_observation"]["torrent_absent"], True)
-                remove.assert_called_once()
-                search.assert_not_called()
-
-    def test_final_history_refresh_suppresses_new_grab_even_when_queue_is_empty(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                replacement = dict(f.grab, id=18, downloadId="b" * 40,
-                    date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
-        search.assert_not_called()
-
-    def test_final_history_same_hash_new_grab_also_suppresses_search(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                replacement = dict(f.grab, id=18, date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
-        search.assert_not_called()
-
-    def test_final_history_outage_blocks_search_without_disclosing_response(self):
-        f = self.f
-        original = f.s.call
-        state = {"intent": False}
-        original_transition = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original_transition(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                state["intent"] = True
-            return row
-        def call(path, *args, **kwargs):
-            if path == "/api/v3/history/since" and state["intent"]:
-                raise RuntimeError("private-response")
-            return original(path, *args, **kwargs)
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch.object(
-                f.s, "call", side_effect=call), patch("production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "dispatch_validation_failed")
-        self.assertNotIn("private-response", json.dumps(row))
-        search.assert_not_called()
-
-    def test_final_history_old_or_other_client_grabs_do_not_suppress_search(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                old = dict(f.grab, id=18, downloadId="b" * 40)
-                other = dict(f.grab, id=19, downloadId="c" * 40,
-                    data={"downloadClientName": "Other"},
-                    date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                f.s.routes["/api/v3/history/since"] = [f.grab, old, other]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        search.assert_called_once()
-
-    def test_final_history_missing_or_invalid_client_identity_blocks_search(self):
-        f = self.f
-        cases = [{}, {"data": None}, {"data": []}, {"data": {}},
-                 *({"data": {"downloadClientName": value}} for value in
-                   (None, True, 0, [], {}, "", "   "))]
-        queue_rows = f.s.routes["/api/v3/queue"]
-        for number, changes in enumerate(cases):
-            with self.subTest(case=number):
-                f.journal.close()
-                f.journal = Journal(f.journal.path.parent / ("case-" + str(number) + ".sqlite3"), allow_public_attempt=True)
-                f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                f.s.routes["/api/v3/queue"] = queue_rows
-                f.s.routes["/api/v3/history/since"] = [f.grab]
-                original = f.journal.transition
-                def transition(*args, **kwargs):
-                    row = original(*args, **kwargs)
-                    if args[2] == "retry_search_recorded":
-                        replacement = dict(f.grab, id=18, downloadId="b" * 40,
-                            date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                        replacement.pop("data")
-                        replacement.update(changes)
-                        f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
-                    return row
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete", side_effect=self.removed), patch.object(
-                        f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-                    row = self.execute()
-                self.assertEqual(row["stage"], "retry_search_blocked")
-                self.assertEqual(row["stop_reason"], "replacement_client_unknown")
-                search.assert_not_called()
-                reopened = Journal(f.journal.path)
-                try:
-                    self.assertEqual(reopened.get(row["key"])["stop_reason"], "replacement_client_unknown")
-                finally:
-                    reopened.close()
-
-    def test_pre_intent_history_with_unknown_client_does_not_block_search(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                old = dict(f.grab, id=18, data=None)
-                f.s.routes["/api/v3/history/since"] = [f.grab, old]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        search.assert_called_once()
-
-    def test_final_history_missing_or_invalid_content_identity_blocks_search(self):
-        f = self.f
-        cases = [(field, missing, value) for field in ("seriesId", "episodeId")
-                 for missing, value in [(True, None), *[(False, value) for value in
-                     (None, True, False, "2", "3", 2.0, 3.0, 0, -1, [], {}, "")]]]
-        queue_rows = f.s.routes["/api/v3/queue"]
-        for number, (field, missing, value) in enumerate(cases):
-            with self.subTest(field=field, missing=missing, value=value):
-                f.journal.close()
-                f.journal = Journal(f.journal.path.parent / ("identity-" + str(number) + ".sqlite3"),
-                                    allow_public_attempt=True)
-                f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                f.s.routes["/api/v3/queue"] = queue_rows
-                f.s.routes["/api/v3/history/since"] = [f.grab]
-                original = f.journal.transition
-                def transition(*args, **kwargs):
-                    row = original(*args, **kwargs)
-                    if args[2] == "retry_search_recorded":
-                        replacement = dict(f.grab, id=18, downloadId="b" * 40,
-                            date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                        if missing:
-                            replacement.pop(field)
-                        else:
-                            replacement[field] = value
-                        f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
-                    return row
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete", side_effect=self.removed), patch.object(
-                        f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-                    row = self.execute()
-                self.assertEqual(row["stage"], "retry_search_blocked")
-                self.assertEqual(row["stop_reason"], "replacement_history_identity_invalid")
-                search.assert_not_called()
-                reopened = Journal(f.journal.path)
-                try:
-                    self.assertEqual(reopened.get(row["key"])["stop_reason"], "replacement_history_identity_invalid")
-                finally:
-                    reopened.close()
-
-    def test_final_history_valid_unrelated_content_can_be_ignored(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                date = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                other_series = dict(f.grab, id=18, seriesId=99, date=date)
-                other_episode = dict(f.grab, id=19, episodeId=99, date=date)
-                unknown_other_series = dict(other_series, id=20, eventType="unknown")
-                unknown_other_episode = dict(other_episode, id=22, eventType="unknown")
-                missing_type_other_series = dict(other_series, id=21)
-                missing_type_other_series.pop("eventType")
-                f.s.routes["/api/v3/history/since"] = [
-                    f.grab, other_series, other_episode, unknown_other_series, missing_type_other_series,
-                    unknown_other_episode]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        search.assert_called_once()
-
-    def assert_invalid_final_records_block(self, cases, route, reason):
-        f = self.f
-        original_queue = f.s.routes["/api/v3/queue"]
-        for number, record in enumerate(cases):
-            with self.subTest(case=number):
-                f.journal.close()
-                f.journal = Journal(f.journal.path.parent / ("schema-" + str(number) + ".sqlite3"),
-                                    allow_public_attempt=True)
-                f.qb.routes["/api/v2/torrents/info"] = [self.t]
-                f.s.routes["/api/v3/queue"] = original_queue
-                f.s.routes["/api/v3/history/since"] = [f.grab]
-                original = f.journal.transition
-                def transition(*args, **kwargs):
-                    row = original(*args, **kwargs)
-                    if args[2] == "retry_search_recorded":
-                        entry = dict(record, date=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                        if route == "/api/v3/queue":
-                            f.s.routes[route] = {"totalRecords": 1, "records": [entry]}
-                        else:
-                            f.s.routes[route] = [entry]
-                    return row
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                        "production._send_queue_delete", side_effect=self.removed), patch.object(
-                        f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-                    row = self.execute()
-                self.assertEqual(row["stage"], "retry_search_blocked")
-                self.assertEqual(row["stop_reason"], reason)
-                search.assert_not_called()
-                reopened = Journal(f.journal.path)
-                try:
-                    self.assertEqual(reopened.get(row["key"])["stop_reason"], reason)
-                finally:
-                    reopened.close()
-
-    def test_final_history_missing_malformed_unknown_event_type_blocks_search(self):
-        base = dict(self.f.grab, id=18, downloadId="b" * 40)
-        base.pop("eventType")
-        cases = [base, *[dict(base, eventType=value) for value in
-            (None, True, False, 1.0, "1", 0, "unknown", "Unknown", "futureType", 8, -1, [], {}, "")]]
-        self.assert_invalid_final_records_block(cases, "/api/v3/history/since", "replacement_history_event_invalid")
-
-    def test_known_non_grab_history_types_can_be_ignored(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                types = [2, 3, 4, 5, 6, 7, "seriesFolderImported", "downloadFolderImported",
-                         "downloadFailed", "episodeFileDeleted", "episodeFileRenamed", "downloadIgnored"]
-                f.s.routes["/api/v3/history/since"] = [dict(id=18 + n, eventType=value) for n, value in enumerate(types)]
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        search.assert_called_once()
-
-    def test_final_history_baseline_does_not_waive_event_type_validation(self):
-        malformed = dict(self.f.grab)
-        malformed.pop("eventType")
-        self.assert_invalid_final_records_block([malformed], "/api/v3/history/since", "replacement_history_event_invalid")
-
-    def test_final_queue_missing_or_invalid_identity_blocks_search(self):
-        base = {"id": 18, "seriesId": 2, "episodeId": 3}
-        cases = []
-        for field in ("seriesId", "episodeId"):
-            missing = dict(base)
-            missing.pop(field)
-            cases.append(missing)
-            for value in (None, True, False, "2", "3", 2.0, 3.0, 0, -1, [], {}, ""):
-                cases.append(dict(base, **{field: value}))
-        cases.append(dict(base, id=7, episodeId=None))  # Stale original row must also be validated.
-        self.assert_invalid_final_records_block(cases, "/api/v3/queue", "replacement_queue_identity_invalid")
 
     def test_final_queue_requests_unknown_series_and_blocks_search(self):
         f = self.f
@@ -1192,7 +424,7 @@ class MetadataSenderTests(unittest.TestCase):
                 result["totalRecords"] = len(result["records"])
             return result
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove_with_unmapped_item) as send, patch.object(
                 f.s, "call", side_effect=sonarr_queue), patch("production._send_episode_search") as search:
             row = self.execute()
@@ -1210,8 +442,6 @@ class MetadataSenderTests(unittest.TestCase):
         f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": grabs}
         f.s.routes["/api/v3/history/since"] = grabs
         f.report = run(f.config, f.qb, f.apis)[0]
-        f.approval.update(ownership_fingerprint=f.report["ownership_fingerprint"],
-                          manifest_fingerprint=f.report["manifest_fingerprint"])
         return second
 
     def test_final_queue_ignores_both_stale_original_season_pack_rows(self):
@@ -1221,7 +451,7 @@ class MetadataSenderTests(unittest.TestCase):
         def remove_from_downloader_only(*args, **kwargs):
             f.qb.routes["/api/v2/torrents/info"] = []
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove_from_downloader_only) as send, patch(
                 "production._send_episode_search", return_value=41) as search:
             row = self.execute()
@@ -1248,29 +478,13 @@ class MetadataSenderTests(unittest.TestCase):
             self.removed()
             f.s.routes["/api/v3/history/since"].remove(grabbed)
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production.wait_for_event_boundary", side_effect=record_grab), patch(
                 "production._send_queue_delete", side_effect=remove) as delete, patch(
                 "production._send_episode_search") as search:
             row = self.execute()
-        self.assertIn(grabbed["id"], row["context"]["baseline_history_ids"])
-        self.assertIs(row["current_observation"]["replacement_observed"], False)
-        self.assertEqual(row["context"].get("metadata_search_hold"), "replacement_already_grabbed")
         self.assertEqual(row["stage"], "retry_search_blocked")
         self.assertEqual(row["stop_reason"], "replacement_already_grabbed")
-        delete.assert_called_once()
-        search.assert_not_called()
-
-    def test_pre_removal_blocklist_is_preserved_as_a_search_veto(self):
-        self.assess_season_pack()
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production.wait_for_event_boundary", side_effect=lambda *_: self.blocklist_one_episode()), patch(
-                "production._send_queue_delete", side_effect=self.removed) as delete, patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertIs(row["current_observation"]["blocklisted"], False)
-        self.assertIn(33, row["context"]["baseline_blocklist_ids"])
-        self.assertEqual(row["stop_reason"], "replacement_blocklisted")
         delete.assert_called_once()
         search.assert_not_called()
 
@@ -1286,55 +500,40 @@ class MetadataSenderTests(unittest.TestCase):
                     self.assert_incomplete_blocklist_result(field, mismatch_field if mismatch else None)
 
     def assert_incomplete_blocklist_result(self, field, mismatch_field):
-        import tempfile
-        from pathlib import Path
-        from contextlib import closing
-
         f = self.f
         self.assess_season_pack()
-        self.f.s.routes["/api/v3/blocklist"] = {"totalRecords": 0, "records": []}
-        with tempfile.TemporaryDirectory() as folder, closing(
-                Journal(Path(folder) / "actions.sqlite3", allow_public_attempt=True)) as journal:
-            transition = journal.transition
+        observe = production.OutcomeVerifier.observe
 
-            def inject(*args, **kwargs):
-                row = transition(*args, **kwargs)
-                if args[2] == "retry_search_recorded":
-                    self.blocklist_one_episode()
-                    record = f.s.routes["/api/v3/blocklist"]["records"][0]
-                    del record[field]
-                    if mismatch_field:
-                        record[mismatch_field] = "Known different"
-                return row
-
-            with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
-                    journal, "transition", side_effect=inject), patch(
-                    "production._send_queue_delete", side_effect=self.removed), patch(
-                    "production._send_episode_search", return_value=41) as search:
-                row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+        def inject_after_observation(verifier):
+            result = observe(verifier)
+            self.blocklist_one_episode()
+            record = f.s.routes["/api/v3/blocklist"]["records"][0]
+            del record[field]
             if mismatch_field:
-                self.assertEqual(row["stage"], "retry_requested")
-                search.assert_called_once()
-            else:
-                self.assertEqual(row["stage"], "retry_search_blocked")
-                self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
-                search.assert_not_called()
-                observation = production.OutcomeVerifier(
-                    f.config, f.qb, f.apis, row["context"], row["dispatched_at"]).observe()
-                self.assertIsNone(observation["blocklisted"])
+                record[mismatch_field] = "Known different"
+            return result
+
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                production.OutcomeVerifier, "observe", inject_after_observation), patch(
+                "production._send_queue_delete", side_effect=self.removed), patch(
+                "production._send_episode_search", return_value=41) as search:
+            result = self.execute()
+        if mismatch_field:
+            self.assertEqual(result["stage"], "retry_requested")
+            search.assert_called_once()
+        else:
+            self.assertEqual(result["stage"], "retry_search_blocked")
+            self.assertEqual(result["stop_reason"], "replacement_blocklist_uncertain")
+            search.assert_not_called()
 
     def test_missing_episode_evidence_holds_but_unrelated_and_usenet_rows_do_not(self):
         import copy
-        import tempfile
-        from pathlib import Path
-        from contextlib import closing
 
         f = self.f
         self.assess_season_pack()
         sonarr, downloader = copy.deepcopy(f.s.routes), copy.deepcopy(f.qb.routes)
         for ids, protocol, held in (([], "torrent", True), ([99], "torrent", False), ([4], "usenet", False)):
-            with self.subTest(ids=ids, protocol=protocol), tempfile.TemporaryDirectory() as folder, closing(
-                    Journal(Path(folder) / "actions.sqlite3", allow_public_attempt=True)) as journal:
+            with self.subTest(ids=ids, protocol=protocol):
                 f.s.routes, f.qb.routes = copy.deepcopy(sonarr), copy.deepcopy(downloader)
 
                 def remove(*args, **kwargs):
@@ -1342,43 +541,17 @@ class MetadataSenderTests(unittest.TestCase):
                     self.blocklist_one_episode()
                     f.s.routes["/api/v3/blocklist"]["records"][0].update(episodeIds=ids, protocol=protocol)
 
-                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                         "production._send_queue_delete", side_effect=remove), patch(
                         "production._send_episode_search", return_value=41) as search:
-                    row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+                    result = self.execute()
                 if held:
-                    self.assertIsNone(row["current_observation"]["blocklisted"])
-                    self.assertEqual(row["stage"], "uncertain")
+                    self.assertEqual(result["stage"], "retry_search_blocked")
+                    self.assertEqual(result["stop_reason"], "replacement_blocklist_uncertain")
                     search.assert_not_called()
                 else:
-                    self.assertIs(row["current_observation"]["blocklisted"], False)
-                    self.assertEqual(row["stage"], "retry_requested")
+                    self.assertEqual(result["stage"], "retry_requested")
                     search.assert_called_once_with(f.s, [3, 4])
-
-    def test_unknown_blocklist_evidence_cannot_be_cleared_by_a_later_read_to_send_search(self):
-        self.assess_season_pack()
-        route = "/api/v3/blocklist"
-
-        def remove(*args, **kwargs):
-            self.removed()
-            self.blocklist_one_episode()
-            self.f.s.routes[route]["records"][0].pop("episodeIds")
-
-        def transition(key, expected, stage, *args, **kwargs):
-            if stage == "retry_search_recorded":
-                self.f.s.routes[route] = {"totalRecords": 0, "records": []}
-            return original_transition(key, expected, stage, *args, **kwargs)
-
-        original_transition = self.f.journal.transition
-        with patch.object(self.f.journal, "transition", side_effect=transition), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=remove), patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "uncertain")
-        self.assertIs(row["current_observation"]["torrent_absent"], True)
-        self.assertIsNone(row["current_observation"]["blocklisted"])
-        search.assert_not_called()
 
     def test_metadata_partial_pack_blocklist_stops_retry(self):
         self.assess_season_pack()
@@ -1387,56 +560,11 @@ class MetadataSenderTests(unittest.TestCase):
             self.removed()
             self.blocklist_one_episode()
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove), patch(
                 "production._send_episode_search") as search:
             row = self.execute()
-        self.assertIs(row["current_observation"]["blocklisted"], True)
-        self.assertEqual(row["stage"], "manual_review")
-        search.assert_not_called()
-
-    def test_metadata_partial_pack_blocklist_after_search_intent_stops_retry(self):
-        self.assess_season_pack()
-        transition = self.f.journal.transition
-
-        def blocklist_after_search_intent(*args, **kwargs):
-            row = transition(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                self.blocklist_one_episode()
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                self.f.journal, "transition", side_effect=blocklist_after_search_intent), patch(
-                "production._send_episode_search") as search:
-            row = self.execute()
-        self.assertIs(row["current_observation"]["blocklisted"], False)
         self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "replacement_blocklisted")
-        search.assert_not_called()
-
-    def test_ambiguous_new_blocklist_evidence_blocks_final_search(self):
-        self.assess_season_pack()
-        transition = self.f.journal.transition
-        dispatch_second = int(time.time())
-
-        def blocklist_after_search_intent(*args, **kwargs):
-            row = transition(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                self.blocklist_one_episode()
-                truncated = datetime.datetime.fromtimestamp(int(row["dispatched_at"]), datetime.timezone.utc)
-                self.f.s.routes["/api/v3/blocklist"]["records"][0]["date"] = truncated.isoformat()
-            return row
-
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production.time.time", return_value=dispatch_second + .5), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                self.f.journal, "transition", side_effect=blocklist_after_search_intent), patch(
-                "production._send_episode_search") as search:
-            # The whole-second timestamp straddles the journal dispatch boundary.
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
         search.assert_not_called()
 
     def test_metadata_recovers_with_same_properties_fallback_as_assessment(self):
@@ -1450,12 +578,11 @@ class MetadataSenderTests(unittest.TestCase):
             f.qb.routes["/api/v2/torrents/info"] = [torrent]
             f.qb.calls.clear()
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove_then_keep_unrelated), patch(
                 "production._send_episode_search", return_value=41) as search:
             row = self.execute()
         self.assertEqual(row["stage"], "retry_requested")
-        self.assertIs(row["current_observation"]["torrent_absent"], True)
         self.assertEqual([params["hash"] for route, params in f.qb.calls if route.endswith("/properties")],
                          [unrelated, unrelated])
         search.assert_called_once_with(f.s, [3])
@@ -1468,7 +595,7 @@ class MetadataSenderTests(unittest.TestCase):
             f.qb.routes["/api/v2/torrents/info"] = []
             second["downloadId"] = "b" * 40
 
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=remove_and_replace) as send, patch(
                 "production._send_episode_search") as search:
             row = self.execute()
@@ -1477,77 +604,13 @@ class MetadataSenderTests(unittest.TestCase):
         send.assert_called_once()
         search.assert_not_called()
 
-    def test_final_queue_valid_unrelated_content_can_be_ignored(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
-                    {"id": 18, "seriesId": 99, "episodeId": 3}, {"id": 19, "seriesId": 2, "episodeId": 99}]}
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        search.assert_called_once()
-
-    def test_final_queue_unrelated_series_with_unmapped_episode_does_not_block_search(self):
-        f = self.f
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
-                    {"id": 18, "seriesId": 99, "episodeId": None}, {"id": 19, "seriesId": 98}]}
-            return row
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch(
-                "production._send_episode_search", return_value=41) as search:
-            row = self.execute()
-        self.assertEqual(row["stage"], "retry_requested")
-        self.assertEqual(row["search_command_id"], 41)
-        search.assert_called_once_with(f.s, [3])
-
     def test_unexpected_blocklisting_requires_review_not_another_search(self):
-        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=lambda *a, **kw: self.f.results()), patch(
                 "production._send_episode_search") as search:
             row = self.execute()
-        self.assertEqual(row["stage"], "manual_review")
-        search.assert_not_called()
-
-    def test_withdrawn_routine_permission_after_search_commit_blocks_search(self):
-        from authorization import RoutineAuthorization, RULE, code_digest, scope_digest
-        f = self.f
-        now = time.time()
-        authority = RoutineAuthorization({"enabled": True, "rule": RULE, "grant_id": "c" * 64,
-            "issued_at": now - 1, "expires_at": now + 3600, "scope_digest": scope_digest(f.config),
-            "code_digest": code_digest()}, f.config)
-        original = f.journal.transition
-        def transition(*args, **kwargs):
-            row = original(*args, **kwargs)
-            if args[2] == "retry_search_recorded":
-                authority.value["enabled"] = False
-            return row
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=self.removed), patch.object(
-                f.journal, "transition", side_effect=transition), patch("production._send_episode_search") as search:
-            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
         self.assertEqual(row["stage"], "retry_search_blocked")
-        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
         search.assert_not_called()
-
-    def test_legacy_context_cannot_enable_soft_retry_without_attempt_identity(self):
-        context = dict(self.f.context, metadata_retry={"blocklist": False, "search": "EpisodeSearch"})
-        for field in production.ATTEMPT_CONTEXT_FIELDS:
-            context.pop(field)
-        with self.assertRaisesRegex(SafetyError, "invalid_operation_context"):
-            production.validate_context(context)
-
 
 class MetadataTransportTests(unittest.TestCase):
     def setUp(self):
@@ -1561,7 +624,7 @@ class MetadataTransportTests(unittest.TestCase):
 
     def test_soft_removal_params_and_exact_episode_search_command(self):
         with patch("production.METADATA_RETRY_RELEASE_ENABLED", True), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "urllib.request.build_opener", return_value=self.opener):
             production._send_queue_delete(self.api, 7, blocklist=False)
             request = self.opener.open.call_args.args[0]
@@ -1576,7 +639,7 @@ class MetadataTransportTests(unittest.TestCase):
 
     def test_search_and_soft_removal_refuse_disabled_release_gate(self):
         with patch("production.METADATA_RETRY_RELEASE_ENABLED", False), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
+                "production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
             with self.assertRaises(SafetyError):
                 production._send_episode_search(self.api, [3])
             with self.assertRaises(SafetyError):
@@ -1592,7 +655,7 @@ class MetadataTransportTests(unittest.TestCase):
             self.response.read.return_value = payload
             self.opener.reset_mock()
             with self.subTest(payload_size=len(payload)), patch("production.METADATA_RETRY_RELEASE_ENABLED", True), patch(
-                    "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                    "production.ROUTINE_RELEASE_ENABLED", True), patch(
                     "urllib.request.build_opener", return_value=self.opener):
                 with self.assertRaisesRegex(SafetyError, "^episode_search_outcome_uncertain$"):
                     production._send_episode_search(self.api, [3])
@@ -1600,7 +663,7 @@ class MetadataTransportTests(unittest.TestCase):
 
     def test_episode_search_rejects_invalid_targets_before_transport(self):
         with patch("production.METADATA_RETRY_RELEASE_ENABLED", True), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
+                "production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
             for ids in ([], [True], [-1], [3, 3], None):
                 with self.subTest(ids=ids), self.assertRaises(SafetyError):
                     production._send_episode_search(self.api, ids)

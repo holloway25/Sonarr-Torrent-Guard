@@ -14,25 +14,22 @@ from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, l
                    load_batch_state, save_batch_state)
 import production
 import public
-from safety import (DISPATCH_STOP_REASONS, Journal, SafetyError,
-                    metadata_journal_wait_reason, open_lock_file)
+from safety import DISPATCH_STOP_REASONS, SafetyError, open_lock_file
 from workflow import file_policy_removal
 
 
 HELD_REASONS = DISPATCH_STOP_REASONS | {
-    "journal_capacity_reached", "previous_attempt_unresolved", "another_run_is_active",
-    "approval_already_consumed", "new_attempt_not_confirmed", "attempt_identity_required",
+    "another_run_is_active",
     "routine_authorization_invalid", "routine_code_not_authorized",
     "routine_authorization_revoked_or_changed",
     "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
     "metadata_retry_not_released",
-    "journal_history_limit_reached", "journal_archive_capacity_reached", "invalid_archive_evidence",
     "delete_request_outcome_uncertain",
 }
 
 
 def save_dispatch_cursor(state_path, cursor):
-    """Merge into current state under the same lock as assessment and recovery."""
+    """Merge into current state under the same lock as assessment."""
     with open_lock_file(state_path.parent / "guard.lock") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -43,14 +40,11 @@ def save_dispatch_cursor(state_path, cursor):
         save_batch_state(state_path, state)
 
 
-def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None, *,
-          summary=None, on_attempt=None, lock_path=None):
-    if isinstance(authority, ContainerAuthorization):
-        authority.validate_scope(config)
-    else:
-        authority.validate(config)
+def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=None, *,
+          lock_path, summary=None, on_attempt=None):
+    authority.validate(config)
     if proposal is None:
-        proposal = public.cycle(config, qb, apis, journal, batch_state, reserve_dispatch=True)
+        proposal = public.cycle(config, qb, apis, batch_state, reserve_dispatch=True)
     runtime = copy.deepcopy(config)
     runtime["dry_run"] = False
     if summary is None:
@@ -58,7 +52,7 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
     actions = []
     summary.update(mode="routine", live_authorized=True, status="interrupted", retry_after_seconds=600,
                    grant_expires_at=authority.expires_at, grant_authorization_mode=authority.mode,
-                   assessment=proposal["assessment"], recovery=proposal["recovery"], actions=actions)
+                   assessment=proposal["assessment"], actions=actions)
     # Rotate the verified snapshot independently of the earlier phases.
     # Record the attempted key before starting work that can consume the cycle.
     candidates = sorted(((r["instance"], r["hash"]), r) for r in proposal["assessment"]
@@ -79,17 +73,10 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
                   "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier}
         try:
             if file_policy_removal(report):
-                path = lock_path if lock_path is not None else journal.path.parent / "guard.lock"
-                production.execute_native_file_removal(runtime, qb, apis, report, authority, path)
+                production.execute_native_file_removal(runtime, qb, apis, report, authority, lock_path)
                 action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
-            elif journal is None:
-                action.update(production.execute_live_metadata_retry(runtime, qb, apis, report, authority, lock_path))
             else:
-                row = production.execute_routine_attempt(runtime, qb, apis, journal, report, authority)
-                action.update(key=row["key"], stage=row["stage"], confirmed=row["confirmed"],
-                              current_observation=row["current_observation"], stop_reason=row["stop_reason"],
-                              metadata_retry=row["context"].get("metadata_retry"),
-                              search_command_id=row["search_command_id"])
+                action.update(production.execute_live_metadata_retry(runtime, qb, apis, report, authority, lock_path))
         except (GuardError, SafetyError) as error:
             if str(error) == "run_time_limit_reached":
                 raise
@@ -97,11 +84,6 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
             reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
             stage = "uncertain" if reason == "delete_request_outcome_uncertain" else "held"
             action.update(stage=stage, stop_reason=reason)
-        except Exception as error:
-            reason = metadata_journal_wait_reason(error) if journal is not None else None
-            if reason is None:
-                raise
-            action.update(stage="held", stop_reason=reason)
         actions.append(action)
         if on_action is not None:
             on_action(actions[-1])
@@ -130,7 +112,7 @@ def main():
             raise SafetyError("routine_log_requires_private_config_directory")
         handler = PrivateRotatingFileHandler(args.log_file, config_path=args.config,
                                             authorization_path=args.authorization)
-        authority = (ContainerAuthorization(config, args.config, bind_journal=False) if args.container_mode
+        authority = (ContainerAuthorization(config, args.config) if args.container_mode
                      else RoutineAuthorization.load(args.authorization, config, config_path=args.config))
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
@@ -142,7 +124,7 @@ def main():
             state = load_batch_state(state_path)
             try:
                 with hard_deadline(deadline):
-                    proposal = public.cycle(config, qb, apis, None, state, reserve_dispatch=True)
+                    proposal = public.cycle(config, qb, apis, state, reserve_dispatch=True)
             finally:
                 save_batch_state(state_path, state)
         production.ROUTINE_RELEASE_ENABLED = True
@@ -153,7 +135,7 @@ def main():
             handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
 
         with hard_deadline(deadline):
-            cycle(config, qb, apis, None, authority, state, proposal, log_action, summary=result,
+            cycle(config, qb, apis, authority, state, proposal, log_action, summary=result,
                   on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor), lock_path=lock_path)
     except BlockingIOError:
         result["reason"] = "another_run_is_active"

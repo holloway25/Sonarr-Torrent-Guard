@@ -8,7 +8,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-ins
     && groupadd --gid 1000 guard && useradd --uid 1000 --gid 1000 --no-create-home guard \
     && mkdir /config && chown 1000:1000 /config && chmod 700 /config
 # Exact source allowlist. No checkout, examples, credentials or runtime data.
-COPY guard.py production.py safety.py maintenance.py public.py authorization.py routine.py workflow.py reports.py retention.py container_worker.py /app/
+COPY guard.py production.py safety.py maintenance.py public.py authorization.py routine.py workflow.py reports.py container_worker.py /app/
 COPY LICENSE /app/LICENSE
 USER 1000:1000
 HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=3 \

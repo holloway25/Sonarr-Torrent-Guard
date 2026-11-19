@@ -14,15 +14,10 @@ config.json
 state*.json
 batch-state.json
 .batch-*
-container-status.json
-*.sqlite3
-*.sqlite3-*
+container-*.json
 HANDOFF*
 handoff*
 staging/
 downloads/
 local/
 routine-authorization.json
-container-live-scope.json
-container-live-journal.json
-container-journal-binding.json

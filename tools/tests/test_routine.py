@@ -12,7 +12,7 @@ from authorization import (CONTAINER_SCOPE_FILE, ContainerAuthorization, Routine
 from guard import load_batch_state, run
 import production
 import routine
-from safety import CONTAINER_JOURNAL_BINDING, CONTAINER_JOURNAL_MARKER, SafetyError
+from safety import SafetyError
 from tools.tests import test_production as fixtures
 
 
@@ -20,7 +20,6 @@ class RoutineTests(unittest.TestCase):
     def setUp(self):
         self.f = fixtures.ProductionTests()
         self.f.setUp()
-        self.f.journal.allow_public_attempt = True
         self.f.qb.login = Mock()
         now = time.time()
         self.grant = {"enabled": True, "rule": RULE, "grant_id": "c" * 64,
@@ -34,16 +33,13 @@ class RoutineTests(unittest.TestCase):
 
     def execute(self):
         f = self.f
-        return production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, self.authority)
+        return production.execute_native_file_removal(f.config, f.qb, f.apis, f.report, self.authority, f.lock_path)
 
     def write_container_scope(self):
         directory = Path(self.f.folder.name)
-        record = {"journal_id": self.f.journal.installation_id(create=True)}
-        for name, content in ((CONTAINER_SCOPE_FILE, container_scope_record(self.f.config)),
-                              (CONTAINER_JOURNAL_MARKER, record), (CONTAINER_JOURNAL_BINDING, record)):
-            path = directory / name
-            path.write_text(json.dumps(content))
-            path.chmod(0o600)
+        path = directory / CONTAINER_SCOPE_FILE
+        path.write_text(json.dumps(container_scope_record(self.f.config)))
+        path.chmod(0o600)
         return self.write_connections()
 
     def write_connections(self):
@@ -60,10 +56,10 @@ class RoutineTests(unittest.TestCase):
         with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
             self.authority = ContainerAuthorization(self.f.config, config_path)
             with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                    "production._send_queue_delete", side_effect=lambda *args: self.f.results()) as send:
+                    "production._send_queue_delete", side_effect=lambda *args, **kwargs: self.f.results()) as send:
                 row = self.execute()
         send.assert_called_once()
-        self.assertEqual(row["stage"], "cleanup_resolved")
+        self.assertIsNone(row)
 
     def test_container_permission_requires_live_mode_and_valid_scope(self):
         config_path = self.write_container_scope()
@@ -81,28 +77,6 @@ class RoutineTests(unittest.TestCase):
             changed["sonarr"]["HD"]["indexers"]["private"].clear()
             with self.assertRaisesRegex(SafetyError, "container_live_scope_confirmation_required"):
                 ContainerAuthorization(changed, config_path)
-
-    def test_final_dispatch_rechecks_on_disk_private_exceptions(self):
-        config_path = self.write_container_scope()
-        refresh = self.f.journal.refresh_baselines
-
-        def protect_source_after_baseline(*args, **kwargs):
-            row = refresh(*args, **kwargs)
-            changed = json.loads(config_path.read_text())
-            changed["sonarr"]["HD"]["indexers"] = {
-                "mode": "private_exclusions", "private": ["Public Source"]}
-            config_path.write_text(json.dumps(changed))
-            return row
-
-        with patch.dict(os.environ, {"STGUARD_MODE": "live"}):
-            self.authority = ContainerAuthorization(self.f.config, config_path)
-            with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
-                    self.f.journal, "refresh_baselines", side_effect=protect_source_after_baseline), patch(
-                    "production._send_queue_delete") as sender:
-                row = self.execute()
-                sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "container_live_scope_confirmation_required")
 
     def test_routine_cli_does_not_append_waiting_message_to_config_or_grant(self):
         import contextlib
@@ -145,9 +119,9 @@ class RoutineTests(unittest.TestCase):
             if report["hash"] == f.hash:
                 raise production.GuardError("run_time_limit_reached")
 
-        def assess(config, qb, apis, journal, state, **kwargs):
+        def assess(config, qb, apis, state, **kwargs):
             state["after"] = ["HD", other["hash"]]
-            return {"assessment": [verified, other], "recovery": []}
+            return {"assessment": [verified, other]}
 
         for number in range(3):
             tried.clear()
@@ -156,7 +130,6 @@ class RoutineTests(unittest.TestCase):
                     "routine.RoutineAuthorization.load", return_value=self.authority), patch(
                     "routine.Api", side_effect=[f.qb, f.s]), patch(
                     "routine.public.cycle", side_effect=assess), patch(
-                    "workflow.BLOCKLIST_SCOPE_VERIFIABLE", False), patch(
                     "production.execute_native_file_removal", side_effect=attempt):
                 self.assertEqual(routine.main(), 0)
             result = json.loads(output.getvalue())
@@ -181,7 +154,6 @@ class RoutineTests(unittest.TestCase):
                 stack.enter_context(patch("routine.load_config", return_value=self.f.config))
                 stack.enter_context(patch("routine.RoutineAuthorization.load", return_value=self.authority))
                 stack.enter_context(patch("routine.Api"))
-                stack.enter_context(patch("routine.Journal", return_value=Mock()))
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 calls = Mock()
                 calls.load.return_value = state
@@ -225,7 +197,7 @@ class RoutineTests(unittest.TestCase):
                 raise production.GuardError("run_time_limit_reached")
             return call(route, params)
 
-        def send_removal(*args):
+        def send_removal(*args, **kwargs):
             self.assertEqual(f.s.deadline, 280.0)
             f.results()
 
@@ -233,13 +205,13 @@ class RoutineTests(unittest.TestCase):
                 "public.require_connectivity", return_value={}), patch.object(
                 f.qb, "call", side_effect=busy_downloader), patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=send_removal) as send:
-            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, state)
-        send.assert_called_once_with(f.s, 7)
-        self.assertEqual(deadlines[:3], [190.0, 190.0, 220.0])
-        self.assertEqual(deadlines[3:], [280.0, 280.0, 280.0])
+            result = routine.cycle(f.config, f.qb, f.apis, self.authority, state, lock_path=f.lock_path)
+        send.assert_called_once_with(f.s, 7, blocklist=True)
+        self.assertEqual(deadlines[:3], [190.0, 190.0, 235.0])
+        self.assertEqual(deadlines[3:], [280.0, 280.0])
         self.assertEqual(state["after"], ["HD", f.hash])
         self.assertEqual(result["assessment"][-1]["reason"], "run_time_limit_reached")
-        self.assertEqual(result["actions"][0]["stage"], "cleanup_resolved")
+        self.assertEqual(result["actions"][0]["stage"], "sonarr_remove_blocklist_accepted")
 
     def test_interrupted_cli_summary_retains_completed_live_actions(self):
         import contextlib
@@ -252,7 +224,7 @@ class RoutineTests(unittest.TestCase):
                 "--authorization", str(directory / "routine-authorization.json"), "--log-file", str(log_path)]
         first = dict(f.report, safeguards={"status": "fresh_attempt_verified"})
         second = dict(first, hash="b" * 40)
-        proposal = {"assessment": [first, second], "recovery": []}
+        proposal = {"assessment": [first, second]}
         execute = production.execute_native_file_removal
 
         def interrupt_after_first(config, qb, apis, report, authority, lock_path):
@@ -267,12 +239,11 @@ class RoutineTests(unittest.TestCase):
             stack.enter_context(patch("routine.RoutineAuthorization.load", return_value=self.authority))
             stack.enter_context(patch("routine.Api", side_effect=[f.qb, f.s]))
             stack.enter_context(patch("routine.public.cycle", return_value=proposal))
-            stack.enter_context(patch("workflow.BLOCKLIST_SCOPE_VERIFIABLE", False))
             stack.enter_context(patch("production.execute_native_file_removal", side_effect=interrupt_after_first))
             send = stack.enter_context(patch("production._send_queue_delete", side_effect=lambda *args, **kw: f.results()))
             self.assertEqual(routine.main(), 0)
 
-        send.assert_called_once_with(f.s, 7, blocklist=True, native_file_cleanup=True)
+        send.assert_called_once_with(f.s, 7, blocklist=True)
         summary = json.loads(output.getvalue())
         self.assertEqual(summary["status"], "interrupted")
         self.assertIs(summary["live_authorized"], True)
@@ -286,20 +257,18 @@ class RoutineTests(unittest.TestCase):
         self.assertEqual(lines[1]["status"], "interrupted")
         self.assertEqual(len(lines), 2)
 
-    def test_routine_gate_is_not_enabled_by_test_permission(self):
-        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+    def test_routine_requires_explicit_live_gate(self):
+        with patch("production._send_queue_delete") as send:
             with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):
                 self.execute()
             send.assert_not_called()
 
-    def test_valid_routine_permission_uses_normal_checks_and_records_its_grant(self):
+    def test_valid_routine_permission_uses_normal_checks(self):
         f = self.f
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=lambda *a: f.results()) as send:
+                "production._send_queue_delete", side_effect=lambda *a, **kw: f.results()) as send:
             row = self.execute()
-        self.assertEqual(row["stage"], "cleanup_resolved")
-        self.assertEqual(row["context"]["routine_grant_digest"], self.authority.identifier)
+        self.assertIsNone(row)
         send.assert_called_once()
 
     def test_disabled_expired_future_or_overlong_permission_is_refused(self):
@@ -406,30 +375,29 @@ class RoutineTests(unittest.TestCase):
                 with self.assertRaisesRegex(SafetyError, "routine_authorization_revoked_or_changed"):
                     authority.validate(self.f.config, self.f.report)
 
-    def test_final_dispatch_blocks_grant_disabled_after_baseline_commit(self):
+    def test_final_dispatch_blocks_grant_disabled_after_history_check(self):
         grant = self.ongoing_grant()
         path = self.write_grant(grant)
         self.authority = self.load_grant(path)
-        refresh = self.f.journal.refresh_baselines
+        refresh = production.check_visible_native_grabs
 
         def revoke_after_refresh(*args, **kwargs):
             row = refresh(*args, **kwargs)
             self.write_grant(dict(grant, enabled=False))
             return row
 
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
-                self.f.journal, "refresh_baselines", side_effect=revoke_after_refresh), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production.check_visible_native_grabs", side_effect=revoke_after_refresh), patch(
                 "production._send_queue_delete") as sender:
-            row = self.execute()
+            with self.assertRaisesRegex(SafetyError, "^routine_authorization_revoked_or_changed$"):
+                self.execute()
             sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "routine_authorization_revoked_or_changed")
 
     def test_standalone_grant_rechecks_disk_scope_at_final_dispatch(self):
         path = self.write_grant(self.ongoing_grant())
         config_path = self.write_connections()
         self.authority = RoutineAuthorization.load(path, self.f.config, config_path=config_path)
-        refresh = self.f.journal.refresh_baselines
+        refresh = production.check_visible_native_grabs
 
         def protect_after_refresh(*args, **kwargs):
             row = refresh(*args, **kwargs)
@@ -439,13 +407,12 @@ class RoutineTests(unittest.TestCase):
             config_path.write_text(json.dumps(changed))
             return row
 
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
-                self.f.journal, "refresh_baselines", side_effect=protect_after_refresh), patch(
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production.check_visible_native_grabs", side_effect=protect_after_refresh), patch(
                 "production._send_queue_delete") as sender:
-            row = self.execute()
+            with self.assertRaisesRegex(SafetyError, "^routine_authorization_expired_or_scope_changed$"):
+                self.execute()
             sender.assert_not_called()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
 
     def test_ongoing_authority_cannot_be_changed_in_memory(self):
         authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
@@ -454,34 +421,23 @@ class RoutineTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             authority.validate(self.f.config)
 
-    def test_ongoing_grant_only_delegates_short_lived_target_token(self):
-        authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
-        stamp = time.time()
-        with patch("time.time", return_value=stamp), patch("production._execute") as execute:
-            production.execute_routine_attempt(self.f.config, self.f.qb, self.f.apis,
-                                              self.f.journal, self.f.report, authority)
-        self.assertEqual(execute.call_args.args[5]["expires_at"], stamp + 120)
-        self.assertEqual(execute.call_args.args[5]["hash"], self.f.report["hash"])
-
     def test_ongoing_authority_can_complete_same_existing_safety_workflow(self):
         self.authority = RoutineAuthorization(self.ongoing_grant(), self.f.config)
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=lambda *a: self.f.results()) as send:
+                "production._send_queue_delete", side_effect=lambda *a, **kw: self.f.results()) as send:
             row = self.execute()
-        self.assertEqual(row["stage"], "cleanup_resolved")
+        self.assertIsNone(row)
         send.assert_called_once()
 
     def test_permission_withdrawn_during_final_checks_blocks_sender(self):
         calls = []
         def connection(*args):
             calls.append(1)
-            if len(calls) == 3:
-                self.authority.value["enabled"] = False
+            self.authority.value["enabled"] = False
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "production.require_connectivity", side_effect=connection), patch("production._send_queue_delete") as send:
-            row = self.execute()
-        self.assertEqual(row["stage"], "dispatch_blocked")
-        self.assertEqual(row["stop_reason"], "routine_authorization_expired_or_scope_changed")
+            with self.assertRaisesRegex(SafetyError, "^routine_authorization_expired_or_scope_changed$"):
+                self.execute()
         send.assert_not_called()
 
     def test_auth_file_requires_private_permissions_and_valid_content(self):
@@ -491,166 +447,28 @@ class RoutineTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             self.load_grant(path)
 
-    def newer_attempt(self, legacy=False):
-        f = self.f
-        context = copy.deepcopy(f.context)
-        if legacy:
-            for name in production.ATTEMPT_CONTEXT_FIELDS:
-                context.pop(name)
-        row = f.journal.prepare(f.report, mode="single_test", context=context)
-        row = f.journal.transition(row["key"], "prepared", "dispatch_recorded")
-        row = f.journal.transition(row["key"], "dispatch_recorded", "manual_review", {"torrent_absent": True})
-        added = int(row["dispatched_at"]) + 3
-        grab = dict(f.grab, id=50, date=datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat())
-        f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, grab]}
-        f.qb.routes["/api/v2/torrents/info"][0]["added_on"] = added
-        report = run(f.config, f.qb, f.apis, now=added+200)[0]
-        return row, report, added+200
-
-    def test_confirmed_new_attempt_can_supersede_old_timestamp_hold_without_erasing_it(self):
-        f = self.f
-        old, f.report, now = self.newer_attempt()
-        with patch("time.time", return_value=now), patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete") as send:
-            row = self.execute()
-        send.assert_called_once()
-        self.assertNotEqual(row["key"], old["key"])
-        self.assertEqual(f.journal.get(old["key"]), old)
-
-    def test_legacy_hold_needs_new_addition_new_grab_and_same_binding(self):
-        old, report, now = self.newer_attempt(legacy=True)
-        production.check_prior_attempts(self.f.journal, report, config=self.f.config)
-        for changes in ({"download_added_on": int(old["dispatched_at"])},
-                        {"grab_ids": old["context"]["baseline_history_ids"]}, {"attempt_fingerprint": None},
-                        {"grab_time_floor": old["dispatched_at"]}, {"grab_time_floor": None}):
-            with self.subTest(changes=changes), self.assertRaises(SafetyError):
-                production.check_prior_attempts(self.f.journal, dict(report, **changes), config=self.f.config)
-        self.f.config["sonarr"]["HD"]["url"] = "https://changed.example.invalid"
-        with self.assertRaises(SafetyError):
-            production.check_prior_attempts(self.f.journal, report, config=self.f.config)
-
-    def test_legacy_empty_baseline_still_requires_positive_new_grab_time(self):
-        f = self.f
-        f.context["baseline_history_ids"] = []
-        old, report, now = self.newer_attempt(legacy=True)
-        production.check_prior_attempts(f.journal, report, config=f.config)
-        with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
-            production.check_prior_attempts(f.journal, dict(report, grab_time_floor=old["dispatched_at"]), config=f.config)
-
     def test_trial_cannot_authorize_lower_than_agreed_two_minute_age(self):
         self.f.config["minimum_age_seconds"] = 1
         grant = dict(self.grant, scope_digest=scope_digest(self.f.config))
         with self.assertRaises(SafetyError):
             RoutineAuthorization(grant, self.f.config)
 
-    def test_same_attempt_uncertainty_still_blocks_unattended_sender(self):
-        f = self.f
-        row = f.journal.prepare(f.report, mode="public_attempt", context=f.context)
-        row = f.journal.transition(row["key"], "prepared", "dispatch_recorded")
-        f.journal.transition(row["key"], "dispatch_recorded", "uncertain")
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
-            with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
-                self.execute()
-            send.assert_not_called()
-
-    def test_worker_handles_only_assessed_unheld_attempts_and_never_chases_replacements(self):
-        f = self.f
-        report = dict(f.report, safeguards={"status": "fresh_attempt_verified"})
-        held = dict(report, hash="b" * 40, safeguards={"status": "held"})
-        proposal = {"assessment": [report, held], "recovery": []}
-        events = []
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production._send_queue_delete", side_effect=lambda *a: f.results()) as send:
-            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal, events.append)
-        self.assertEqual(len(result["actions"]), 1)
-        self.assertEqual(result["actions"][0]["stage"], "cleanup_resolved")
-        self.assertEqual(events, result["actions"])
-        send.assert_called_once()
-
     def test_trial_timer_has_explicit_live_worker_and_ten_minute_interval(self):
         folder = Path(__file__).resolve().parents[2] / "deploy"
         self.assertIn("OnUnitInactiveSec=10min", (folder / "sonarr-torrent-guard-live.timer").read_text())
         self.assertIn("routine.py --live", (folder / "sonarr-torrent-guard-live.service").read_text())
 
-    def assert_cancellation_report(self, reason, recheck_effect=None, connection_error=None):
-        f = self.f
-        original = production.recheck_candidate
-        calls = []
-        def recheck(*args):
-            fresh = original(*args)
-            calls.append(1)
-            if len(calls) == 2 and recheck_effect is not None:
-                recheck_effect(fresh)
-            return fresh
-        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
-                    "recovery": []}
-        events = []
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
-                "production.recheck_candidate", side_effect=recheck), patch(
-                "production.require_connectivity", side_effect=[None, connection_error]), patch(
-                "production._send_queue_delete") as send:
-            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal, events.append)
-        action = result["actions"][0]
-        self.assertEqual(action["stage"], "cancelled")
-        self.assertEqual(action["stop_reason"], reason)
-        self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
-        self.assertEqual(events, result["actions"])
-        send.assert_not_called()
-        reopened = routine.Journal(f.journal.path)
-        try:
-            row = reopened.get(action["key"])
-            self.assertEqual(row["stop_reason"], reason)
-            self.assertIsNone(row["dispatched_at"])
-            self.assertEqual(row["context"]["routine_grant_digest"], self.authority.identifier)
-        finally:
-            reopened.close()
-        self.assertNotIn("secret-payload", json.dumps(result))
-
-    def test_pre_dispatch_connectivity_cancellation_retains_reason_and_grant(self):
-        self.assert_cancellation_report("sonarr_connectivity_unavailable",
-            connection_error=routine.GuardError("sonarr_connectivity_unavailable"))
-
-    def test_pre_dispatch_file_change_cancellation_retains_reason_and_grant(self):
-        self.assert_cancellation_report("identity_or_manifest_changed",
-            recheck_effect=lambda fresh: fresh["assessment"].update(manifest_fingerprint="e" * 64))
-
-    def test_pre_dispatch_withdrawn_permission_retains_reason_and_grant(self):
-        self.assert_cancellation_report("routine_authorization_expired_or_scope_changed",
-            recheck_effect=lambda fresh: self.authority.value.update(enabled=False))
-
-    def test_pre_dispatch_unknown_error_is_redacted(self):
-        for error in (SafetyError("sonarr_connectivity_unavailable secret-payload"),
-                      RuntimeError("identity_or_manifest_changed secret-payload")):
-            with self.subTest(error=type(error).__name__):
-                self.assert_cancellation_report("cancellation_validation_failed", connection_error=error)
-
-    def test_full_journal_hold_records_reason_and_grant_without_sending(self):
-        f = self.f
-        f.journal.limit = 0
-        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
-                    "recovery": []}
-        events = []
-        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
-            result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal, events.append)
-        action = result["actions"][0]
-        self.assertEqual(action["stage"], "held")
-        self.assertEqual(action["stop_reason"], "journal_capacity_reached")
-        self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
-        self.assertEqual(events, result["actions"])
-        send.assert_not_called()
-
     def test_held_errors_only_log_exact_allowlisted_reasons(self):
         f = self.f
-        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})],
-                    "recovery": []}
-        for error in (SafetyError("previous_attempt_unresolved"),
-                      SafetyError("journal_capacity_reached secret-payload"),
+        proposal = {"assessment": [dict(f.report, safeguards={"status": "fresh_attempt_verified"})]}
+        for error in (SafetyError("target_reappeared"),
+                      SafetyError("target_reappeared secret-payload"),
                       routine.GuardError("private-response secret-payload")):
             with self.subTest(error=type(error).__name__), patch(
-                    "production.execute_routine_attempt", side_effect=error):
-                result = routine.cycle(f.config, f.qb, f.apis, f.journal, self.authority, {}, proposal)
+                    "production.execute_native_file_removal", side_effect=error):
+                result = routine.cycle(f.config, f.qb, f.apis, self.authority, {}, proposal, lock_path=f.lock_path)
             action = result["actions"][0]
-            expected = ("previous_attempt_unresolved" if str(error) == "previous_attempt_unresolved"
+            expected = ("target_reappeared" if str(error) == "target_reappeared"
                         else "maintenance_or_safety_check_unavailable")
             self.assertEqual(action["stop_reason"], expected)
             self.assertEqual(action["routine_grant_digest"], self.authority.identifier)
