@@ -178,28 +178,37 @@ def open_regular_file(path, *, nofollow=False):
 def load_batch_state(path):
     try:
         with open_regular_file(path, nofollow=True) as (file, mode):
-            state = json.load(file)
-        if not isinstance(state, dict) or set(state) - {
-                "after", "timed_out", "verification_after", "dispatch_after", "recovery_after", "identity_cache"}:
-            raise ValueError()
-        for key in ("after", "timed_out", "verification_after", "dispatch_after"):
-            if key not in state:
-                continue
-            cursor = state[key]
-            if (not isinstance(cursor, list) or len(cursor) != 2
-                    or not isinstance(cursor[0], str) or not cursor[0].strip()):
-                raise ValueError()
-            torrent_hash(cursor[1])
-        if "identity_cache" in state:
-            if os.name != "nt" and mode & 0o077:
+            info = os.fstat(file.fileno())
+            if info.st_nlink != 1 or (os.name != "nt" and (info.st_uid != os.geteuid() or mode & 0o077)):
                 raise GuardError("invalid_batch_state")
-            validate_identity_cache(state["identity_cache"])
-        state.pop("recovery_after", None)  # Ignore the retired cursor in previously written state.
-        return state
+            try:
+                state = json.load(file, object_pairs_hook=unique_config_keys)
+                return validate_batch_state(state)
+            except (ValueError, RecursionError, GuardError):
+                # An owned, private regular file can be rebuilt from current evidence.
+                return {}
     except FileNotFoundError:
         return {}
-    except (ValueError, TypeError, AttributeError, OSError, GuardError):
+    except (ValueError, OSError):
         raise GuardError("invalid_batch_state") from None
+
+
+def validate_batch_state(state):
+    if not isinstance(state, dict) or set(state) - {
+            "after", "timed_out", "verification_after", "dispatch_after", "recovery_after", "identity_cache"}:
+        raise ValueError()
+    for key in ("after", "timed_out", "verification_after", "dispatch_after"):
+        if key not in state:
+            continue
+        cursor = state[key]
+        if (not isinstance(cursor, list) or len(cursor) != 2
+                or not isinstance(cursor[0], str) or not cursor[0].strip()):
+            raise ValueError()
+        torrent_hash(cursor[1])
+    if "identity_cache" in state:
+        validate_identity_cache(state["identity_cache"])
+    state.pop("recovery_after", None)
+    return state
 
 
 def save_batch_state(path, state):
@@ -257,39 +266,75 @@ def manifest_fingerprint(files):
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
 
-# Use the common Qt and Python glob forms. An invalid Qt character class
-# must not be reinterpreted as a literal filename by Python.
-QBITTORRENT_NAME_GLOB = re.compile(r"""
-    (?:
-        [^\[/\\]                               # Ordinary name character
-        | \[ !? (?: \][^\[\]/\\]* | [^\[\]!^/\\][^\[\]/\\]* ) \]
-        | \[\[\]                               # Literal opening bracket
-    )+
+# Tokenize the common Qt and Python glob forms. Match the entire pattern
+# so an unsupported character class cannot be reinterpreted as a literal.
+QBITTORRENT_GLOB_TOKEN = re.compile(r"""
+    [^\[/\\]+
+    | \[ (?P<negated>[!^]?) (?P<members>\][^\[\]/\\]*|[^\[\]!^/\\][^\[\]/\\]*|\[) \]
 """, re.VERBOSE)
 
 
+def compile_file_exclusion(pattern):
+    if not pattern or "\x00" in pattern:
+        return None
+    parts = []
+    offset = 0
+    for token in QBITTORRENT_GLOB_TOKEN.finditer(pattern):
+        if token.start() != offset:
+            return None
+        offset = token.end()
+        members = token["members"]
+        if members is None:
+            parts.append(token[0])
+            continue
+        # Validate the range before fnmatch can discard an invalid one.
+        escaped = "".join(char if char == "-" else re.escape(char) for char in members)
+        try:
+            re.compile(f"[{escaped}]")
+        except re.error:
+            return None
+        negated = "!" if token["negated"] else ""
+        parts.append(f"[{negated}{members}]")
+
+    if offset != len(pattern):
+        return None
+    try:
+        return re.compile(fnmatch.translate("".join(parts)), re.IGNORECASE)
+    except re.error:
+        return None
+
+
 def read_file_exclusions(qb):
-    """Return the current downloader patterns and whether they were available."""
+    """Return usable exclusion patterns and a reason if the list is incomplete."""
+    unavailable = "qbittorrent_file_exclusions_unavailable"
     try:
         preferences = qb.call("/api/v2/app/preferences")
     except GuardError as error:
         if str(error) == "run_time_limit_reached":
             raise
-        return (), False
+        return (), unavailable
     if not isinstance(preferences, dict):
-        return (), False
+        return (), unavailable
     enabled = preferences.get("excluded_file_names_enabled")
     if enabled is False:
-        return (), True
+        return (), None
     names = preferences.get("excluded_file_names")
-    if enabled is not True or not isinstance(names, str) or "\x00" in names or len(names) > 65536:
-        return (), False
-    patterns = tuple(dict.fromkeys(line.lower() for line in names.split("\n")
-                                   if QBITTORRENT_NAME_GLOB.fullmatch(line)))
-    return patterns, True
+    if enabled is not True or not isinstance(names, str) or len(names) > 65536:
+        return (), unavailable
+
+    patterns, issue = [], None
+    for line in dict.fromkeys(names.split("\n")):
+        if not line:
+            continue
+        pattern = compile_file_exclusion(line)
+        if pattern is None:
+            issue = "qbittorrent_file_exclusions_incomplete"
+        else:
+            patterns.append(pattern)
+    return patterns, issue
 
 
-def assess_files(files, excluded_names=()):
+def assess_files(files, exclusions=()):
     """Return failure reasons only for a structurally valid full manifest."""
     if not isinstance(files, list) or not files:
         raise GuardError("empty_or_invalid_manifest")
@@ -310,15 +355,16 @@ def assess_files(files, excluded_names=()):
                 or not 0 <= progress <= 1):
             raise GuardError("invalid_manifest_entry")
         indexes.add(index)
-        suffix = PurePosixPath(name.replace("\\", "/")).suffix.casefold()
-        if suffix in (".exe", ".scr"):
-            dangerous.add(suffix)
+        basename = PurePosixPath(name.replace("\\", "/")).name.casefold()
+        for suffix in (".exe", ".scr"):
+            if basename.endswith(suffix):
+                dangerous.add(suffix)
         if priority:
-            selected.append(suffix)
-            if excluded_names and not excluded_selected:
-                names = name.lower().split("/")
-                excluded_selected = any(fnmatch.fnmatchcase(part, pattern)
-                                        for part in names if part for pattern in excluded_names)
+            selected.append(PurePosixPath(basename).suffix)
+            if exclusions and not excluded_selected:
+                names = name.split("/")
+                excluded_selected = any(pattern.fullmatch(part)
+                                        for part in names if part for pattern in exclusions)
     if indexes != set(range(len(files))):
         raise GuardError("incomplete_manifest_indexes")
     reasons = ["contains_" + s[1:] for s in sorted(dangerous)]
@@ -865,10 +911,10 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             else:
                 if exclusions is None:
                     exclusions = read_file_exclusions(qb)
-                patterns, available = exclusions
+                patterns, issue = exclusions
                 reasons = assess_files(files, patterns)
-                if not reasons and not available:
-                    raise GuardError("qbittorrent_file_exclusions_unavailable")
+                if not reasons and issue:
+                    raise GuardError(issue)
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
             report.update(public_source_confirmed=True, indexer=source,
                           queue_ids=sorted({r["id"] for r in rows}),

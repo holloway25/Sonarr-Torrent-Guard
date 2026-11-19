@@ -109,6 +109,9 @@ or credential command-line arguments.
 Persistent `/config` contains the connection config, batch cursors, locks,
 approved live scope, rotating `dry-run.log` and `routine.log`, and the
 container heartbeat. Preserve the appdata directory when updating the image.
+Guard rebuilds malformed batch cursors and their cached torrent identities from
+current responses. The cursor file must be a private regular file owned by the
+worker.
 
 ## Scheduler and health
 

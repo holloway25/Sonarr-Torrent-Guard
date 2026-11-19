@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from guard import (Api, GuardError, SameOriginRedirect, PrivateRotatingFileHandler,
-                   assess_files, load_config, load_batch_state, save_batch_state, records, run,
+                   assess_files, compile_file_exclusion, load_config, load_batch_state, save_batch_state, records, run,
                    recheck_candidate)
 from safety import SafetyError
 from reports import human_report, json_events
@@ -41,17 +41,31 @@ class FilesTests(unittest.TestCase):
     def test_blocked_suffixes_require_selection_except_executables_and_screen_savers(self):
         for suffix in ("lnk", "rar", "001"):
             with self.subTest(suffix=suffix):
+                patterns = (compile_file_exclusion("*." + suffix),)
                 extra = "extra." + suffix.upper()
-                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 1)), ("*." + suffix,)), ["blocked_file_selected"])
-                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 0)), ("*." + suffix,)), [])
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 1)), patterns), ["blocked_file_selected"])
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 0)), patterns), [])
 
     def test_exclusion_globs_match_names_and_parent_folders(self):
-        patterns = ("extras", "readme-?.[tx][tx][tx]")
+        patterns = tuple(map(compile_file_exclusion, ("extras", "readme-?.[tx][tx][tx]")))
         for path in ("Extras/Subdirectory/file.mkv", "release/README-A.TXT"):
             with self.subTest(path=path):
                 self.assertEqual(assess_files(manifest(("episode.mkv", 1), (path, 1)), patterns),
                                  ["blocked_file_selected"])
         self.assertEqual(assess_files(manifest(("episode.mkv", 1), ("release/readme-ab.txt", 1)), patterns), [])
+
+    def test_exclusion_compilation_keeps_valid_ranges_and_rejects_reversed_ranges(self):
+        for pattern in ("[!z-a]*", "[^z-a]*", "[!0-9z-a]*", "[!Z-A]*"):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(compile_file_exclusion(pattern))
+        for pattern in ("[^0-9]*.zip", "[!0-9]*.zip"):
+            with self.subTest(pattern=pattern):
+                match = compile_file_exclusion(pattern)
+                self.assertTrue(match.fullmatch("episode.ZIP"))
+                self.assertFalse(match.fullmatch("1episode.zip"))
+        match = compile_file_exclusion("[A-z]*.zip")
+        self.assertTrue(match.fullmatch("_episode.zip"))
+        self.assertTrue(match.fullmatch("Episode.ZIP"))
 
     def test_invalid_or_partial_manifest_is_not_failure(self):
         invalid = [[], None, {}, [{"name": "payload.exe"}]]
@@ -221,7 +235,7 @@ class WorkflowTests(unittest.TestCase):
             ({"excluded_file_names_enabled": True, "excluded_file_names": "*.ZIP"},
              ("keep", None, [])),
             ({"excluded_file_names_enabled": True, "excluded_file_names": "*.NEWEXT["},
-             ("keep", None, [])),
+             ("skip", "qbittorrent_file_exclusions_incomplete", None)),
             ({"excluded_file_names_enabled": False, "excluded_file_names": "*.NEWEXT"},
              ("keep", None, [])),
             ({"excluded_file_names_enabled": "true", "excluded_file_names": "*.NEWEXT"},
@@ -238,7 +252,9 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual([call for call in self.qb.calls if call[0] == path], [(path, None)])
         self.qb.routes[path] = {"excluded_file_names_enabled": True, "excluded_file_names": "*[.newext"}
         self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("extras[.newext", 1))
-        self.assertEqual(self.check()["decision"], "keep")
+        report = self.check()
+        self.assertEqual((report["decision"], report["reason"]),
+                         ("skip", "qbittorrent_file_exclusions_incomplete"))
         self.qb.routes[path] = GuardError("api_request_or_response_failed")
         self.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("payload.scr", 0))
         self.assertEqual(self.check()["reasons"], ["contains_scr"])

@@ -413,9 +413,9 @@ def require_current_file_failure(qb, context, category):
     """Check the target's incarnation and full file policy immediately before removal."""
     target = context["hash"]
     try:
-        patterns, available = (), True
+        patterns, issue = (), None
         if "blocked_file_selected" in context["reasons"]:
-            patterns, available = read_file_exclusions(qb)
+            patterns, issue = read_file_exclusions(qb)
         torrents = torrents_by_hash(qb.call("/api/v2/torrents/info", {"hashes": target}))
         if set(torrents) != {target}:
             raise SafetyError("identity_or_manifest_changed")
@@ -430,9 +430,7 @@ def require_current_file_failure(qb, context, category):
         if manifest_fingerprint(files) != context["manifest_fingerprint"]:
             raise SafetyError("identity_or_manifest_changed")
         if not reasons:
-            reason = ("qbittorrent_file_exclusion_no_longer_matches" if available
-                      else "qbittorrent_file_exclusions_unavailable")
-            raise SafetyError(reason)
+            raise SafetyError(issue or "qbittorrent_file_exclusion_no_longer_matches")
     except GuardError as error:
         if str(error) == "run_time_limit_reached":
             raise

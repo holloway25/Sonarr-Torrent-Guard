@@ -113,7 +113,7 @@ def main():
             finally:
                 save_batch_state(batch_path, batch_state)
     except (SafetyError, GuardError) as error:
-        allowed = {"invalid_worker_lock", "another_run_is_active", "log_destination_reserved",
+        allowed = {"invalid_batch_state", "invalid_worker_lock", "another_run_is_active", "log_destination_reserved",
                    "log_destination_not_private_file", "log_symlink_refused"}
         reason = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
         result = {"dry_run": True, "status": "waiting", "reason": reason,

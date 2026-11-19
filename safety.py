@@ -20,6 +20,7 @@ DISPATCH_STOP_REASONS = {"fresh_assessment_expired",
                          "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
                          "sonarr_blocklist_scope_unverified", "retry_settings_not_ready",
                          "qbittorrent_file_exclusion_no_longer_matches", "qbittorrent_file_exclusions_unavailable",
+                         "qbittorrent_file_exclusions_incomplete",
                          "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence"}
 class SafetyError(Exception):
     pass

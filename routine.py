@@ -147,7 +147,7 @@ def main():
             "container_live_scope_confirmation_required",
             "routine_log_requires_private_config_directory", "run_time_limit_reached",
             "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused",
-            "another_run_is_active", "invalid_worker_lock"}
+            "another_run_is_active", "invalid_worker_lock", "invalid_batch_state"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

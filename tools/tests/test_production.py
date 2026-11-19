@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import production
-from guard import GuardError, run
+from guard import GuardError, load_batch_state, run
 from safety import SafetyError
 from tools.tests.test_guard import FakeApi, manifest
 
@@ -703,6 +703,8 @@ class FileCleanupTests(unittest.TestCase):
         cases = [
             (manifest(("episode.mkv", 1), ("PAYLOAD.EXE", 0)), "contains_exe"),
             (manifest(("episode.mkv", 1), ("payload.scr", 0)), "contains_scr"),
+            (manifest(("episode.mkv", 1), ("nested/.EXE", 0)), "contains_exe"),
+            (manifest(("episode.mkv", 1), (".sCr", 0)), "contains_scr"),
             (manifest(("episode.mkv", 1), ("archive.RAR", 1)), "blocked_file_selected"),
             (manifest(("episode.mkv", 0)), "all_files_unselected"),
             (manifest(("info.nfo", 1), ("notes.txt", 1), ("padding", 0)), "only_txt_nfo_selected"),
@@ -912,6 +914,63 @@ class FileCleanupTests(unittest.TestCase):
         self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
         self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
 
+    def test_malformed_exclusions_cannot_remove_healthy_torrents(self):
+        f = self.f
+        pref_path = "/api/v2/app/preferences"
+        torrents = f.qb.routes["/api/v2/torrents/info"]
+        for pattern, files, stage, detail in (
+                ("[!z-a]*", manifest(("episode.mkv", 1)), None, "qbittorrent_file_exclusions_incomplete"),
+                ("[[:digit:]]*.mkv", manifest(("episode.mkv", 1)), None, "qbittorrent_file_exclusions_incomplete"),
+                ("[!z-a]*\n*.bad\x00name\n*.zip", manifest(("episode.mkv", 1), ("extras.zip", 1)),
+                 "sonarr_remove_blocklist_accepted", "blocked_file_selected"),
+                ("[^0-9]*.zip", manifest(("episode.mkv", 1), ("episode.zip", 1)),
+                 "sonarr_remove_blocklist_accepted", "blocked_file_selected"),
+                ("[!z-a]*", manifest(("episode.mkv", 1), ("nested/.exe", 0)),
+                 "sonarr_remove_blocklist_accepted", "contains_exe")):
+            with self.subTest(pattern=pattern, detail=detail), tempfile.TemporaryDirectory() as folder:
+                f.qb.routes["/api/v2/torrents/info"] = torrents
+                f.qb.routes["/api/v2/torrents/files"] = files
+                f.qb.routes[pref_path] = {"excluded_file_names_enabled": True, "excluded_file_names": pattern}
+                send = Mock(side_effect=self.sonarr_transport)
+                result = self.container_cycle(Path(folder), send)
+                assessment, = result["assessment"]
+                if stage is None:
+                    self.assertEqual((assessment["decision"], assessment["reason"]), ("skip", detail))
+                    self.assertEqual(result["actions"], [])
+                    send.assert_not_called()
+                else:
+                    self.assertEqual(assessment["reasons"], [detail])
+                    action, = result["actions"]
+                    self.assertEqual(action["stage"], stage)
+                    send.assert_called_once()
+
+    def test_worker_rebuilds_malformed_private_cursor_but_holds_unsafe_cursor(self):
+        import os
+
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            path = folder / "batch-state.json"
+            bad_state = b'{"after": ["HD", "not-a-hash"], "identity_cache": {}}'
+            path.write_bytes(bad_state)
+            path.chmod(0o644)
+            send = Mock(side_effect=self.sonarr_transport)
+            result = self.container_cycle(folder, send)
+            self.assertEqual((result["status"], result["reason"]), ("waiting", "invalid_batch_state"))
+            self.assertEqual(path.read_bytes(), bad_state)
+            send.assert_not_called()
+
+            path.chmod(0o600)
+            with patch("guard.os.geteuid", return_value=os.geteuid() + 1):
+                with self.assertRaisesRegex(GuardError, "^invalid_batch_state$"):
+                    load_batch_state(path)
+            result = self.container_cycle(folder, send)
+            action, = result["actions"]
+            self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+            state = load_batch_state(path)
+            self.assertEqual(state["after"], ["HD", self.f.hash])
+            self.assertNotIn("identity_cache", state)
+            send.assert_called_once()
+
     def test_exclusion_is_read_again_before_sonarr_removal(self):
         f = self.f
         path = "/api/v2/app/preferences"
@@ -920,7 +979,9 @@ class FileCleanupTests(unittest.TestCase):
         for final_preferences, reason in (
                 ({"excluded_file_names_enabled": False}, "qbittorrent_file_exclusion_no_longer_matches"),
                 ({"excluded_file_names_enabled": True, "excluded_file_names": []},
-                 "qbittorrent_file_exclusions_unavailable")):
+                 "qbittorrent_file_exclusions_unavailable"),
+                ({"excluded_file_names_enabled": True, "excluded_file_names": "[!z-a]*"},
+                 "qbittorrent_file_exclusions_incomplete")):
             with self.subTest(preferences=final_preferences), tempfile.TemporaryDirectory() as folder:
                 f.qb.routes[path] = {"excluded_file_names_enabled": True, "excluded_file_names": "*.newext"}
 

@@ -51,8 +51,9 @@ Maintain the exclusion patterns in qBittorrent under **Settings â†’ Downloads â†
 Excluded file names**. Guard reads the enabled list when it checks files and
 re-reads it before removing a torrent based on a match. Patterns such as `*.rar`
 and `sample-*` are case-insensitive and can match a file or a parent folder.
-If the list is disabled or cannot be read, Guard can still act on the independent
-file rules. Keep
+Guard reports an incomplete list when it encounters an invalid or unsupported
+pattern. The invalid pattern cannot trigger removal. Other valid patterns and
+the independent file rules can still apply. Keep
 `*.exe` and `*.scr` in the exclusion list if qBittorrent should skip those files
 as well.
 
