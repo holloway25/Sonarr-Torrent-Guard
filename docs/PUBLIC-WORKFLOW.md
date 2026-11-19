@@ -123,8 +123,9 @@ recheck and include its result in the report and optional log. The recheck
 compares ownership and manifest fingerprints and requires a snapshot no more
 than ten seconds old. Manifest fingerprints use names, sizes, indices and
 priorities. The scheduled dry-run also checks the visible Sonarr grab titles
-before logging a file candidate as `would_remove`. Metadata timeouts require
-verified retry settings.
+before logging a file candidate as `would_remove`. A metadata timeout that
+passes the dry-run checks is logged as `metadata_candidate`. The live worker
+still has to verify the release title and other removal prerequisites.
 
 ## Production verification and sender gates
 

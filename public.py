@@ -90,7 +90,7 @@ def cycle(config, qb, apis, batch_state=None, *, reserve_dispatch=False):
 def main():
     parser = argparse.ArgumentParser(description="One public dry-run cycle; never removes torrents")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--log-file", type=Path, help="Write would-remove proposals to a private rotating log")
+    parser.add_argument("--log-file", type=Path, help="Write dry-run candidates and holds to a private rotating log")
     args = parser.parse_args()
     handler = None
     try:
@@ -127,8 +127,13 @@ def main():
             for report in result.get("assessment", ()):
                 if report["decision"] == "would_fail":
                     status = report.get("safeguards", {}).get("status")
-                    entry = {"event": "would_remove" if status == "fresh_attempt_verified" else "held",
-                             "time": stamp, "instance": report["instance"], "hash": report["hash"],
+                    if status != "fresh_attempt_verified":
+                        event = "held"
+                    elif file_policy_removal(report):
+                        event = "would_remove"
+                    else:
+                        event = "metadata_candidate"
+                    entry = {"event": event, "time": stamp, "instance": report["instance"], "hash": report["hash"],
                              "reasons": report["reasons"], "safeguards": report.get("safeguards")}
                     handler.emit(logging.LogRecord("public", logging.INFO, "", 0, json.dumps(entry), (), None))
             if result["status"] == "waiting":

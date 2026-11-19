@@ -845,7 +845,7 @@ class FileCleanupTests(unittest.TestCase):
         remove.assert_called_once()
         search.assert_not_called()
 
-    def test_public_dry_run_logs_would_remove_and_sends_nothing(self):
+    def read_dry_run_entry(self, folder):
         import json
         from contextlib import redirect_stdout
         from io import StringIO
@@ -853,28 +853,49 @@ class FileCleanupTests(unittest.TestCase):
 
         f = self.f
         f.qb.login = Mock()
+        path = folder / "dry-run.log"
+        args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
+        with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
+                "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
+                "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
+            self.assertEqual(public.main(), 0)
+        transport.assert_not_called()
+        entry, = [json.loads(line) for line in path.read_text().splitlines()]
+        return entry
+
+    def test_public_dry_run_logs_would_remove_and_sends_nothing(self):
+        f = self.f
         previous = datetime.datetime.fromisoformat(f.grab["date"]) - datetime.timedelta(minutes=10)
         old_grab = dict(f.grab, id=4, date=previous.isoformat(), sourceTitle="Older Example Release")
         f.s.routes["/api/v3/system/status"]["version"] = LEGACY_SONARR_VERSION
         f.s.routes["/api/v3/history"].update(totalRecords=2, records=[old_grab, f.grab])
         for conflicting in (True, False):
             with self.subTest(conflicting=conflicting), tempfile.TemporaryDirectory() as folder:
-                folder = Path(folder)
-                path = folder / "dry-run.log"
                 if not conflicting:
                     old_grab["sourceTitle"] = f.grab["sourceTitle"]
-                args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
-                with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
-                        "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
-                        "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
-                    self.assertEqual(public.main(), 0)
-                entry, = [json.loads(line) for line in path.read_text().splitlines()]
+                entry = self.read_dry_run_entry(Path(folder))
                 self.assertEqual((entry["event"], entry["hash"]), ("held" if conflicting else "would_remove", f.hash))
                 self.assertIn("contains_exe", entry["reasons"])
                 self.assertIn("time", entry)
                 if conflicting:
                     self.assertEqual(entry["safeguards"]["reason"], "ambiguous_release_title_evidence")
-                transport.assert_not_called()
+
+    def test_public_dry_run_labels_metadata_timeout_as_candidate_only(self):
+        f = self.f
+        self.make_metadata_timeout()
+        for title in (f.grab["sourceTitle"], ""):
+            with self.subTest(blank=not title), tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder)
+                f.grab["sourceTitle"] = title
+                entry = self.read_dry_run_entry(folder)
+                self.assertEqual((entry["event"], entry["hash"], entry["reasons"]),
+                                 ("metadata_candidate", f.hash, ["metadata_timeout"]))
+                if not title:
+                    send = Mock()
+                    action, = self.container_cycle(folder, send)["actions"]
+                    self.assertEqual((action["stage"], action["stop_reason"]),
+                                     ("held", "ambiguous_release_title_evidence"))
+                    send.assert_not_called()
 
     def test_file_removal_with_lost_response_retries_on_next_pass_only_if_still_queued(self):
         f = self.f

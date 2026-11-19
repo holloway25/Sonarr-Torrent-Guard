@@ -133,9 +133,10 @@ See [standalone authorization](docs/UNATTENDED-TRIAL.md).
 - `retry_requested` means Sonarr accepted the search for an eligible metadata
   timeout. `retry_search_blocked` includes the reason the search was held.
 
-Docker and the supplied service templates write `dry-run.log` for would-remove
-proposals and `routine.log` for live actions. Both logs rotate. Logs are never
-read back to decide what to remove.
+Docker and the supplied service templates write `dry-run.log` for file-cleanup
+proposals, metadata candidates and holds. `metadata_candidate` means the timeout
+passed the scheduled preview and still needs live removal checks.
+`routine.log` records live actions and holds. Both logs rotate and are for inspection.
 
 [Production preflight](docs/PUBLIC-WORKFLOW.md#production-verification-and-sender-gates)
 can check one candidate without sending a removal or search:
