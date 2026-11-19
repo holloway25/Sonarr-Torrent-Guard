@@ -666,6 +666,26 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
         raise SafetyError("delete_redirect_refused")
 
 
+def _read_action_response(response, limit):
+    """Keep bounded reads from accepting a prematurely closed HTTP response."""
+    lengths = response.headers.get_all("Content-Length", [])
+    declared = None
+    if lengths:
+        if len(lengths) != 1 or response.headers.get("Transfer-Encoding") is not None:
+            raise ValueError("ambiguous response length")
+        value = lengths[0].strip(" \t")
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise ValueError("invalid response length")
+        declared = int(value)
+        if declared > limit:
+            raise ValueError("response too large")
+
+    raw = response.read(limit + 1)
+    if len(raw) > limit or (declared is not None and len(raw) != declared):
+        raise ValueError("unexpected response length")
+    return raw
+
+
 def _send_queue_delete(api, queue_id, *, blocklist, alternate_hash_cleanup=False):
     """Send one native queue removal after the live checks."""
     if (ROUTINE_RELEASE_ENABLED is not True or not isinstance(blocklist, bool)
@@ -682,8 +702,9 @@ def _send_queue_delete(api, queue_id, *, blocklist, alternate_hash_cleanup=False
     try:
         with hard_deadline(deadline):
             with opener.open(request, timeout=min(15, deadline - time.monotonic())) as response:
-                if response.status != 200 or response.read(1) != b"":
-                    raise SafetyError("delete_response_uncertain")
+                if response.status != 200:
+                    raise ValueError()
+                _read_action_response(response, 0)
     except Exception:
         raise SafetyError("delete_request_outcome_uncertain") from None
 
@@ -701,10 +722,10 @@ def _send_history_failure(api, grab_id):
         with hard_deadline(deadline):
             with urllib.request.build_opener(RejectDeleteRedirect()).open(
                     request, timeout=min(15, deadline - time.monotonic())) as response:
-                raw = response.read(4097)
-                if (response.status != 200 or response.headers.get_content_type() != "application/json"
-                        or len(raw) > 4096
-                        or json.loads(raw, object_pairs_hook=unique_response_keys) != {}):
+                if response.status != 200 or response.headers.get_content_type() != "application/json":
+                    raise ValueError()
+                raw = _read_action_response(response, 4096)
+                if json.loads(raw, object_pairs_hook=unique_response_keys) != {}:
                     raise ValueError()
     except Exception:
         raise SafetyError("alternate_hash_blocklist_request_uncertain") from None
@@ -725,9 +746,9 @@ def _send_episode_search(api, episode_ids):
         with hard_deadline(deadline):
             with urllib.request.build_opener(RejectDeleteRedirect()).open(
                     request, timeout=min(15, deadline - time.monotonic())) as response:
-                raw = response.read(65537)
-                if not 200 <= response.status < 300 or len(raw) > 65536:
+                if not 200 <= response.status < 300:
                     raise ValueError()
+                raw = _read_action_response(response, 65536)
                 result = json.loads(raw, object_pairs_hook=unique_response_keys)
                 if (not isinstance(result, dict) or not integer(result.get("id")) or result["id"] <= 0
                         or result.get("name") != "EpisodeSearch"):

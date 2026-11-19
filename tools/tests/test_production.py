@@ -1,6 +1,7 @@
 import copy
 import tempfile
 import datetime
+from email.message import Message
 import time
 import unittest
 from pathlib import Path
@@ -554,6 +555,66 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             self.observe()
 
+    def test_action_senders_reject_truncated_http_responses_without_retrying(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+        from urllib.parse import urlsplit
+
+        calls = []
+        replies = {}
+
+        class Sonarr(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def reply(self):
+                path = urlsplit(self.path).path
+                calls.append((self.command, path))
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                status, body, length = replies[path]
+                self.send_response_only(status)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+
+            do_DELETE = reply
+            do_POST = reply
+
+        with ThreadingHTTPServer(("localhost", 0), Sonarr) as server:
+            worker = Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                api = Mock(config={"url": f"http://localhost:{server.server_port}", "api_key": "REPLACE_ME"},
+                           deadline=None)
+                cases = (
+                    ("DELETE", "/api/v3/queue/7", 200, b"", 18,
+                     lambda: production._send_queue_delete(api, 7, blocklist=True),
+                     "delete_request_outcome_uncertain", None),
+                    ("POST", "/api/v3/history/failed/5", 200, b"{}", 10,
+                     lambda: production._send_history_failure(api, 5),
+                     "alternate_hash_blocklist_request_uncertain", None),
+                    ("POST", "/api/v3/command", 201, b'{"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}', 10,
+                     lambda: production._send_episode_search(api, [3]),
+                     "episode_search_outcome_uncertain", 42),
+                )
+                for method, path, status, body, missing, send, uncertain, accepted in cases:
+                    with self.subTest(path=path), patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                            "production.METADATA_RETRY_RELEASE_ENABLED", True):
+                        calls.clear()
+                        replies[path] = (status, body, len(body) + missing)
+                        with self.assertRaisesRegex(SafetyError, uncertain):
+                            send()
+                        self.assertEqual(calls, [(method, path)])
+
+                        replies[path] = (status, body, len(body))
+                        self.assertEqual(send(), accepted)
+                        self.assertEqual(calls, [(method, path), (method, path)])
+            finally:
+                server.shutdown()
+                worker.join()
+
     def test_sender_refuses_production_transport_when_release_gate_is_off(self):
         with patch("urllib.request.build_opener") as opener:
             with self.assertRaisesRegex(SafetyError, "live_execution_disabled"):
@@ -561,7 +622,7 @@ class ProductionTests(unittest.TestCase):
             opener.assert_not_called()
 
     def test_delete_transport_has_fixed_scope_and_never_follows_redirects(self):
-        response = Mock(status=200)
+        response = Mock(status=200, headers=Message())
         response.read.return_value = b""
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
@@ -690,7 +751,7 @@ class FileCleanupTests(unittest.TestCase):
         self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["true"],
                                               "skipRedownload": ["false"], "changeCategory": ["false"]})
         self.f.qb.routes["/api/v2/torrents/info"] = []
-        response = Mock(status=200, read=Mock(return_value=b""))
+        response = Mock(status=200, headers=Message(), read=Mock(return_value=b""))
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         return response
@@ -732,7 +793,7 @@ class FileCleanupTests(unittest.TestCase):
         for status, body in ((200, b"<html>Sign in</html>"), (200, b'{"error":"denied"}'), (202, b"")):
             with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder)
-                response = Mock(status=status, read=Mock(side_effect=lambda size: body[:size]))
+                response = Mock(status=status, headers=Message(), read=Mock(side_effect=lambda size: body[:size]))
                 response.__enter__ = Mock(return_value=response)
                 response.__exit__ = Mock(return_value=False)
                 send = Mock(return_value=response)
@@ -802,7 +863,7 @@ class FileCleanupTests(unittest.TestCase):
         def transport(request, **kwargs):
             self.assertEqual(request.get_method(), "DELETE")
             f.qb.routes["/api/v2/torrents/info"] = []
-            response = Mock(status=200, read=Mock(return_value=b""))
+            response = Mock(status=200, headers=Message(), read=Mock(return_value=b""))
             response.__enter__ = Mock(return_value=response)
             response.__exit__ = Mock(return_value=False)
             return response
@@ -838,7 +899,7 @@ class FileCleanupTests(unittest.TestCase):
                 self.assertEqual(url.path, "/api/v3/command")
                 self.assertEqual(json.loads(request.data), {"name": "EpisodeSearch", "episodeIds": [3]})
                 body = b'{"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
-            response = Mock(status=200, read=Mock(return_value=body))
+            response = Mock(status=200, headers=Message(), read=Mock(return_value=body))
             response.__enter__ = Mock(return_value=response)
             response.__exit__ = Mock(return_value=False)
             return response
@@ -1168,8 +1229,9 @@ class FileCleanupTests(unittest.TestCase):
                             body, content_type = b"<html>Sign in</html>", "text/html"
                         elif case == "error_document":
                             body = b'{"error":"denied"}'
-                    response = Mock(status=200, read=Mock(return_value=body))
-                    response.headers.get_content_type.return_value = content_type
+                    response = Mock(status=200, headers=Message(), read=Mock(return_value=body))
+                    if content_type is not None:
+                        response.headers["Content-Type"] = content_type
                     response.__enter__ = Mock(return_value=response)
                     response.__exit__ = Mock(return_value=False)
                     return response

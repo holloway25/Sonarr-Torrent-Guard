@@ -101,7 +101,8 @@ raw endpoints or file paths are logged. No application file deletion is added.
 
 Live logs record accepted requests, holds and uncertain responses. Guard
 records queue removal as accepted when Sonarr returns an empty HTTP 200 response.
-Guard logs an unexpected response as uncertain and attempts no follow-up or
-resend in that pass. The worker prints a cycle summary separately.
+Guard logs an unexpected or incomplete response as uncertain and does not
+follow up or resend the request in that pass. The worker prints a cycle summary
+separately.
 Trial expiry stops new actions automatically, though an installed timer may keep
 recording waiting runs until disabled.

@@ -1,4 +1,5 @@
 import datetime
+from email.message import Message
 import json
 import time
 import unittest
@@ -655,7 +656,7 @@ class MetadataSenderTests(unittest.TestCase):
 class MetadataTransportTests(unittest.TestCase):
     def setUp(self):
         self.api = Mock(config={"url": "https://sonarr.example.invalid", "api_key": "REPLACE_ME"}, deadline=None)
-        self.response = Mock(status=201)
+        self.response = Mock(status=201, headers=Message())
         self.response.__enter__ = Mock(return_value=self.response)
         self.response.__exit__ = Mock(return_value=False)
         self.response.read.return_value = b'{"id":41,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
