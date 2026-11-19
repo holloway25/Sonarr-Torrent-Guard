@@ -12,6 +12,8 @@ from safety import SafetyError
 from tools.tests.test_guard import FakeApi, manifest
 
 
+LEGACY_SONARR_VERSION = ".".join(("4", "0", "0", "748"))
+
 class ProductionTests(unittest.TestCase):
     def setUp(self):
         for name, value in (("wait_for_event_boundary", None), ("event_boundary_reached", True)):
@@ -344,7 +346,7 @@ class ProductionTests(unittest.TestCase):
 
     def test_same_second_results_are_uncertain_not_missing_or_confirmed(self):
         self.results()
-        stamp = "2026-01-01T00:00:10Z"
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         for row in self.s.routes["/api/v3/history/since"][1:]:
             row["date"] = stamp
         self.s.routes["/api/v3/blocklist"]["records"][0]["date"] = stamp
@@ -849,20 +851,28 @@ class FileCleanupTests(unittest.TestCase):
 
         f = self.f
         f.qb.login = Mock()
-        with tempfile.TemporaryDirectory() as folder:
-            folder = Path(folder)
-            path = folder / "dry-run.log"
-            args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
-            with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
-                    "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
-                    "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
-                self.assertEqual(public.main(), 0)
-            entry, = [json.loads(line) for line in path.read_text().splitlines()]
-            self.assertEqual((entry["event"], entry["hash"]), ("would_remove", f.hash))
-            self.assertIn("contains_exe", entry["reasons"])
-            self.assertIn("time", entry)
-
-            transport.assert_not_called()
+        previous = datetime.datetime.fromisoformat(f.grab["date"]) - datetime.timedelta(minutes=10)
+        old_grab = dict(f.grab, id=4, date=previous.isoformat(), sourceTitle="Older Example Release")
+        f.s.routes["/api/v3/system/status"]["version"] = LEGACY_SONARR_VERSION
+        f.s.routes["/api/v3/history"].update(totalRecords=2, records=[old_grab, f.grab])
+        for conflicting in (True, False):
+            with self.subTest(conflicting=conflicting), tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder)
+                path = folder / "dry-run.log"
+                if not conflicting:
+                    old_grab["sourceTitle"] = f.grab["sourceTitle"]
+                args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
+                with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
+                        "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
+                        "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
+                    self.assertEqual(public.main(), 0)
+                entry, = [json.loads(line) for line in path.read_text().splitlines()]
+                self.assertEqual((entry["event"], entry["hash"]), ("held" if conflicting else "would_remove", f.hash))
+                self.assertIn("contains_exe", entry["reasons"])
+                self.assertIn("time", entry)
+                if conflicting:
+                    self.assertEqual(entry["safeguards"]["reason"], "ambiguous_release_title_evidence")
+                transport.assert_not_called()
 
     def test_file_removal_with_lost_response_retries_on_next_pass_only_if_still_queued(self):
         f = self.f
@@ -959,6 +969,24 @@ class FileCleanupTests(unittest.TestCase):
         action, = result["actions"]
         self.assertEqual(action["stop_reason"], "sonarr_blocklist_scope_unverified")
         send.assert_not_called()
+
+    def test_older_sonarr_holds_conflicting_prior_title_but_allows_consistent_scr_cleanup(self):
+        f = self.f
+        f.s.routes["/api/v3/system/status"]["version"] = LEGACY_SONARR_VERSION
+        f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("payload.scr", 0))
+        previous = datetime.datetime.fromisoformat(f.grab["date"]) - datetime.timedelta(minutes=10)
+        old_grab = dict(f.grab, id=4, date=previous.isoformat(), sourceTitle="Earlier Example Release")
+        f.s.routes["/api/v3/history"].update(totalRecords=2, records=[f.grab, old_grab])
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            send = Mock(side_effect=self.sonarr_transport)
+            action, = self.container_cycle(folder, send)["actions"]
+            self.assertEqual(action["stop_reason"], "ambiguous_release_title_evidence")
+            send.assert_not_called()
+            old_grab["sourceTitle"] = f.grab["sourceTitle"]
+            action, = self.container_cycle(folder, send)["actions"]
+            self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+            send.assert_called_once()
 
     def test_pack_with_conflicting_titles_is_held_but_consistent_titles_still_allow_removal(self):
         f = self.f

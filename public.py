@@ -12,8 +12,9 @@ import time
 from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config, run, recheck_candidate,
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
+from production import check_visible_native_grabs, require_sonarr_v4
 from safety import SafetyError, check_fresh, open_lock_file
-from workflow import manual_handling_reason
+from workflow import file_policy_removal, manual_handling_reason
 
 PERSIST_SECONDS = 2
 
@@ -74,6 +75,11 @@ def cycle(config, qb, apis, batch_state=None, *, reserve_dispatch=False):
                 with hard_deadline(verification_end):
                     fresh = recheck_candidate(report, config, qb, apis)
                     check_fresh(report, fresh)
+                    if not reserve_dispatch and file_policy_removal(report):
+                        label = report["instance"]
+                        require_sonarr_v4(apis[label])
+                        check_visible_native_grabs(apis[label], config["sonarr"][label], fresh["assessment"],
+                                                   config.get("max_pages", 20))
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}

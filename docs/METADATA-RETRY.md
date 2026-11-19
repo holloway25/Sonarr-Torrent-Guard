@@ -39,9 +39,11 @@ confirms the original torrent is absent and checks for replacements that
 already exist.
 
 Before searching, Guard rereads the queue, grab history, relevant blocklist,
-retry settings and authorization. A new grab or queue entry for any affected
-episode, ambiguous evidence or a matching new blocklist entry holds the
-search. Guard recognizes original stale queue rows by their exact row ID,
+retry settings and authorization. Guard checks a bounded history for each affected
+episode back to the original grab. A later grab by the owning Sonarr holds the
+search even if a different downloader handled it or it has already been imported.
+A replacement queue entry, ambiguous evidence or a matching new blocklist entry
+also holds the search. Guard recognizes original stale queue rows by their exact row ID,
 episode and hash. A response that omits relevant evidence leaves the decision
 uncertain.
 

@@ -31,10 +31,10 @@ SONARR_V4_VERSION = re.compile(r"4(?:\.[0-9]+){1,3}")
 EVENT_CLOCK_SKEW_SECONDS = 120
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
-                  "window_start", "baseline_history_ids", "baseline_blocklist_ids"}
+                  "window_start", "replacement_history_start", "baseline_history_ids", "baseline_blocklist_ids"}
 ATTEMPT_CONTEXT_FIELDS = {"attempt_fingerprint", "download_added_on", "grab_ids"}
 METADATA_SEARCH_HOLDS = {"replacement_already_grabbed", "replacement_history_ambiguous",
-                         "replacement_client_unknown", "replacement_history_identity_invalid",
+                         "replacement_history_identity_invalid",
                          "replacement_history_event_invalid", "replacement_blocklisted",
                          "replacement_blocklist_uncertain", "dispatch_validation_failed"}
 
@@ -87,9 +87,10 @@ def validate_context(value):
         for field in ("binding_digest", "client_name_digest", "release_title_digest"):
             if not valid_digest(value[field]):
                 raise ValueError()
-        stamp = value["window_start"]
-        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or stamp <= 0:
-            raise ValueError()
+        for field in ("window_start", "replacement_history_start"):
+            stamp = value[field]
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or stamp <= 0:
+                raise ValueError()
         if "attempt_fingerprint" in value:
             added, grabs = value["download_added_on"], value["grab_ids"]
             if (not integer(added) or added <= 0 or not isinstance(grabs, list) or not grabs
@@ -151,9 +152,10 @@ def outcome_history(api, series, episodes, start, max_pages, *, on_page=None):
     for episode in episodes:
         def validate_page(page):
             for row in page:
-                if (not all(integer(row.get(key)) and row[key] == expected
-                            for key, expected in (("seriesId", series), ("episodeId", episode)))
-                        or row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000):
+                if not all(integer(row.get(key)) and row[key] == expected
+                           for key, expected in (("seriesId", series), ("episodeId", episode))):
+                    raise SafetyError("replacement_history_identity_invalid")
+                if row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000:
                     raise SafetyError("invalid_history_response")
                 ids.add(row["id"])
             if on_page is not None:
@@ -269,7 +271,9 @@ def check_visible_native_grabs(api, instance, report, max_pages):
                 raise ValueError()
         if not approved <= {row["id"] for row in rows}:
             raise ValueError()
-        if len({row["sourceTitle"] for row in rows if row["id"] in approved}) != 1:
+        # Sonarr 4.x releases differ in how they pick a grab to blocklist.
+        # Require all visible grabs for this download ID to agree on the title.
+        if len({row["sourceTitle"] for row in rows}) != 1:
             raise SafetyError("ambiguous_release_title_evidence")
     except (GuardError, TypeError, ValueError) as error:
         if str(error) == "run_time_limit_reached":
@@ -375,7 +379,8 @@ def capture_context(config, api, report, now=None):
         "client_id": client["id"], "indexer": report["indexer"],
         "binding_digest": binding_digest(config, report["instance"]),
         "client_name_digest": digest(client["name"]), "release_title_digest": digest(titles[0]),
-        "window_start": start, "baseline_history_ids": [r["id"] for r in baseline_history],
+        "window_start": start, "replacement_history_start": min(grab_timestamp(grab) for grab in grabs),
+        "baseline_history_ids": [r["id"] for r in baseline_history],
         "baseline_blocklist_ids": [r["id"] for r in blocklist],
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
@@ -383,7 +388,7 @@ def capture_context(config, api, report, now=None):
     if "hash_aliases" in report:
         context["hash_aliases"] = aliases
     try:
-        check_replacement_grabs(baseline_history, context, start)
+        check_replacement_grabs(baseline_history, context)
     except (GuardError, SafetyError) as error:
         reason = str(error)
         context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
@@ -530,30 +535,15 @@ class OutcomeVerifier:
 
         def observe_history_page(rows):
             for event in rows:
-                if event["id"] in baseline_ids:
-                    continue
                 try:
-                    if history_event_type(event) != "grabbed":
-                        continue
-                    after = event_after(event, self.not_before)
-                    if after is False:
-                        continue
-                    data = event.get("data")
-                    name = data.get("downloadClientName") if isinstance(data, dict) else None
-                    client_known = isinstance(name, str) and bool(name.strip())
-                    if client_known and digest(name) != c["client_name_digest"]:
-                        continue
-                    torrent_hash(event.get("downloadId"))
-                    if after is True and client_known:
+                    if is_replacement_grab(event, c):
                         result["replacement_grab_observed"] = True
-                        continue
                 except (GuardError, SafetyError):
-                    pass
-                result["replacement_grab_ambiguous"] = True
+                    result["replacement_grab_ambiguous"] = True
 
         try:
             # Preserve a known grab even if a later history page fails to load.
-            rows = outcome_history(api, c["series_id"], c["episode_ids"], math.floor(self.not_before),
+            rows = outcome_history(api, c["series_id"], c["episode_ids"], math.floor(c["replacement_history_start"]),
                                    self.config.get("max_pages", 20),
                                    on_page=observe_history_page)
             new = [r for r in rows if r["id"] not in baseline_ids]
@@ -696,35 +686,28 @@ def metadata_history_type(event):
         raise SafetyError("replacement_history_event_invalid") from None
 
 
-def check_replacement_grabs(events, context, not_before):
-    for event in events:
-        series = event.get("seriesId")
-        if integer(series) and series > 0:
-            if series != context["series_id"]:
-                continue
-            episode = event.get("episodeId")
-            if integer(episode) and episode > 0 and episode not in context["episode_ids"]:
-                continue
-        if metadata_history_type(event) != "grabbed":
-            continue
-        # A late grab can belong to the refreshed outcome baseline. Its
-        # presence can still make a new search redundant.
-        if event["id"] in context["baseline_history_ids"] and event_after(event, not_before) is False:
-            continue
-        if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
-            raise SafetyError("replacement_history_identity_invalid")
-        after = event_after(event, not_before)
-        if after is None:
-            raise SafetyError("replacement_history_ambiguous")
-        if after is False:
-            continue
-        data = event.get("data")
-        name = data.get("downloadClientName") if isinstance(data, dict) else None
-        if not isinstance(name, str) or not name.strip():
-            raise SafetyError("replacement_client_unknown")
-        if digest(name) != context["client_name_digest"]:
-            continue
-        torrent_hash(event.get("downloadId"))
+def is_replacement_grab(event, context):
+    series, episode = event.get("seriesId"), event.get("episodeId")
+    if integer(series) and series > 0:
+        if series != context["series_id"] or (integer(episode) and episode > 0
+                                              and episode not in context["episode_ids"]):
+            return False
+    if metadata_history_type(event) != "grabbed":
+        return False
+    if not all(integer(value) and value > 0 for value in (series, episode)):
+        raise SafetyError("replacement_history_identity_invalid")
+    if event["id"] in context["grab_ids"]:
+        return False
+    after = event_after(event, context["replacement_history_start"])
+    if after is None:
+        raise SafetyError("replacement_history_ambiguous")
+    # This is a search veto. A grab by this Sonarr counts regardless of the
+    # downloader or protocol, without proving the original torrent was removed.
+    return after
+
+
+def check_replacement_grabs(events, context):
+    if any(is_replacement_grab(event, context) for event in events):
         raise SafetyError("replacement_already_grabbed")
 
 
@@ -770,11 +753,12 @@ def check_replacement_search_ready(config, qb, apis, c, not_before, observation,
             raise SafetyError("replacement_already_queued")
     # Queue visibility can lag a successful grab. Refresh history before
     # searching so any new grab for an affected episode can veto the search.
-    events = history_since(apis[c["instance"]], c["window_start"])
+    events = outcome_history(apis[c["instance"]], c["series_id"], c["episode_ids"],
+                             math.floor(c["replacement_history_start"]), config.get("max_pages", 20))
     client = bound_client(config, apis[c["instance"]], c["instance"])
     if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
         raise SafetyError("identity_or_manifest_changed")
-    check_replacement_grabs(events, c, not_before)
+    check_replacement_grabs(events, c)
     require_sonarr_v4(apis[c["instance"]])
     if (binding_digest(config, c["instance"]) != c["binding_digest"] or
             endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):

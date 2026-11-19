@@ -60,7 +60,7 @@ timeout or restart.
 1. Under the worker lock, repeat assessment for the candidate using both
    Sonarr queues. Check the owning Sonarr's current connection and version.
    Review the visible grab history for the exact queue download ID and hold
-   conflicting sources, clients, episodes or malformed evidence.
+   conflicting titles, sources, clients, episodes or malformed evidence.
 2. As the last remote check before sending, reread the target torrent and
    its complete manifest from qBittorrent. Require the same addition time,
    hash identity, category and failing manifest. Revalidate the approved
@@ -122,7 +122,9 @@ With `guard.py --check-safeguards`, eligible dry-run assessments receive a fresh
 recheck and include its result in the report and optional log. The recheck
 compares ownership and manifest fingerprints and requires a snapshot no more
 than ten seconds old. Manifest fingerprints use names, sizes, indices and
-priorities. Metadata timeouts also require the retry settings to be verified.
+priorities. The scheduled dry-run also checks the visible Sonarr grab titles
+before logging a file candidate as `would_remove`. Metadata timeouts require
+verified retry settings.
 
 ## Production verification and sender gates
 
@@ -133,12 +135,6 @@ INSTANCE TORRENT_HASH` checks the visible grab scope for file cleanup and uses t
 read-only outcome verifier for metadata. It neither prepares an operation nor
 sends a removal or search.
 
-`production.py --observe INSTANCE TORRENT_HASH` can update the observations
-for a stored single-test operation without sending a removal or search.
-The single-test and separately gated per-attempt sender interfaces are
-disabled in the repository code. They do not configure or authorize the
-scheduled live worker.
-
 ### Metadata and logs
 
 [Metadata retry](METADATA-RETRY.md) uses fresh checks and keeps evidence in
@@ -146,7 +142,8 @@ memory for the current pass. It removes the stalled torrent without blocklisting
 and may request an affected-episode search if removal is confirmed and no
 replacement is already queued or grabbed. A later pass never resumes an earlier
 search request. Dry-run logs proposals, and live mode logs action outcomes.
-Both use private rotating files. The logs are not inputs to Guard's decisions.
+Both use private rotating files. Check `routine.log` for the request outcome,
+then check Sonarr’s history for any blocklist entry or replacement grab.
 
 ## Verification before enabling live operation
 

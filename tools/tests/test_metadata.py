@@ -203,7 +203,9 @@ class MetadataSenderTests(unittest.TestCase):
                 ({"seriesId": None}, "replacement_history_identity_invalid"),
                 ({"episodeId": "3"}, "replacement_history_identity_invalid"),
                 ({"eventType": None}, "replacement_history_event_invalid"),
-                ({"data": {}}, "replacement_client_unknown"),
+                ({"data": {}, "downloadId": None}, "replacement_already_grabbed"),
+                ({"data": {"downloadClientName": "Another Downloader"}, "downloadId": "another-download-id"},
+                 "replacement_already_grabbed"),
                 ({}, "replacement_already_grabbed")):
             with self.subTest(change=change):
                 f.s.routes, f.qb.routes = copy.deepcopy(sonarr), copy.deepcopy(downloader)
@@ -304,6 +306,42 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertIs(plan["request_preview"]["params"]["skipRedownload"], True)
         self.assertEqual(plan["search_preview"]["body"], {"name": "EpisodeSearch", "episodeIds": [3]})
         self.assertIn("explicit_metadata_retry_authorization_required", plan["blockers"])
+
+    def test_imported_replacement_grab_older_than_five_minutes_still_vetoes_search(self):
+        f = self.f
+        for downloader, age, should_search in (("Downloader", 600, False),
+                                              ("Another Downloader", 600, False),
+                                              ("Downloader", 7200, True)):
+            with self.subTest(downloader=downloader, age=age):
+                f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [
+                    {"id": 7, "downloadId": f.hash.upper(), "seriesId": 2,
+                     "episodeId": 3, "downloadClientId": 1}]}
+                stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age)
+                replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat(),
+                                   data={"downloadClientName": downloader})
+                imported = dict(replacement, id=21, eventType="downloadFolderImported")
+                # The general recent read omits older events. The episode query still exposes them.
+                original = f.s.call
+                f.s.routes["/api/v3/history/since"] = [f.grab, replacement, imported]
+
+                def history(route, params=None):
+                    if route == "/api/v3/history/since":
+                        return [f.grab]
+                    return original(route, params)
+
+                with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                        f.s, "call", side_effect=history), patch(
+                        "production._send_queue_delete", side_effect=self.removed) as remove, patch(
+                        "production._send_episode_search", return_value=41) as search:
+                    result = self.execute()
+                remove.assert_called_once_with(f.s, 7, blocklist=False)
+                if should_search:
+                    self.assertEqual(result["stage"], "retry_requested")
+                    search.assert_called_once_with(f.s, [3])
+                else:
+                    self.assertEqual(result["stage"], "retry_superseded")
+                    search.assert_not_called()
 
     def test_preexisting_new_grab_suppresses_redundant_search(self):
         def removed(*args, **kwargs):
