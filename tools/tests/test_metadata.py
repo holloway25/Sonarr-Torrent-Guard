@@ -78,14 +78,13 @@ class MetadataTests(unittest.TestCase):
         event = list(json_events([report], {}, "test time"))[0]
         self.assertEqual(event["proposed_actions"], report["proposed_actions"])
 
-    def test_file_failure_human_and_json_proposals_show_removal_without_blocklisting(self):
+    def test_file_failure_human_and_json_proposals_show_native_sonarr_cleanup(self):
         self.t["state"] = "stalledUP"
         self.f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
         report = self.assess()
-        self.assertIn("remove_torrent_and_data_through_sonarr_without_blocklisting", report["proposed_actions"])
+        self.assertIn("blocklist_release_in_owning_sonarr", report["proposed_actions"])
         output = human_report([report], {}, "test time")
-        self.assertIn("WITHOUT blocklisting", output)
-        self.assertNotIn("blocklists and handles retry", output)
+        self.assertIn("blocklists and handles retry", output)
         event = list(json_events([report], {}, "test time"))[0]
         self.assertEqual(event["proposed_actions"], report["proposed_actions"])
 

@@ -24,7 +24,8 @@ from guard import GuardError, load_config, open_regular_file, source_policy_key
 from safety import ACTION_JOURNAL_FILE as JOURNAL_FILE
 from safety import CONTAINER_JOURNAL_BINDING as JOURNAL_BINDING
 from safety import CONTAINER_JOURNAL_MARKER as JOURNAL_MARKER
-from safety import Journal, SafetyError, open_lock_file, recover_bound_journal_rollback
+from safety import (Journal, SafetyError, metadata_journal_wait_reason, open_lock_file,
+                    recover_bound_journal_rollback)
 
 CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
@@ -103,7 +104,7 @@ def atomic_json(path, value):
             temporary.unlink()
 
 
-def configure(env, *, check_only=False, validate=None, recover_journal=False):
+def configure(env, *, check_only=False, validate=None, recover_journal=False, defer_journal_error=None):
     path = CONFIG_DIR / "connections.json"
     if path.is_symlink():
         raise GuardError("container_private_appdata_required")
@@ -144,7 +145,16 @@ def configure(env, *, check_only=False, validate=None, recover_journal=False):
         candidate = load_config(path)
     else:
         raise GuardError("container_configuration_invalid")
-    validate_journal_identity(candidate, recover=recover_journal and not check_only)
+    try:
+        validate_journal_identity(candidate, recover=recover_journal and not check_only)
+    except GuardError as error:
+        if defer_journal_error is None or str(error) != "container_identity_migration_required":
+            raise
+        defer_journal_error(SafetyError("container_journal_identity_mismatch"))
+    except (SafetyError, sqlite3.Error) as error:
+        if defer_journal_error is None:
+            raise
+        defer_journal_error(error)
     if validate is not None:
         validate(candidate)
     if source == "env" and not check_only:
@@ -300,13 +310,15 @@ def terminate_child(child):
         child.wait(timeout=KILL_TIMEOUT)
 
 
-def run_cycle(mode, path):
+def run_cycle(mode, path, *, file_cleanup_only=False):
     global CHILD
     command = [sys.executable, str(APP_DIR / ("routine.py" if mode == "live" else "public.py")),
                "--config", str(path), "--container-journal"]
     if mode == "live":
         command.extend(["--live", "--container-mode",
                         "--log-file", str(CONFIG_DIR / "routine.log")])
+        if file_cleanup_only:
+            command.append("--file-cleanup-only")
     # Credentials are in the owner-private runtime config, not process arguments
     # or a child environment dump. No shell command construction.
     env = {key: value for key, value in os.environ.items() if key in
@@ -361,6 +373,15 @@ def main():
             fresh = all(entry.name == lock_path.name for entry in CONFIG_DIR.iterdir())
             scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
             scope_update = {"rule": RULE, "scope_digest": None} if fresh else None
+            file_cleanup_only = False
+
+            def defer_journal_error(error):
+                nonlocal file_cleanup_only
+                reason = metadata_journal_wait_reason(error)
+                if reason is None:
+                    raise error
+                file_cleanup_only = True
+                print(json.dumps({"event": "container_metadata_waiting", "reason": reason}), file=sys.stderr)
 
             def validate_scope(config):
                 nonlocal scope_update
@@ -383,23 +404,31 @@ def main():
                     raise SafetyError("container_live_scope_confirmation_required")
 
             path = configure(os.environ, check_only=args.check_config, validate=validate_scope,
-                             recover_journal=not args.check_config)
+                             recover_journal=not args.check_config, defer_journal_error=(
+                                 defer_journal_error if mode == "live" and not (
+                                     args.check_config or args.approve_live_scope) else None))
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0
-            initialize_journal()
+            if not file_cleanup_only:
+                try:
+                    initialize_journal()
+                except (SafetyError, sqlite3.Error) as error:
+                    if mode != "live" or args.approve_live_scope:
+                        raise
+                    defer_journal_error(error)
             if scope_update is not None:
                 atomic_json(scope_path, scope_update)
             if args.approve_live_scope:
                 print(json.dumps({"event": "container_live_scope_confirmed", "actions_sent": False}))
                 return 0
             if mode == "live":
-                ContainerAuthorization(load_config(path), path)
+                ContainerAuthorization(load_config(path), path, bind_journal=not file_cleanup_only)
             signal.signal(signal.SIGTERM, stop_worker)
             signal.signal(signal.SIGINT, stop_worker)
             while not STOP.is_set():
                 atomic_json(CONFIG_DIR / "container-status.json", {"updated_at": time.time(), "mode": mode, "stage": "running"})
-                code = run_cycle(mode, path)
+                code = run_cycle(mode, path, file_cleanup_only=True) if file_cleanup_only else run_cycle(mode, path)
                 if STOP.is_set():
                     # Do not start another appdata fsync while the array stops.
                     if args.once:

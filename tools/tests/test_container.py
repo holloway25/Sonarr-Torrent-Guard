@@ -104,9 +104,9 @@ os._exit(0)
         for record in (marker, binding):
             worker.atomic_json(record, wrong)
         result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         self.assertIn("container_journal_identity_mismatch", error)
-        cycle.assert_not_called()
+        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
         self.assertTrue(rollback.is_file())
         self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
         for record in (marker, binding):
@@ -483,19 +483,24 @@ os._exit(0)
         self.assertTrue(marker.exists())
         saved = path.read_bytes()
         path.unlink()
-        for command in ("--check-config", "--once", "--approve-live-scope"):
+        for command in ("--check-config", "--approve-live-scope"):
             with self.subTest(command=command):
                 result, cycle, error = self.run_mode(env, command)
                 self.assertEqual(result, 1)
                 self.assertIn("container_journal_missing", error)
                 cycle.assert_not_called()
                 self.assertFalse(path.exists())
+        result, cycle, error = self.run_mode(env, "--once")
+        self.assertEqual(result, 0)
+        self.assertIn("container_journal_missing", error)
+        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
+        self.assertFalse(path.exists())
         with closing(Journal(path)) as orphan:
             orphan.installation_id(create=True)
         result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         self.assertIn("container_journal_identity_mismatch", error)
-        cycle.assert_not_called()
+        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
         path.write_bytes(saved)
         self.assertEqual(self.run_mode(env, "--once")[0], 0)
 
@@ -528,7 +533,7 @@ os._exit(0)
                     binding.unlink()
                 reason = ("container_journal_marker_missing" if previous_release
                           else "container_journal_identity_mismatch")
-                for command in ("--check-config", "--once", "--approve-live-scope"):
+                for command in ("--check-config", "--approve-live-scope"):
                     with self.subTest(identified=identified, previous_release=previous_release, command=command):
                         result, cycle, errors = self.run_mode(env, command)
                         self.assertEqual(result, 1)
@@ -536,6 +541,11 @@ os._exit(0)
                         cycle.assert_not_called()
                         self.assertFalse(marker.exists())
                         self.assertEqual(path.read_bytes(), replacement)
+                result, cycle, errors = self.run_mode(env, "--once")
+                self.assertEqual(result, 0)
+                self.assertIn(reason, errors)
+                cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
+                self.assertEqual(path.read_bytes(), replacement)
                 args = ["routine.py", "--live", "--container-mode", "--config", str(self.path / "connections.json"),
                         "--log-file", str(self.path / "routine.log")]
                 with patch.dict(os.environ, {"STGUARD_MODE": "live"}, clear=True), patch(
@@ -543,8 +553,10 @@ os._exit(0)
                             "assessment": [], "recovery": []}) as direct, contextlib.redirect_stdout(
                         io.StringIO()) as output:
                     self.assertEqual(routine.main(), 0)
-                direct.assert_not_called()
-                self.assertEqual(json.loads(output.getvalue())["reason"], "container_journal_marker_missing")
+                direct.assert_called_once()
+                self.assertIsNone(direct.call_args.args[3])
+                self.assertEqual(json.loads(output.getvalue())["metadata_journal_waiting"],
+                                 "container_journal_marker_missing")
                 if previous_release:
                     binding.write_bytes(saved_binding)
                     binding.chmod(0o600)
@@ -641,7 +653,7 @@ os._exit(0)
         with closing(Journal(path, read_only=True)) as journal:
             self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
 
-    def test_scheduled_children_refuse_a_missing_or_substituted_journal(self):
+    def test_scheduled_children_preserve_a_missing_or_substituted_journal(self):
         from contextlib import closing
 
         import public
@@ -661,13 +673,22 @@ os._exit(0)
             saved = path.read_bytes() if replacement else None
             for module, extra, mode in ((public, [], "dry-run"), (routine, [
                     "--container-mode", "--live", "--log-file", str(self.path / "routine.log")], "live")):
-                with self.subTest(replacement=replacement, mode=mode), patch(
-                        "sys.argv", [module.__file__, *command, *extra]), patch.dict(
-                        os.environ, {"STGUARD_MODE": mode}, clear=True), patch.object(
-                        public, "cycle") as cycle, contextlib.redirect_stdout(io.StringIO()) as output:
+                with (
+                    self.subTest(replacement=replacement, mode=mode),
+                    patch("sys.argv", [module.__file__, *command, *extra]),
+                    patch.dict(os.environ, {"STGUARD_MODE": mode}, clear=True),
+                    patch.object(public, "cycle", return_value={"assessment": [], "recovery": []}) as cycle,
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
                     self.assertEqual(module.main(), 0)
-                cycle.assert_not_called()
-                self.assertEqual(json.loads(output.getvalue())["reason"], expected)
+                result = json.loads(output.getvalue())
+                if mode == "live":
+                    cycle.assert_called_once()
+                    self.assertIsNone(cycle.call_args.args[3])
+                    self.assertEqual(result["metadata_journal_waiting"], expected)
+                else:
+                    cycle.assert_not_called()
+                    self.assertEqual(result["reason"], expected)
                 if replacement:
                     self.assertEqual(path.read_bytes(), saved)
                 else:
@@ -704,15 +725,15 @@ test.assertEqual(container_worker.healthcheck(), 1)
 """, str(self.path)], capture_output=True, text=True, timeout=4)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_legacy_approved_scope_without_journal_refuses_live_start(self):
+    def test_legacy_approved_scope_without_journal_runs_only_file_cleanup(self):
         from authorization import container_scope_record
         config = worker.runtime_config(self.env)
         worker.atomic_json(self.path / "connections.json", config)
         worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, container_scope_record(config))
         result, cycle, error = self.run_mode(dict(self.env, STGUARD_MODE="live"), "--once")
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         self.assertIn("container_journal_missing", error)
-        cycle.assert_not_called()
+        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
         self.assertFalse((self.path / worker.JOURNAL_FILE).exists())
 
     def test_scope_change_requires_confirmation_even_after_restart(self):

@@ -210,7 +210,7 @@ class WorkflowTests(unittest.TestCase):
         refreshed = recheck_candidate(original, self.config, self.qb, {"HD": self.s})
         self.assertEqual(refreshed["assessment"]["ownership_fingerprint"], original["ownership_fingerprint"])
         self.assertEqual(len([c for c in self.qb.calls if c[0].endswith("/files")]), before + 1)
-        self.assertEqual(refreshed["readiness"]["status"], "verified")
+        self.assertEqual(refreshed["readiness"], {})
 
     def test_target_recheck_blocks_new_useful_selection(self):
         self.qb.routes["/api/v2/torrents/files"] = manifest(("info.txt", 1), ("episode.mkv", 0))
@@ -639,14 +639,14 @@ class ReportingWorkflowTests(unittest.TestCase):
                        "public_source_confirmed": True, "queue_ids": [7, 9], "episode_ids": [3]}
         self.ready = {"status": "verified", "automatic_retry": True, "interactive_retry": True}
 
-    def test_file_failure_previews_removal_without_blocklisting_and_conditional_search(self):
+    def test_file_failure_previews_removal_blocklisting_and_native_sonarr_retry(self):
         plan = preview_failure(self.report, self.ready)
         self.assertEqual(plan["status"], "preview_only")
         self.assertEqual(plan["request_preview"]["params"], {
-            "removeFromClient": True, "blocklist": False, "skipRedownload": True, "changeCategory": False})
+            "removeFromClient": True, "blocklist": True, "skipRedownload": False, "changeCategory": False})
         self.assertFalse(plan["live_enabled"])
-        self.assertTrue(plan["extra_search"])
-        self.assertEqual(plan["search_preview"]["body"]["episodeIds"], [3])
+        self.assertFalse(plan["extra_search"])
+        self.assertEqual(plan["replacement_owner"], "sonarr")
 
     def test_disabled_or_unverified_retries_are_explicit_blockers(self):
         cases = [({}, "retry_settings_unverified"),

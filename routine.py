@@ -6,6 +6,7 @@ import fcntl
 import json
 import logging
 from pathlib import Path
+import sqlite3
 import time
 
 from authorization import ContainerAuthorization, RoutineAuthorization, read_container_journal_id
@@ -13,7 +14,9 @@ from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, l
                    load_batch_state, save_batch_state)
 import production
 import public
-from safety import ACTION_JOURNAL_FILE, DISPATCH_STOP_REASONS, Journal, SafetyError, open_lock_file
+from safety import (ACTION_JOURNAL_FILE, DISPATCH_STOP_REASONS, Journal, SafetyError,
+                    metadata_journal_wait_reason, open_lock_file)
+from workflow import file_policy_removal
 
 
 HELD_REASONS = DISPATCH_STOP_REASONS | {
@@ -24,6 +27,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
     "not_a_public_failure_candidate", "candidate_no_longer_eligible", "retry_settings_not_ready",
     "metadata_retry_not_released",
     "journal_history_limit_reached", "journal_archive_capacity_reached", "invalid_archive_evidence",
+    "delete_request_outcome_uncertain",
 }
 
 
@@ -40,8 +44,11 @@ def save_dispatch_cursor(state_path, cursor):
 
 
 def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_action=None, *,
-          summary=None, on_attempt=None):
-    authority.validate(config)
+          summary=None, on_attempt=None, lock_path=None):
+    if isinstance(authority, ContainerAuthorization):
+        authority.validate_scope(config)
+    else:
+        authority.validate(config)
     if proposal is None:
         proposal = public.cycle(config, qb, apis, journal, batch_state, reserve_dispatch=True)
     runtime = copy.deepcopy(config)
@@ -68,22 +75,29 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
         if on_attempt is not None:
             on_attempt(cursor)
         batch_state["dispatch_after"] = cursor
+        action = {"instance": report["instance"], "hash": report["hash"],
+                  "routine_grant_digest": authority.identifier}
         try:
-            row = production.execute_routine_attempt(runtime, qb, apis, journal, report, authority)
-            actions.append({"instance": report["instance"], "hash": report["hash"],
-                "key": row["key"], "stage": row["stage"], "confirmed": row["confirmed"],
-                "current_observation": row["current_observation"], "stop_reason": row["stop_reason"],
-                "routine_grant_digest": authority.identifier,
-                "metadata_retry": row["context"].get("metadata_retry"),
-                **({"file_cleanup": True} if row["context"].get("file_cleanup") is True else {}),
-                "search_command_id": row["search_command_id"]})
+            if file_policy_removal(report):
+                path = lock_path if lock_path is not None else journal.path.parent / "guard.lock"
+                production.execute_native_file_removal(runtime, qb, apis, report, authority, path)
+                action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
+            else:
+                row = production.execute_routine_attempt(runtime, qb, apis, journal, report, authority)
+                action.update(key=row["key"], stage=row["stage"], confirmed=row["confirmed"],
+                              current_observation=row["current_observation"], stop_reason=row["stop_reason"],
+                              metadata_retry=row["context"].get("metadata_retry"),
+                              search_command_id=row["search_command_id"])
         except (GuardError, SafetyError) as error:
             if str(error) == "run_time_limit_reached":
                 raise
             # Only exact known codes may reach logs; exception text can contain secrets.
             reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
-            actions.append({"instance": report["instance"], "hash": report["hash"], "stage": "held",
-                "stop_reason": reason, "routine_grant_digest": authority.identifier})
+            stage = "uncertain" if reason == "delete_request_outcome_uncertain" else "held"
+            action.update(stage=stage, stop_reason=reason)
+        except sqlite3.Error:
+            action.update(stage="held", stop_reason="metadata_journal_unavailable")
+        actions.append(action)
         if on_action is not None:
             on_action(actions[-1])
         if actions[-1]["stop_reason"] == "run_time_limit_reached":
@@ -101,6 +115,7 @@ def main():
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--live", action="store_true", help="Enable live routine actions")
     parser.add_argument("--container-journal", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--file-cleanup-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     result = {"mode": "routine", "live_authorized": False, "status": "waiting", "actions": [], "retry_after_seconds": 600}
     handler = None
@@ -112,21 +127,34 @@ def main():
             raise SafetyError("routine_log_requires_private_config_directory")
         handler = PrivateRotatingFileHandler(args.log_file, config_path=args.config,
                                             authorization_path=args.authorization)
-        authority = (ContainerAuthorization(config, args.config) if args.container_mode
+        authority = (ContainerAuthorization(config, args.config, bind_journal=False) if args.container_mode
                      else RoutineAuthorization.load(args.authorization, config, config_path=args.config))
         deadline = time.monotonic() + 180
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
         state_path = args.config.parent / "batch-state.json"
-        journal_id = (authority.journal_id if args.container_mode else
-                      read_container_journal_id(args.config.parent, required=args.container_journal))
-        journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, allow_public_attempt=True,
-                          expected_installation_id=journal_id)
+        lock_path = args.config.parent / "guard.lock"
+        journal = None
+        if args.file_cleanup_only and args.container_mode:
+            result["metadata_journal_waiting"] = "metadata_journal_unavailable"
+        else:
+            try:
+                journal_authority = ContainerAuthorization(config, args.config) if args.container_mode else authority
+                journal_id = (journal_authority.journal_id if args.container_mode else
+                              read_container_journal_id(args.config.parent, required=args.container_journal))
+                journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, allow_public_attempt=True,
+                                  expected_installation_id=journal_id)
+                authority = journal_authority
+            except (SafetyError, sqlite3.Error) as error:
+                reason = metadata_journal_wait_reason(error)
+                if reason is None:
+                    raise
+                result["metadata_journal_waiting"] = reason
         try:
             # Assessment/recovery and each sender use the same lock. Release it
             # before coordinator calls; they independently lock and recheck. A
             # second process can at most cause a hold, never duplicate sending.
-            with open_lock_file(args.config.parent / "guard.lock") as lock:
+            with open_lock_file(lock_path) as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 state = load_batch_state(state_path)
                 try:
@@ -141,9 +169,10 @@ def main():
                 handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
             with hard_deadline(deadline):
                 cycle(config, qb, apis, journal, authority, state, proposal, log_action, summary=result,
-                      on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor))
+                      on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor), lock_path=lock_path)
         finally:
-            journal.close()
+            if journal is not None:
+                journal.close()
     except (SafetyError, GuardError) as error:
         allowed = {"routine_authorization_invalid", "routine_authorization_unavailable",
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",

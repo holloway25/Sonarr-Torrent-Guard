@@ -6,7 +6,7 @@
 - Keep the handoff exclusively in the administration user's home directory, never in this repository.
 - Keep project documentation in the repository using generic configurable examples.
 - Public checker scope requires exact category, corresponding Sonarr queue hash, recorded Sonarr grab history and known content identity. Category alone is insufficient.
-- In explicitly authorized live mode, verified public file-policy failures must be removed through the owning Sonarr. Release tests must exercise the actual removal request with fake services, including failure reasons besides executable files and protected or ambiguous cases that send nothing. Keep automatic blocklisting separate from removal.
+- In explicitly authorized live mode, send the owning Sonarr its native remove-and-blocklist action for verified public file-policy failures. Sonarr owns the replacement search. Release tests must cover the actual request, failures besides executable files, protected items that receive no request, and a fresh pass after a re-grab. File-policy cleanup uses current evidence and must work without a journal or repeat counter.
 - Use the configured per-instance source policy. New container configurations treat identified sources as public except private exclusions; legacy files retain explicit public allowlists unless deliberately migrated. Private, missing, malformed and ambiguous source identities stay protected. Policy changes require fresh review/authorization, never silent live activation.
 - Paused/stopped status is never evidence of failure. Never resume torrents.
 - Do not access media-library files, change seeding policies, execute payloads, or mutate production queues/downloads during dry-run.

@@ -211,17 +211,25 @@ class ContainerAuthorization:
     mode = "container"
     expires_at = None
 
-    def __init__(self, config, config_path):
+    def __init__(self, config, config_path, *, bind_journal=True):
         self._config_path = config_path.absolute()
         self._path = self._config_path.parent / CONTAINER_SCOPE_FILE
         self._scope = container_scope_record(config)
         self.journal_id = None
-        if os.environ.get("STGUARD_MODE") == "live":
+        if bind_journal and os.environ.get("STGUARD_MODE") == "live":
             self.journal_id = read_bound_container_journal_id(self._path.parent)
         self.identifier = digest({"mode": self.mode, **self._scope})
-        self.validate(config)
+        if bind_journal:
+            self.validate(config)
+        else:
+            self.validate_scope(config)
 
     def validate(self, config, report=None):
+        self.validate_scope(config, report)
+        if read_bound_container_journal_id(self._path.parent) != self.journal_id:
+            raise SafetyError("container_journal_identity_mismatch")
+
+    def validate_scope(self, config, report=None):
         if os.environ.get("STGUARD_MODE") != "live":
             raise SafetyError("live_execution_disabled")
         if config.get("minimum_age_seconds", 120) < 120:
@@ -231,8 +239,6 @@ class ContainerAuthorization:
         reason = "container_live_scope_confirmation_required"
         if read_config_scope(self._config_path, reason) != self._scope["scope_digest"]:
             raise SafetyError(reason)
-        if read_bound_container_journal_id(self._path.parent) != self.journal_id:
-            raise SafetyError("container_journal_identity_mismatch")
         validate_candidate(config, report)
 
     def execution_expiry(self):

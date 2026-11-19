@@ -8,9 +8,9 @@ A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
 are currently enabled by default. The routine CLI requires explicit scope-bound
-trial or ongoing permission. Live cleanup removes verified public file-policy
-failures and stalled metadata downloads through Sonarr. A replacement search
-requires confirmed removal and separate safety checks. No resume, extraction,
+trial or ongoing permission. For verified public file-policy failures, Guard
+asks Sonarr to remove and blocklist the torrent and handle its own replacement
+search. Metadata timeouts follow a separate policy. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Docker / Unraid
@@ -127,11 +127,11 @@ There is no three-attempt escalation. Sonarr selects the replacement using its
 normal rules; it may choose the same release again. The separate metadata-retry
 policy gate is enabled. Sender gates and explicit live mode still apply. Docker
 uses its mode switch and standalone routine workers use a private grant.
-Live file-policy cleanup asks the owning Sonarr to remove the torrent and its
-download data without adding a blocklist entry. A new grab of the same bad
-torrent can be removed again after its identity is verified. Guard sends at most
-one replacement search for the same torrent hash or verified alias and affected
-episodes in the retained journal. See [public cleanup](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup)
+Live file-policy cleanup uses the owning Sonarr's Remove and Blocklist action,
+which requests removal of both the torrent and its download data. Guard uses
+the current queue and manifest on every pass, including for a re-grab or a grab
+from another public indexer. It needs no SQLite journal or repeat counter for
+these decisions. See [public cleanup](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup)
 and [metadata retry](docs/METADATA-RETRY.md).
 
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
@@ -197,9 +197,10 @@ and is not automatically invoked by workers or constructors.
 python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
 ```
 
-Preflight rereads eligible file-policy and metadata candidates and retry settings,
-checks the Sonarr 4.x version, and reports read-only outcomes
-including replacement-grab evidence. Preflight creates no dispatch journal
+Preflight rereads eligible candidates and checks Sonarr 4.x. For file-policy
+candidates it verifies the visible grab evidence for native remove and blocklist.
+For metadata it reports read-only outcomes including replacement-grab evidence.
+Preflight creates no dispatch journal
 entry or approval.
 The verifier matches failure history by original hash and episode identity. New
 replacement grabs must have different valid hashes for the affected episodes and
@@ -227,8 +228,8 @@ approval file is created by the app. There is no single-test CLI live switch. It
 worker lock, captures baselines, rechecks immediately before intent/dispatch,
 commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
-Sonarr owns the downloader operation. Eligible file-policy and metadata
-removals can request an affected-episode search after the final checks.
+Sonarr owns the downloader operation and native file-policy retry. Guard's
+separate affected-episode search applies to eligible metadata removals.
 
 After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
 version, then revalidates the saved final snapshot's freshness and approval expiry

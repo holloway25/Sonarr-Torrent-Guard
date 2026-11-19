@@ -2,7 +2,8 @@
 
 
 # Sonarr's public history can omit grabs used by the blocklist operation.
-# No supported API supplies equivalent evidence for automatic blocklisting.
+# The old journalled test senders require equivalent blocklisting evidence.
+# Scheduled file cleanup uses Sonarr's native queue action explicitly.
 BLOCKLIST_SCOPE_VERIFIABLE = False
 BLOCKLIST_MANUAL_REASON = "sonarr_blocklist_scope_unverifiable"
 FILE_FAILURE_REASONS = ("contains_exe", "contains_scr", "blocked_file_selected",
@@ -50,8 +51,8 @@ def preview_failure(report, readiness):
     """Describe one future Sonarr operation per torrent, never send it.
 
     A preview is not authorization or a substitute for a fresh assessment.
-    Both retry switches are required for a replacement search. Metadata
-    retries also require them before removal.
+    File removal uses Sonarr's own retry settings. Metadata retry checks
+    those settings before its separate removal and search.
     """
     plan = {"status": "preview_only", "live_enabled": False,
             "blockers": ["live_sender_disabled", "fresh_recheck_required"],
@@ -66,13 +67,14 @@ def preview_failure(report, readiness):
     if reason is not None:
         plan.update(status="manual_review", blockers=[reason])
         return plan
-    if readiness.get("status") != "verified":
-        plan["blockers"].append("retry_settings_unverified")
-    else:
-        if readiness.get("automatic_retry") is not True:
-            plan["blockers"].append("automatic_retry_disabled")
-        if readiness.get("interactive_retry") is not True:
-            plan["blockers"].append("interactive_retry_disabled")
+    if not file_policy_removal(report):
+        if readiness.get("status") != "verified":
+            plan["blockers"].append("retry_settings_unverified")
+        else:
+            if readiness.get("automatic_retry") is not True:
+                plan["blockers"].append("automatic_retry_disabled")
+            if readiness.get("interactive_retry") is not True:
+                plan["blockers"].append("interactive_retry_disabled")
     plan["request_preview"] = {
         "method": "DELETE", "path": "/api/v3/queue/" + str(min(ids)),
         "params": {"removeFromClient": True, "blocklist": True,
@@ -80,7 +82,7 @@ def preview_failure(report, readiness):
     }
     if report.get("reasons") == ["metadata_timeout"]:
         plan["blockers"].append("explicit_metadata_retry_authorization_required")
-    if report.get("reasons") == ["metadata_timeout"] or file_policy_removal(report):
+    if report.get("reasons") == ["metadata_timeout"]:
         episodes = report.get("episode_ids")
         if (not isinstance(episodes, list) or not episodes
                 or any(type(episode) is not int or episode <= 0 for episode in episodes)):

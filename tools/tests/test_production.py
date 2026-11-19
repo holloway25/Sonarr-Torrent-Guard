@@ -1414,7 +1414,7 @@ class FileCleanupTests(unittest.TestCase):
         self.addCleanup(self.f.tearDown)
         self.f.journal.allow_public_attempt = True
 
-    def container_cycle(self, folder, send, *, mode="live"):
+    def container_cycle(self, folder, send, *, mode="live", with_journal=False):
         from contextlib import redirect_stdout
         from io import StringIO
         import json
@@ -1430,7 +1430,8 @@ class FileCleanupTests(unittest.TestCase):
         with patch.object(container_worker, "CONFIG_DIR", folder):
             if not path.exists():
                 container_worker.atomic_json(path, config)
-                container_worker.initialize_journal()
+                if with_journal:
+                    container_worker.initialize_journal()
                 container_worker.atomic_json(folder / container_worker.CONTAINER_SCOPE_FILE,
                                              container_worker.container_scope_record(config))
         args = ["routine.py", "--config", str(path), "--container-mode", "--container-journal",
@@ -1443,28 +1444,21 @@ class FileCleanupTests(unittest.TestCase):
         return json.loads(output.getvalue())
 
     def sonarr_transport(self, request, **kwargs):
-        import json
         from urllib.parse import parse_qs, urlsplit
 
         url = urlsplit(request.full_url)
         self.assertEqual(url.netloc, "sonarr.example.invalid")
-        if request.get_method() == "DELETE":
-            self.assertEqual(url.path, "/api/v3/queue/7")
-            self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["false"],
-                                                  "skipRedownload": ["true"], "changeCategory": ["false"]})
-            self.f.qb.routes["/api/v2/torrents/info"] = []
-            body = b""
-        else:
-            self.assertEqual(request.get_method(), "POST")
-            self.assertEqual(url.path, "/api/v3/command")
-            self.assertEqual(json.loads(request.data), {"name": "EpisodeSearch", "episodeIds": [3]})
-            body = b'{"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
-        response = Mock(status=200, read=Mock(return_value=body))
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(url.path, "/api/v3/queue/7")
+        self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["true"],
+                                              "skipRedownload": ["false"], "changeCategory": ["false"]})
+        self.f.qb.routes["/api/v2/torrents/info"] = []
+        response = Mock(status=200, read=Mock(return_value=b""))
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         return response
 
-    def test_live_container_removes_each_file_policy_failure_through_sonarr_without_blocklisting(self):
+    def test_live_container_uses_the_native_remove_and_blocklist_action_for_each_file_failure(self):
         f = self.f
         torrents = f.qb.routes["/api/v2/torrents/info"]
         cases = [
@@ -1474,12 +1468,6 @@ class FileCleanupTests(unittest.TestCase):
             (manifest(("episode.mkv", 0)), "all_files_unselected"),
             (manifest(("info.nfo", 1), ("notes.txt", 1), ("padding", 0)), "only_txt_nfo_selected"),
         ]
-        # Sonarr's blocklisting connector can see history for a deleted
-        # episode which the public history API omits. No request may ask it to blocklist.
-        private = dict(f.grab, id=6, episodeId=444,
-                       data={**f.grab["data"], "indexer": "Private Source"})
-        f.s.routes["/api/v3/history"]["records"] = [
-            row for row in (f.grab, private) if row["episodeId"] == 3]
         for files, reason in cases:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder, patch(
                     "production.METADATA_RETRY_RELEASE_ENABLED", False):
@@ -1491,10 +1479,10 @@ class FileCleanupTests(unittest.TestCase):
                 self.assertIn(reason, result["assessment"][0]["reasons"])
                 self.assertEqual(len(result["actions"]), 1)
                 action, = result["actions"]
-                self.assertEqual(action["stage"], "retry_requested")
-                self.assertIs(action["confirmed"]["torrent_absent"], True)
-                self.assertIsNone(action["current_observation"]["data_deleted"])
-                self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST"])
+                self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+                self.assertEqual(result["metadata_journal_waiting"], "container_journal_marker_missing")
+                self.assertFalse((Path(folder) / "action-journal.sqlite3").exists())
+                send.assert_called_once()
 
     def test_live_container_rejects_healthy_private_ambiguous_and_dry_run_candidates(self):
         f = self.f
@@ -1522,26 +1510,58 @@ class FileCleanupTests(unittest.TestCase):
                         self.assertIn("ambiguous_instance_ownership", {r.get("reason") for r in result["assessment"]})
                 send.assert_not_called()
 
-    def test_file_removal_does_not_depend_on_retry_settings_or_blocklist_availability(self):
-        from guard import GuardError
+    def test_file_removal_leaves_existing_journal_untouched_and_does_not_read_sonarr_blocklist(self):
+        from contextlib import closing
 
         f = self.f
-        torrents = f.qb.routes["/api/v2/torrents/info"]
-        for ready, blocklist, reason in (
-                (False, {"totalRecords": 0, "records": []}, "retry_settings_not_ready"),
-                (True, GuardError("sonarr_unavailable"), "replacement_blocklist_uncertain")):
-            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder:
-                f.qb.routes["/api/v2/torrents/info"] = torrents
-                f.s.routes["/api/v3/config/downloadclient"]["autoRedownloadFailed"] = ready
-                f.s.routes["/api/v3/blocklist"] = blocklist
-                send = Mock(side_effect=self.sonarr_transport)
-                result = self.container_cycle(Path(folder), send)
-                action, = result["actions"]
-                self.assertEqual((action["stage"], action["stop_reason"]), ("retry_search_blocked", reason))
-                self.assertIs(action["confirmed"]["torrent_absent"], True)
-                self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE"])
+        f.s.routes["/api/v3/config/downloadclient"]["autoRedownloadFailed"] = False
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            self.container_cycle(folder, Mock(), mode="dry-run", with_journal=True)
+            path = folder / "action-journal.sqlite3"
+            with closing(Journal(path, allow_single_test=True)) as journal:
+                old = journal.prepare(f.report, mode="single_test", context=f.context)
+                journal.transition(old["key"], "prepared", "dispatch_recorded")
+                old = journal.transition(old["key"], "dispatch_recorded", "manual_review")
+            f.s.calls.clear()
+            send = Mock(side_effect=self.sonarr_transport)
+            result = self.container_cycle(folder, send)
+            with closing(Journal(path, read_only=True)) as journal:
+                self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM actions").fetchone(), (1,))
+                self.assertEqual(journal.get(old["key"]), old)
+        action, = result["actions"]
+        self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+        self.assertNotIn("/api/v3/blocklist", {route for route, _ in f.s.calls})
+        self.assertNotIn("/api/v3/config/downloadclient", {route for route, _ in f.s.calls})
+        send.assert_called_once()
 
-    def test_file_removal_with_lost_response_is_never_replayed(self):
+    def test_file_cleanup_without_a_journal_does_not_enable_metadata_dispatch(self):
+        f = self.f
+        torrent = f.qb.routes["/api/v2/torrents/info"][0]
+        torrent.update(state="metaDL", added_on=int(time.time()) - 2000, total_size=-1, progress=0)
+        f.grab["date"] = datetime.datetime.fromtimestamp(torrent["added_on"], datetime.timezone.utc).isoformat()
+        f.qb.routes["/api/v2/torrents/files"] = []
+        with tempfile.TemporaryDirectory() as folder:
+            send = Mock()
+            result = self.container_cycle(Path(folder), send)
+        assessment, = result["assessment"]
+        self.assertEqual(assessment["reasons"], ["metadata_timeout"])
+        self.assertEqual(assessment["safeguards"]["reason"], "metadata_journal_unavailable")
+        self.assertEqual(result["actions"], [])
+        send.assert_not_called()
+
+    def test_metadata_recovery_database_error_does_not_stop_file_cleanup(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "public.recover_pending", side_effect=sqlite3.OperationalError):
+            send = Mock(side_effect=self.sonarr_transport)
+            result = self.container_cycle(Path(folder), send, with_journal=True)
+        self.assertEqual(result["recovery"], [{"stage": "held", "stop_reason": "metadata_journal_unavailable"}])
+        self.assertEqual(result["actions"][0]["stage"], "sonarr_remove_blocklist_accepted")
+        send.assert_called_once()
+
+    def test_file_removal_with_lost_response_retries_on_next_pass_only_if_still_queued(self):
         f = self.f
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -1549,67 +1569,90 @@ class FileCleanupTests(unittest.TestCase):
             first = self.container_cycle(folder, send)
             action, = first["actions"]
             self.assertEqual(action["stage"], "uncertain")
+            send.side_effect = self.sonarr_transport
             second = self.container_cycle(folder, send)
-            self.assertEqual(second["actions"], [])
-            self.assertEqual(second["assessment"][0]["safeguards"]["reason"], "previous_attempt_unresolved")
-            f.qb.routes["/api/v2/torrents/info"] = []
+            self.assertEqual(second["actions"][0]["stage"], "sonarr_remove_blocklist_accepted")
             third = self.container_cycle(folder, send)
-            recovered, = third["recovery"]
-            self.assertEqual(recovered["stage"], "retry_removed")
             self.assertEqual(third["actions"], [])
-        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE"])
+            self.assertFalse((folder / "action-journal.sqlite3").exists())
+        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
 
-    def test_live_container_removes_a_verified_regrab_without_searching_for_it_again(self):
-        from contextlib import closing
-
+    def test_live_container_removes_a_new_bad_grab_from_another_public_indexer(self):
         f = self.f
         torrent = f.qb.routes["/api/v2/torrents/info"][0]
+        f.config["sonarr"]["HD"]["indexers"]["public"].append("Second Public Source")
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
             send = Mock(side_effect=self.sonarr_transport)
             first = self.container_cycle(folder, send)
             action, = first["actions"]
-            self.assertEqual(action["stage"], "retry_requested")
-            with closing(Journal(folder / "action-journal.sqlite3", read_only=True)) as journal:
-                previous = journal.get(action["key"])
-            added = int(previous["dispatched_at"]) + 3
-            latest = dict(f.grab, id=50, date=datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat())
+            self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+            added = int(time.time()) + 3
+            latest = dict(f.grab, id=50, date=datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat(),
+                          data={**f.grab["data"], "indexer": "Second Public Source"})
             f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, latest]}
             f.s.routes["/api/v3/history/since"] = [f.grab, latest]
             f.qb.routes["/api/v2/torrents/info"] = [dict(torrent, added_on=added)]
             with patch("time.time", return_value=added + 200):
                 second = self.container_cycle(folder, send)
-            with closing(Journal(folder / "action-journal.sqlite3", read_only=True)) as journal:
-                self.assertEqual(journal.get(action["key"]), previous)
         action, = second["actions"]
-        self.assertEqual((action["stage"], action["stop_reason"]), ("retry_search_blocked", "file_policy_repeat_search_held"))
-        self.assertIs(action["confirmed"]["torrent_absent"], True)
-        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST", "DELETE"])
+        self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "DELETE"])
 
     def test_file_manifest_changes_during_final_sonarr_read_hold_removal(self):
         f = self.f
-        version = production.require_sonarr_v4
-        final_check = False
-        refresh = Journal.refresh_baselines
+        check = production.check_visible_native_grabs
 
-        def mark_refreshed(journal, *args):
-            nonlocal final_check
-            result = refresh(journal, *args)
-            final_check = True
-            return result
+        def replace_manifest(*args):
+            check(*args)
+            f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
 
-        def replace_manifest(api):
-            version(api)
-            if final_check:
-                f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(
-                Journal, "refresh_baselines", mark_refreshed), patch(
-                "production.require_sonarr_v4", side_effect=replace_manifest):
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "production.check_visible_native_grabs", side_effect=replace_manifest):
             send = Mock()
             result = self.container_cycle(Path(folder), send)
         action, = result["actions"]
-        self.assertEqual((action["stage"], action["stop_reason"]), ("dispatch_blocked", "identity_or_manifest_changed"))
+        self.assertEqual((action["stage"], action["stop_reason"]), ("held", "identity_or_manifest_changed"))
+        send.assert_not_called()
+
+    def test_native_blocklist_holds_conflicting_visible_history(self):
+        f = self.f
+        hidden_from_episode_query = dict(f.grab, id=6, episodeId=444,
+                                         data={**f.grab["data"], "indexer": "Private Source"})
+        original = f.s.call
+
+        def history(route, params=None):
+            if route == "/api/v3/history" and params and "downloadId" in params:
+                return {"totalRecords": 2, "records": [f.grab, hidden_from_episode_query]}
+            return original(route, params)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(f.s, "call", side_effect=history):
+            send = Mock()
+            result = self.container_cycle(Path(folder), send)
+        action, = result["actions"]
+        self.assertEqual(action["stop_reason"], "sonarr_blocklist_scope_unverified")
+        send.assert_not_called()
+
+    def test_native_cleanup_holds_if_the_file_scope_changes_during_recheck(self):
+        import json
+
+        check = production.check_visible_native_grabs
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+
+            def protect_source(*args):
+                check(*args)
+                path = folder / "connections.json"
+                config = json.loads(path.read_text())
+                config["sonarr"]["HD"]["indexers"] = {
+                    "public": [], "private": ["Private Source", "Public Source"],
+                }
+                path.write_text(json.dumps(config))
+
+            send = Mock()
+            with patch("production.check_visible_native_grabs", side_effect=protect_source):
+                result = self.container_cycle(folder, send)
+        self.assertEqual(result["actions"][0]["stop_reason"], "container_live_scope_confirmation_required")
         send.assert_not_called()
 
     def test_preflight_verifies_file_policy_removal_read_only(self):
@@ -1628,8 +1671,8 @@ class FileCleanupTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(result["preflight"], "verified")
         self.assertIs(result["live_sender_enabled"], False)
-        self.assertIs(result["observation"]["torrent_absent"], False)
-        capture.assert_called_once()
+        self.assertEqual(result["operation"], "sonarr_remove_and_blocklist")
+        capture.assert_not_called()
         journal.assert_not_called()
 
     def test_transport_blocks_file_action_even_when_other_release_gates_are_enabled(self):

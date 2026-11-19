@@ -24,8 +24,8 @@ no hash/indexer timeout ban and no new attempt-counter database. Repeated metada
 timeouts may therefore lead to repeated searches until the trial expires or the
 existing bounded journal reaches capacity and fails closed.
 
-File-policy failures use a [separate eligibility check and repeat-search limit](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
-Both workflows request removal without blocklisting. Existing
+File-policy failures use Sonarr's [native remove-and-blocklist action](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
+Existing
 blocklist entries are not removed or bypassed: Sonarr can reject the same known
 hash across indexers for the series. No direct qBittorrent deletion, file deletion,
 selection, resume, tracker/DHT change, indexer selection or scoring change is added.

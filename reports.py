@@ -3,7 +3,7 @@
 import collections
 import json
 
-from workflow import file_policy_removal, manual_handling_reason
+from workflow import manual_handling_reason
 
 
 REASONS = {
@@ -67,7 +67,7 @@ def human_report(reports, readiness, timestamp):
             if reason is not None:
                 lines.append("  Manual review in Sonarr required. " + REASONS.get(reason, reason.replace("_", " ")) + ".")
                 continue
-            if report.get("reasons") == ["metadata_timeout"] or file_policy_removal(report):
+            if report.get("reasons") == ["metadata_timeout"]:
                 lines.append("  Proposed after approval/checks: Sonarr removes torrent/data WITHOUT blocklisting; "
                              "after confirmed removal and final checks, request an affected-episode search.")
             else:

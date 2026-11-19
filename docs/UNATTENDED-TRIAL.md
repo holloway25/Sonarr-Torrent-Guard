@@ -121,7 +121,7 @@ blocklisting, confirms original-incarnation absence, and then asks owning Sonarr
 for one EpisodeSearch. It never escalates metadata timeouts to blocklisting.
 The metadata policy gate is enabled, but sender gates and explicit permission
 still apply. The v3 grant requires its own approval. Qualified file-policy failures
-use [Sonarr removal without blocklisting](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
+use [Sonarr's native remove-and-blocklist action](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
 No DHT/PeX/tracker settings are changed. Rule or scope changes
 require reissuing permission. Code changes require a matching grant unless an ongoing grant allows updates.
 Preserve the original trial deadline when reissuing for a code update.

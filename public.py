@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import fcntl
 import json
 from pathlib import Path
+import sqlite3
 import time
 
 from authorization import read_bound_container_journal_id, read_container_journal_id
@@ -12,8 +13,9 @@ from guard import (Api, GuardError, hard_deadline, load_config, run, recheck_can
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
 from production import OutcomeVerifier, check_prior_attempts
-from safety import ACTION_JOURNAL_FILE, Journal, SafetyError, check_fresh, open_lock_file, reconcile
-from workflow import manual_handling_reason
+from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, check_fresh,
+                    metadata_journal_wait_reason, open_lock_file, reconcile)
+from workflow import file_policy_removal, manual_handling_reason
 
 RECOVERY_LIMIT = 5
 RECOVERY_SECONDS = 30
@@ -126,11 +128,25 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
                 with hard_deadline(verification_end):
                     fresh = recheck_candidate(report, config, qb, apis)
                     check_fresh(report, fresh)
-                    check_prior_attempts(journal, report, config=config)
+                    if not file_policy_removal(report):
+                        if journal is None:
+                            raise SafetyError("metadata_journal_unavailable")
+                        check_prior_attempts(journal, report, config=config)
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
-    recovered = recover_pending(config, qb, apis, journal, batch_state, recovery_end)
+            except sqlite3.Error:
+                report["safeguards"] = {"status": "held", "reason": "metadata_journal_unavailable",
+                                        "live_enabled": False}
+    recovered = []
+    if journal is not None:
+        try:
+            recovered = recover_pending(config, qb, apis, journal, batch_state, recovery_end)
+        except (SafetyError, sqlite3.Error) as error:
+            reason = metadata_journal_wait_reason(error)
+            if not reserve_dispatch or reason is None:
+                raise
+            recovered = [{"stage": "held", "stop_reason": reason}]
     return {"dry_run": True, "status": "assessed", "retry_after_seconds": RETRY_AFTER_SECONDS,
             "live_sender_enabled": False, "recovery": recovered, "assessment": reports}
 

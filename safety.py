@@ -27,8 +27,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "container_journal_missing", "container_journal_identity_mismatch",
                          "container_journal_marker_missing", "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
                          "sonarr_blocklist_scope_unverified", "sonarr_blocklist_scope_unverifiable", "retry_settings_not_ready",
-                         "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence",
-                         "file_policy_repeat_search_held"}
+                         "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
@@ -71,6 +70,17 @@ def clean_observation(observation):
 
 class SafetyError(Exception):
     pass
+
+
+def metadata_journal_wait_reason(error):
+    if isinstance(error, sqlite3.Error):
+        return "metadata_journal_unavailable"
+    if isinstance(error, SafetyError) and str(error) in {
+            "container_journal_missing", "container_journal_identity_mismatch", "container_journal_marker_missing",
+            "container_journal_rollback_required", "journal_requires_private_directory",
+            "invalid_archive_evidence", "invalid_operation_context"}:
+        return str(error)
+    return None
 
 
 @contextlib.contextmanager

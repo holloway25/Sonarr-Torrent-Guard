@@ -18,7 +18,7 @@ import urllib.request
 
 from authorization import (ContainerAuthorization, read_bound_container_journal_id,
                            read_container_journal_binding, read_container_journal_id)
-from guard import (Api, FILE_ASSESSMENT_STATES, GuardError, assess_files, endpoint_key, grab_indexer, grab_timestamp,
+from guard import (Api, FILE_ASSESSMENT_STATES, GuardError, assess_files, classify_source, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
                    manifest_fingerprint, metadata_still_pending, records, recheck_candidate, run, select_latest_grabs, torrent_hash,
                    torrent_hash_ownership, torrents_by_hash, unique_client_name, unique_response_keys, verified_hashes,
@@ -295,6 +295,75 @@ def check_blocklist_scope(api, download_id, context, max_pages):
         raise SafetyError("sonarr_blocklist_scope_unverified") from None
 
 
+def check_visible_native_grabs(api, instance, report, max_pages):
+    """Hold contradictory public API records before using Sonarr's native action."""
+    try:
+        download_id = report["download_id_spelling"]
+        rows = records(api, "/api/v3/history", {
+            "downloadId": download_id, "eventType": 1, "sortKey": "date", "sortDirection": "descending",
+        }, max_pages)
+        episodes = set(report["episode_ids"])
+        approved = set(report["grab_ids"])
+        if (not rows or len(report["series_ids"]) != 1
+                or {row.get("episodeId") for row in rows} != episodes):
+            raise ValueError()
+        newest = max(grab_timestamp(row) for row in rows)
+        for row in rows:
+            data, title = row.get("data"), row.get("sourceTitle")
+            name = data.get("downloadClientName") if isinstance(data, dict) else None
+            if (row["id"] <= 0 or row.get("downloadId") != download_id or history_event_type(row) != "grabbed"
+                    or not integer(row.get("seriesId")) or row["seriesId"] != report["series_ids"][0]
+                    or not integer(row.get("episodeId"))
+                    or not isinstance(name, str) or not name.strip()
+                    or digest(name) != report["download_client_name_digest"]
+                    or not isinstance(title, str) or not title.strip()):
+                raise ValueError()
+            source = grab_indexer(row, name)
+            if (classify_source(instance["indexers"], source) != "public"
+                    or (grab_timestamp(row) == newest and (row["id"] not in approved or source != report["indexer"]))):
+                raise ValueError()
+        if not approved <= {row["id"] for row in rows}:
+            raise ValueError()
+    except (GuardError, TypeError, ValueError) as error:
+        if str(error) == "run_time_limit_reached":
+            raise
+        raise SafetyError("sonarr_blocklist_scope_unverified") from None
+
+
+def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
+    """Ask the owning Sonarr to remove, blocklist and natively retry once this pass."""
+    from authorization import RoutineAuthorization
+
+    if config.get("dry_run") is not False or ROUTINE_RELEASE_ENABLED is not True or not file_policy_removal(report):
+        raise SafetyError("live_execution_disabled")
+    if not isinstance(authority, (ContainerAuthorization, RoutineAuthorization)):
+        raise SafetyError("routine_authorization_invalid")
+    validate = authority.validate_scope if isinstance(authority, ContainerAuthorization) else authority.validate
+    validate(config, report)
+    label = report["instance"]
+    api, instance = apis[label], config["sonarr"][label]
+    if endpoint_key(api.config["url"]) != endpoint_key(instance["url"]):
+        raise SafetyError("identity_or_manifest_changed")
+    with open_lock_file(lock_path) as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SafetyError("another_run_is_active") from None
+        require_sonarr_v4(api)
+        require_connectivity(config, api, label)
+        refreshed = run(config, qb, apis, target=(label, report["hash"]))
+        if len(refreshed) != 1 or not file_policy_removal(refreshed[0]):
+            raise SafetyError("candidate_no_longer_eligible")
+        current = refreshed[0]
+        fresh = {"assessment": current}
+        check_fresh(report, fresh)
+        check_visible_native_grabs(api, instance, current, config.get("max_pages", 20))
+        require_current_file_failure(qb, current, instance["category"], current["manifest_fingerprint"])
+        validate(config, current)
+        check_fresh(report, fresh)
+        _send_queue_delete(api, min(current["queue_ids"]), blocklist=True, native_file_cleanup=True)
+
+
 def capture_context(config, api, report, approval_digest, now=None, *, dispatch=None):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
@@ -328,7 +397,6 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
     if any(not isinstance(title, str) or not title.strip() for title in titles) or len(set(titles)) != 1:
         raise SafetyError("ambiguous_release_title_evidence")
     policy = metadata_policy(report)
-    file_cleanup = file_policy_removal(report)
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
     approved_by_id = {grab["id"]: grab for grab in grabs}
@@ -357,7 +425,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 raise SafetyError("identity_or_manifest_changed")
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
-    if policy is None and not file_cleanup:
+    if policy is None:
         try:
             latest = max(grab_timestamp(grab) for grab in grabs)
             for row in baseline_history:
@@ -369,9 +437,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                     raise SafetyError("sonarr_blocklist_scope_unverified")
         except GuardError:
             raise SafetyError("sonarr_blocklist_scope_unverified") from None
-    # File cleanup does not touch the blocklist. Read it after removal to
-    # constrain the optional search without delaying removal itself.
-    blocklist = [] if file_cleanup else blocklist_records(api, series[0], start, config.get("max_pages", 20))
+    blocklist = blocklist_records(api, series[0], start, config.get("max_pages", 20))
     context = {
         "instance": report["instance"], "hash": report["hash"], "series_id": series[0],
         "episode_ids": report["episode_ids"], "queue_id": min(report["queue_ids"]),
@@ -382,17 +448,13 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
-    if policy is not None or file_cleanup:
+    if policy is not None:
         context["queue_rows"] = report["queue_rows"]
-        if file_cleanup:
-            context["file_cleanup"] = True
-        else:
-            context["metadata_retry"] = policy
+        context["metadata_retry"] = policy
         if dispatch is not None:
             previous = dispatch["context"]
             try:
-                if not file_cleanup:
-                    check_metadata_blocklist(blocklist, previous, dispatch["dispatched_at"])
+                check_metadata_blocklist(blocklist, previous, dispatch["dispatched_at"])
                 check_replacement_grabs(baseline_history, previous, dispatch["dispatched_at"])
             except (GuardError, SafetyError) as error:
                 # Preserve an observed veto even if the later read no longer contains the row.
@@ -400,7 +462,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
     if "hash_aliases" in report:
         context["hash_aliases"] = aliases
-    if policy is None and not file_cleanup and dispatch is None:
+    if policy is None and dispatch is None:
         check_blocklist_scope(api, report["download_id_spelling"], context, config.get("max_pages", 20))
     return validate_context(context)
 
@@ -652,17 +714,17 @@ class RejectDeleteRedirect(urllib.request.HTTPRedirectHandler):
         raise SafetyError("delete_redirect_refused")
 
 
-def _send_queue_delete(api, queue_id, blocklist=True, *, file_cleanup=False):
+def _send_queue_delete(api, queue_id, blocklist=True, *, native_file_cleanup=False):
     """Narrow transport; called only after the coordinator's gates and durable intent."""
     if (SINGLE_TEST_RELEASE_ENABLED is not True and PUBLIC_ATTEMPT_RELEASE_ENABLED is not True
             and ROUTINE_RELEASE_ENABLED is not True):
         raise SafetyError("live_execution_disabled")
     if not integer(queue_id) or queue_id <= 0:
         raise SafetyError("invalid_queue_id")
-    if (not isinstance(blocklist, bool) or (file_cleanup and blocklist)
-            or (not blocklist and not file_cleanup and METADATA_RETRY_RELEASE_ENABLED is not True)):
+    if (not isinstance(blocklist, bool) or (not blocklist and METADATA_RETRY_RELEASE_ENABLED is not True)
+            or (native_file_cleanup and (not blocklist or ROUTINE_RELEASE_ENABLED is not True))):
         raise SafetyError("live_execution_disabled")
-    if blocklist and not workflow.BLOCKLIST_SCOPE_VERIFIABLE:
+    if blocklist and not native_file_cleanup and not workflow.BLOCKLIST_SCOPE_VERIFIABLE:
         raise SafetyError(workflow.BLOCKLIST_MANUAL_REASON)
     params = {"removeFromClient": "true", "blocklist": "true" if blocklist else "false",
               "skipRedownload": "false" if blocklist else "true", "changeCategory": "false"}
@@ -679,9 +741,9 @@ def _send_queue_delete(api, queue_id, blocklist=True, *, file_cleanup=False):
         raise SafetyError("delete_request_outcome_uncertain") from None
 
 
-def _send_episode_search(api, episode_ids, *, file_cleanup=False):
+def _send_episode_search(api, episode_ids):
     """One Sonarr command, no redirect/retry; no release or indexer is selected here."""
-    if ((not file_cleanup and METADATA_RETRY_RELEASE_ENABLED is not True) or not any(flag is True for flag in (
+    if (METADATA_RETRY_RELEASE_ENABLED is not True or not any(flag is True for flag in (
             SINGLE_TEST_RELEASE_ENABLED, PUBLIC_ATTEMPT_RELEASE_ENABLED, ROUTINE_RELEASE_ENABLED))):
         raise SafetyError("live_execution_disabled")
     if (not isinstance(episode_ids, list) or not episode_ids or len(episode_ids) > 10000
@@ -769,7 +831,7 @@ def check_metadata_blocklist(rows, context, not_before):
 
 def finish_replacement_search(config, qb, apis, journal, row, validate):
     """Only the original removal coordinator can request a replacement search."""
-    if row["stage"] != "retry_removed":
+    if row["stage"] != "retry_removed" or "metadata_retry" not in row["context"]:
         return row
     if replacement_already_observed(row):
         return journal.transition(row["key"], "retry_removed", "retry_superseded")
@@ -778,20 +840,6 @@ def finish_replacement_search(config, qb, apis, journal, row, validate):
     try:
         if "metadata_search_hold" in c:
             raise SafetyError(c["metadata_search_hold"])
-        if c.get("file_cleanup") is True:
-            if row["current_observation"].get("blocklisted") is not False:
-                raise SafetyError("replacement_blocklisted" if row["confirmed"].get("blocklisted") is True
-                                  else "replacement_blocklist_uncertain")
-            # Removing a proven new incarnation is still useful. Reissuing
-            # the search that can fetch it again is not.
-            episodes = set(c["episode_ids"])
-            for previous in journal.related(c["instance"], c["hash"], c.get("hash_aliases", ()),
-                                            binding=c["binding_digest"]):
-                if (previous["key"] != row["key"] and previous["stage"] in (
-                        "retry_search_recorded", "retry_search_uncertain", "retry_requested")
-                        and previous["context"].get("series_id") == c["series_id"]
-                        and episodes.intersection(previous["context"].get("episode_ids", ()))):
-                    raise SafetyError("file_policy_repeat_search_held")
         if row["confirmed"].get("replacement_grab_ambiguous") is True:
             raise SafetyError("replacement_history_ambiguous")
         # Only a complete observation can rule out a replacement at this point.
@@ -843,7 +891,7 @@ def finish_replacement_search(config, qb, apis, journal, row, validate):
         if any(readiness[field] is not True for field in ("automatic_retry", "interactive_retry")):
             raise SafetyError("retry_settings_not_ready")
         validate()
-        if c.get("file_cleanup") is not True and METADATA_RETRY_RELEASE_ENABLED is not True:
+        if METADATA_RETRY_RELEASE_ENABLED is not True:
             raise SafetyError("live_execution_disabled")
     except Exception as error:
         reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "dispatch_validation_failed"
@@ -851,10 +899,7 @@ def finish_replacement_search(config, qb, apis, journal, row, validate):
             reason = "dispatch_validation_failed"
         return journal.transition(row["key"], "retry_search_recorded", "retry_search_blocked", stop_reason=reason)
     try:
-        if c.get("file_cleanup") is True:
-            command_id = _send_episode_search(apis[c["instance"]], c["episode_ids"], file_cleanup=True)
-        else:
-            command_id = _send_episode_search(apis[c["instance"]], c["episode_ids"])
+        command_id = _send_episode_search(apis[c["instance"]], c["episode_ids"])
         return journal.record_search_accepted(row["key"], command_id)
     except Exception:
         return journal.transition(row["key"], "retry_search_recorded", "retry_search_uncertain")
@@ -964,6 +1009,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 return journal.transition(key, "prepared", "cancelled", stop_reason="abandoned_before_dispatch")
             verifier = OutcomeVerifier(config, qb, apis, old["context"], old["dispatched_at"])
             return reconcile(journal, key, verifier.observe)
+        if file_policy_removal(report):
+            raise SafetyError("native_file_cleanup_requires_routine")
         reason = workflow.manual_handling_reason(report)
         if reason is not None:
             raise SafetyError(reason)
@@ -1021,10 +1068,7 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                     endpoint_key(apis[report["instance"]].config["url"]) !=
                     endpoint_key(config["sonarr"][report["instance"]]["url"])):
                 raise SafetyError("identity_or_manifest_changed")
-            if context.get("file_cleanup") is True:
-                require_current_file_failure(qb, context, config["sonarr"][report["instance"]]["category"],
-                                             report["manifest_fingerprint"])
-            elif not removal_without_blocklist(context):
+            if not removal_without_blocklist(context):
                 check_blocklist_scope(apis[report["instance"]],
                                       final_snapshot["assessment"]["download_id_spelling"], context,
                                       config.get("max_pages", 20))
@@ -1040,9 +1084,7 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 reason = "dispatch_validation_failed"
             return journal.transition(row["key"], "dispatch_recorded", "dispatch_blocked", stop_reason=reason)
         try:
-            if context.get("file_cleanup") is True:
-                _send_queue_delete(apis[report["instance"]], context["queue_id"], blocklist=False, file_cleanup=True)
-            elif removal_without_blocklist(context):
+            if removal_without_blocklist(context):
                 _send_queue_delete(apis[report["instance"]], context["queue_id"], blocklist=False)
             else:
                 _send_queue_delete(apis[report["instance"]], context["queue_id"])
@@ -1110,6 +1152,14 @@ def main():
             reason = workflow.manual_handling_reason(report)
             if reason is not None:
                 result.update(preflight="manual_review", reason=reason)
+            elif file_policy_removal(report):
+                fresh = recheck_candidate(report, config, qb, apis)
+                check_fresh(report, fresh)
+                api = apis[target[0]]
+                require_sonarr_v4(api)
+                check_visible_native_grabs(api, config["sonarr"][target[0]], fresh["assessment"],
+                                           config.get("max_pages", 20))
+                result.update(preflight="verified", operation="sonarr_remove_and_blocklist")
             else:
                 fresh = recheck_candidate(report, config, qb, apis)
                 check_fresh(report, fresh)

@@ -101,8 +101,8 @@ endpoints, category and pinned client ID and preserves its exact existing labels
 ambiguous bindings, extra/missing owners, or a journal without its connection
 config require an explicit identity migration; startup refuses to guess and does
 not replace the config. File mode preserves existing labels and settings.
-Both modes check active and archived journal owner identities and recorded live
-bindings read-only before scheduling. The check can read an older journal with
+Journal-based metadata action and dry-run recovery validate active and archived
+journal owner identities and recorded bindings. The check can read an older journal with
 missing optional columns. The worker adds those columns when it opens the journal
 for normal use. On the first real start or scope approval, Guard records the
 expected journal identity in `container-journal-binding.json` and binds it to
@@ -118,15 +118,18 @@ transaction, then validates the recovered journal before scheduling a cycle.
 changing the database or its rollback file. Leave both files together for
 normal startup to recover. [SQLite rollback recovery](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals)
 
-Container cycles and direct container-mode workers require both records to
-agree with the database. A missing or different journal holds the worker.
+Journal-based operations require both records to agree with the database.
+If the journal cannot be used, an approved live worker can still perform
+file-policy cleanup from the current queue. It reports the metadata hold and
+preserves the existing journal files. Checks and scope approval still validate
+the journal read-only before accepting any journal-based operation.
 Existing installs with a matching journal and marker acquire the independent
 binding automatically. An uninitialized legacy journal without prior live
 approval can still be adopted. A previously approved install lacking both
 identity records must recover its matching journal and marker first.
 Keep the configuration, scope, journal, marker and binding together when
-backing up or restoring. Live removal and search verify that the opened journal
-is still in place before sending.
+backing up or restoring. Metadata removal and search verify that the opened
+journal is still in place before sending.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.

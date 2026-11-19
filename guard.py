@@ -878,7 +878,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     report["proposed_actions"] = ["review_release_manually_in_sonarr"]
                 else:
                     report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
-                    if reasons == ["metadata_timeout"] or file_policy_removal(report):
+                    if reasons == ["metadata_timeout"]:
                         report["queue_rows"] = sorted([r["id"], r["episodeId"], h] for r in rows)
                         report["proposed_actions"] = [
                             "remove_torrent_and_data_through_sonarr_without_blocklisting",
@@ -888,7 +888,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                         report["proposed_actions"] = [
                             "blocklist_release_in_owning_sonarr",
                             "remove_torrent_and_data_through_sonarr",
-                            "obtain_targeted_replacement_after_retry_settings_verified",
+                            "let_owning_sonarr_handle_its_normal_replacement_search",
                         ]
         except GuardError as e:
             reason = str(e)
@@ -917,7 +917,7 @@ def recheck_candidate(original, config, qb, apis):
         raise SafetyError("torrent_identity_scan_time_limit_reached")
     if len(reports) != 1 or reports[0].get("decision") != "would_fail":
         raise SafetyError("candidate_no_longer_eligible")
-    readiness = read_readiness({target[0]: apis[target[0]]})[target[0]]
+    readiness = {} if file_policy_removal(reports[0]) else read_readiness({target[0]: apis[target[0]]})[target[0]]
     return {"assessment": reports[0], "readiness": readiness}
 
 
