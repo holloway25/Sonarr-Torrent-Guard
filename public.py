@@ -13,6 +13,7 @@ from guard import (Api, GuardError, hard_deadline, load_config, run, recheck_can
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
 from production import OutcomeVerifier, check_prior_attempts
 from safety import ACTION_JOURNAL_FILE, Journal, SafetyError, check_fresh, open_lock_file, reconcile
+from workflow import manual_handling_reason
 
 RECOVERY_LIMIT = 5
 RECOVERY_SECONDS = 30
@@ -103,7 +104,16 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
         reports = run(config, qb, apis, batch_state=batch_state)
     # Rotation is independent of assessment. Even an attempted verification
     # that exhausts this phase gives the next candidate first turn next cycle.
-    candidates = sorted(((r["instance"], r["hash"]), r) for r in reports if r["decision"] == "would_fail")
+    candidates = []
+    for report in reports:
+        if report["decision"] != "would_fail":
+            continue
+        reason = manual_handling_reason(report)
+        if reason is None:
+            candidates.append(((report["instance"], report["hash"]), report))
+        else:
+            report["safeguards"] = {"status": "manual_review", "reason": reason, "live_enabled": False}
+    candidates.sort(key=lambda item: item[0])
     after = tuple(batch_state.get("verification_after", ()))
     candidates = [entry for entry in candidates if entry[0] > after] + [
         entry for entry in candidates if entry[0] <= after]

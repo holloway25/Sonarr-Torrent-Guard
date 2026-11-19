@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 
 from reports import human_report, json_events
-from workflow import preview_failure, read_readiness
+from workflow import manual_handling_reason, preview_failure, read_readiness
 from safety import Journal, SafetyError, open_lock_file, record_preview
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
@@ -853,18 +853,24 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             if include_titles and isinstance(t.get("name"), str):
                 report["title"] = t["name"]
             if reasons:
-                report["proposed_actions"] = [
-                    "blocklist_release_in_owning_sonarr",
-                    "remove_torrent_and_data_through_sonarr",
-                    "obtain_targeted_replacement_after_retry_settings_verified",
-                ]
-                if reasons == ["metadata_timeout"]:
-                    report["queue_rows"] = sorted([r["id"], r["episodeId"], h] for r in rows)
-                    report["proposed_actions"] = [
-                        "remove_torrent_and_data_through_sonarr_without_blocklisting",
-                        "request_owning_sonarr_episode_search_after_confirmed_removal_and_final_checks",
-                    ]
-                report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
+                manual_reason = manual_handling_reason(report)
+                if manual_reason is not None:
+                    report["manual_handling_reason"] = manual_reason
+                    report["proposed_actions"] = ["review_release_manually_in_sonarr"]
+                else:
+                    report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
+                    if reasons == ["metadata_timeout"]:
+                        report["queue_rows"] = sorted([r["id"], r["episodeId"], h] for r in rows)
+                        report["proposed_actions"] = [
+                            "remove_torrent_and_data_through_sonarr_without_blocklisting",
+                            "request_owning_sonarr_episode_search_after_confirmed_removal_and_final_checks",
+                        ]
+                    else:
+                        report["proposed_actions"] = [
+                            "blocklist_release_in_owning_sonarr",
+                            "remove_torrent_and_data_through_sonarr",
+                            "obtain_targeted_replacement_after_retry_settings_verified",
+                        ]
         except GuardError as e:
             reason = str(e)
             if reason in ("run_time_limit_reached", "torrent_identity_scan_time_limit_reached") or time.monotonic() >= deadline:
@@ -998,6 +1004,10 @@ def main():
                         try:
                             for report in reports:
                                 if report["decision"] != "would_fail":
+                                    continue
+                                reason = manual_handling_reason(report)
+                                if reason is not None:
+                                    report["safeguards"] = {"status": "manual_review", "reason": reason, "live_enabled": False}
                                     continue
                                 try:
                                     row = record_preview(journal, report, lambda: recheck_candidate(report, config, qb, apis))

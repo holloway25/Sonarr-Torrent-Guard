@@ -18,8 +18,8 @@ priority change or filesystem cleanup is implemented.
 A non-root Docker image and GitHub build/publish workflow are implemented.
 Runtime environment variables supply connections and credentials; nothing private
 is baked into the image. Persistent appdata keeps journal/config/logs across
-updates. The container defaults to dry-run. Set `STGUARD_MODE=live` to allow
-qualifying cleanup. Existing installs confirm their cleanup scope once at cutover
+updates. The container defaults to dry-run. `STGUARD_MODE=live` only allows
+qualifying metadata retries. Existing installs confirm their scope once at cutover
 and again only if it changes. Publishing never deploys it. See
 [container setup](docs/CONTAINER.md) before activation or migration.
 Retention application remains separately disabled.
@@ -123,9 +123,11 @@ followed by one explicitly journaled episode search after confirmed removal.
 There is no three-attempt escalation. Sonarr selects the replacement using its
 normal rules; it may choose the same release again. The separate metadata-retry
 policy gate is enabled. Sender gates and explicit live mode still apply. Docker
-uses its mode switch and standalone routine workers use a private grant. File-policy failures
-continue to use immediate blocklisting and native Sonarr retry. See
-[metadata retry](docs/METADATA-RETRY.md) for request and recovery details.
+uses its mode switch and standalone routine workers use a private grant.
+File-policy failures require manual review in Sonarr. Guard cannot verify
+the full blocklist scope from public history, so it sends no automated removal
+for those candidates. See [metadata retry](docs/METADATA-RETRY.md) and the
+[blocklist scope limitation](docs/PUBLIC-WORKFLOW.md#file-policy-blocklist-scope).
 
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
 state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
@@ -219,8 +221,8 @@ approval file is created by the app. There is no single-test CLI live switch. It
 worker lock, captures baselines, rechecks immediately before intent/dispatch,
 commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
-It never directly deletes from qBittorrent. File-policy failures never submit an
-extra search; the separately gated metadata retry is the explicit exception.
+Sonarr owns the downloader operation. Only the separately gated metadata
+retry can send an additional search.
 
 After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
 version, then revalidates the saved final snapshot's freshness and approval expiry

@@ -1,6 +1,19 @@
 """Read-only readiness checks and request previews; contains no live executor."""
 
 
+# Sonarr's public history can omit grabs used by the blocklist operation.
+# No supported API supplies equivalent evidence for automatic blocklisting.
+BLOCKLIST_SCOPE_VERIFIABLE = False
+BLOCKLIST_MANUAL_REASON = "sonarr_blocklist_scope_unverifiable"
+
+
+def manual_handling_reason(report):
+    if (report.get("decision") == "would_fail" and report.get("reasons") != ["metadata_timeout"]
+            and not BLOCKLIST_SCOPE_VERIFIABLE):
+        return BLOCKLIST_MANUAL_REASON
+    return None
+
+
 def read_readiness(apis):
     result = {}
     fields = ("autoRedownloadFailed", "autoRedownloadFailedFromInteractiveSearch")
@@ -34,6 +47,10 @@ def preview_failure(report, readiness):
             or not isinstance(ids, list) or not ids
             or any(not isinstance(i, int) or isinstance(i, bool) or i <= 0 for i in ids)):
         plan["blockers"].append("not_a_verified_public_candidate")
+        return plan
+    reason = manual_handling_reason(report)
+    if reason is not None:
+        plan.update(status="manual_review", blockers=[reason])
         return plan
     if readiness.get("status") != "verified":
         plan["blockers"].append("retry_settings_unverified")

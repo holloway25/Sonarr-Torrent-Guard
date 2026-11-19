@@ -59,13 +59,13 @@ adapters. Enable
 `--check-safeguards` to exercise rechecks against the APIs. New preview entries go
 into `preview-journal.sqlite3` so they have their own capacity.
 
-## Proposed normal path
+## Proposed file-policy path
 
-The following failure/blocklist/native-retry path applies to **file-policy
-failures**. Metadata timeouts instead use the separately authorized policy
-in [metadata retry](METADATA-RETRY.md): remove without blocklisting, then
-one affected-episode search only after confirmed removal. It is not deployed by
-changing these documents, and never escalates to blocklisting after three attempts.
+The steps below describe a possible future failure, blocklist and native-retry
+workflow. File-policy candidates currently require manual review because Sonarr's
+public history cannot prove the blocklist scope. Metadata timeouts use the
+separately authorized [metadata retry](METADATA-RETRY.md) policy, which removes
+without blocklisting and requests one affected-episode search after confirmed removal.
 
 1. Require successful Sonarr-side connectivity diagnostics for both owners; wait
    until the next ten-minute cycle during maintenance, without downloader-only
@@ -140,16 +140,13 @@ appropriate client-side verification without adding broad filesystem access.
 
 ## Current preview contract
 
-`workflow.py` only reads retry configuration and creates a `request_preview`
-dictionary. It never sends the described request. Every preview remains blocked
-by `live_sender_disabled` and `fresh_recheck_required`, plus any retry
-setting problems. A protected/kept/unidentified candidate gets no request preview.
-Multiple queue rows yield one removal preview. File-policy failures plan no
-additional search: owning Sonarr's native failure handler handles retry. The
-separately gated metadata-timeout exception previews removal without blocklisting
-and an explicit affected-episode search only after confirmed removal and final
-safety checks; see [metadata retry](METADATA-RETRY.md). Both previews are
-descriptions only, never dispatch permission.
+File-policy candidates receive `manual_review` with
+`sonarr_blocklist_scope_unverifiable` and no request preview. Protected, kept
+and unidentified torrents also receive no request preview. The separately
+gated [metadata retry](METADATA-RETRY.md) previews one removal without
+blocklisting and an affected-episode search after confirmed removal and
+final safety checks. This preview describes the requests and grants no
+dispatch permission.
 
 `safety.py` compares ownership and manifest fingerprints from fresh assessment,
 checks public eligibility, both retry switches and a ten-second maximum snapshot
@@ -223,11 +220,20 @@ with series filtering, such as
 reduces the volume of unrelated entries. Guard correlates torrent blocklist entries
 using protocol, a release-title digest, indexer, series, episode IDs and newly
 added record IDs. Failure history must also match the original hash.
-Guard reads all Sonarr grabs for the exact queue download ID when preparing a
-blocklisting deletion and repeats the read immediately before sending. Their episode set must match
-the approved target, and the newest grab must match the approved release,
-indexer and downloader. Sonarr uses these grabs to select the failed episodes
-and release metadata. [Sonarr failed-download implementation](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs#L53-L60)
+### File-policy blocklist scope
+
+Automatic blocklisting and removal remain disabled. In Sonarr v4.0.20.3014,
+the public history query joins existing episodes. The internal download-ID
+lookup can still include a deleted episode and use its grab when choosing
+the release or episode set to blocklist. In v4.0.0.748, the failure handler
+selects the last internally returned grab. A public history query sorted by
+date cannot prove that selection either. Guard reports these candidates for
+manual review even if the visible grabs agree. [History repository](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/History/HistoryRepository.cs)
+[Newer selection](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs#L53-L60)
+[Older selection](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/NzbDrone.Core/Download/FailedDownloadService.cs#L115-L128)
+
+### Ownership and outcome checks
+
 An explicitly conflicting indexer in a matching queue row also holds
 cleanup. A missing queue indexer can be established by verified grab history.
 After a standalone owner is renamed, recovery can use the stored binding
@@ -379,7 +385,8 @@ The known blank-category warning alone is accepted, identified by Sonarr's own
 Other warnings/errors, redirects, outages or malformed responses make the cycle
 wait. Connectivity is
 rechecked by disabled senders before preparation, before intent, and after commit.
-All actual public removals/blocklists/native retries still go through Sonarr.
+Sonarr owns the allowed metadata removal and episode search. File-policy
+candidates remain manual.
 
 Timer templates under `deploy/` run only the dry-run CLI at ten-minute intervals
 after completion; they are not installed/enabled. No long sleeps or catch-up

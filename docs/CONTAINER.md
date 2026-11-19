@@ -70,7 +70,7 @@ by the operator; they are not claimed to be hidden from root.
 
 | Variables | Meaning |
 | --- | --- |
-| `STGUARD_MODE` | Defaults to `dry-run`. Set `live` to enable qualifying cleanup. |
+| `STGUARD_MODE` | Defaults to `dry-run`. Live mode permits qualifying metadata retries. File-policy findings require manual review. |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
 | `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
@@ -110,6 +110,13 @@ the database and its `container-live-journal.json` marker. A normal start can
 restore an interrupted marker write when the independent binding proves the
 journal's identity. If the first SQLite binding was also interrupted, Guard
 can finish binding the original, unchanged database file.
+
+After an interrupted SQLite write, normal startup takes the worker lock,
+checks the installed journal identity, lets SQLite roll back the interrupted
+transaction, then validates the recovered journal before scheduling a cycle.
+`--check-config` reports `container_journal_rollback_required` without
+changing the database or its rollback file. Leave both files together for
+normal startup to recover. [SQLite rollback recovery](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals)
 
 Container cycles and direct container-mode workers require both records to
 agree with the database. A missing or different journal holds the worker.
@@ -164,8 +171,9 @@ Docker log rotation on the host too. No automatic journal archival is enabled.
 
 ## Live mode and cutover
 
-Set `STGUARD_MODE=live` to enable qualifying Sonarr cleanup. Unset the variable
-or set it to `dry-run` for reporting only. Apply a mode change by recreating the
+`STGUARD_MODE=live` permits qualifying metadata retries through Sonarr.
+File-policy findings still require manual review. Unset the variable or set it
+to `dry-run` for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.
 

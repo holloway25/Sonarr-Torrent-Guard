@@ -24,7 +24,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "replacement_blocklist_uncertain", "run_time_limit_reached",
                          "container_journal_missing", "container_journal_identity_mismatch",
                          "container_journal_marker_missing", "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
-                         "sonarr_blocklist_scope_unverified", "retry_settings_not_ready"}
+                         "sonarr_blocklist_scope_unverified", "sonarr_blocklist_scope_unverifiable", "retry_settings_not_ready"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
@@ -118,6 +118,64 @@ def check_fresh(original, refreshed, now=None, maximum_age=10):
     return after
 
 
+def read_installation_id(db):
+    exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='installation_identity'").fetchone()
+    if exists is None:
+        return None
+    rows = db.execute("SELECT singleton,id FROM installation_identity").fetchall()
+    if len(rows) != 1 or rows[0][0] != 1 or not valid_digest(rows[0][1]):
+        raise SafetyError("container_journal_identity_mismatch")
+    return rows[0][1]
+
+
+def validate_journal_sidecars(path, *, harden=False):
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        try:
+            mode = sidecar.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise SafetyError("journal_symlink_refused")
+        if not stat.S_ISREG(mode):
+            raise SafetyError("journal_requires_private_directory")
+        if harden:
+            sidecar.chmod(0o600)
+
+
+def recover_bound_journal_rollback(path, expected_id):
+    """Recover one existing journal under the shared worker lock."""
+    if not valid_digest(expected_id):
+        raise SafetyError("container_journal_identity_mismatch")
+    if path.parent.stat().st_mode & 0o077:
+        raise SafetyError("journal_requires_private_directory")
+
+    def identity():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise SafetyError("journal_requires_private_directory")
+        return info.st_dev, info.st_ino
+
+    original_file = identity()
+    validate_journal_sidecars(path)
+    uri = path.absolute().as_uri()
+    # The installation ID is written once and is outside routine transactions.
+    # Read only that ID from the main file without triggering rollback. Never
+    # use this view for action rows or any other startup validation.
+    with contextlib.closing(sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True, timeout=5)) as db:
+        if read_installation_id(db) != expected_id:
+            raise SafetyError("container_journal_identity_mismatch")
+    if identity() != original_file:
+        raise SafetyError("container_journal_identity_mismatch")
+    validate_journal_sidecars(path)
+    with contextlib.closing(sqlite3.connect(uri + "?mode=rw", uri=True, timeout=5)) as db:
+        # SQLite applies its rollback before serving this query. No application
+        # writes, schema migration or replacement of the database happens here.
+        if read_installation_id(db) != expected_id or identity() != original_file:
+            raise SafetyError("container_journal_identity_mismatch")
+
+
 class Journal:
     """A private SQLite journal under the already-private external config folder.
 
@@ -138,6 +196,7 @@ class Journal:
             if (not stat.S_ISREG(mode) or mode & 0o077
                     or allow_single_test or allow_public_attempt or allow_archive):
                 raise SafetyError("journal_requires_private_directory")
+            validate_journal_sidecars(self.path)
             self.limit = limit
             self.allow_single_test = self.allow_public_attempt = self.allow_archive = False
             self.db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
@@ -176,12 +235,7 @@ class Journal:
                 os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
-        for suffix in ("-journal", "-wal", "-shm"):
-            sidecar = Path(str(self.path) + suffix)
-            if sidecar.is_symlink():
-                raise SafetyError("journal_symlink_refused")
-            if sidecar.exists():
-                sidecar.chmod(0o600)
+        validate_journal_sidecars(self.path, harden=True)
         self.limit = limit
         self.allow_single_test = allow_single_test is True
         self.allow_public_attempt = allow_public_attempt is True
@@ -255,14 +309,7 @@ class Journal:
                 if self.db.execute("SELECT 1 FROM installation_identity").fetchone() is None:
                     self.db.execute("INSERT INTO installation_identity VALUES (1,?)",
                                     (identifier if identifier is not None else secrets.token_hex(32),))
-        exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                                 "AND name='installation_identity'").fetchone()
-        if exists is None:
-            return None
-        rows = self.db.execute("SELECT singleton,id FROM installation_identity").fetchall()
-        if len(rows) != 1 or rows[0][0] != 1 or not valid_digest(rows[0][1]):
-            raise SafetyError("container_journal_identity_mismatch")
-        return rows[0][1]
+        return read_installation_id(self.db)
 
     def close(self):
         self.db.close()

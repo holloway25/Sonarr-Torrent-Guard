@@ -26,6 +26,7 @@ from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
 from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, open_lock_file, reconcile, replacement_already_observed, valid_digest)
 from maintenance import require_connectivity
+import workflow
 from workflow import read_readiness
 
 
@@ -613,6 +614,8 @@ def _send_queue_delete(api, queue_id, blocklist=True):
         raise SafetyError("invalid_queue_id")
     if not isinstance(blocklist, bool) or (not blocklist and METADATA_RETRY_RELEASE_ENABLED is not True):
         raise SafetyError("live_execution_disabled")
+    if blocklist and not workflow.BLOCKLIST_SCOPE_VERIFIABLE:
+        raise SafetyError(workflow.BLOCKLIST_MANUAL_REASON)
     params = {"removeFromClient": "true", "blocklist": "true" if blocklist else "false",
               "skipRedownload": "false" if blocklist else "true", "changeCategory": "false"}
     url = api.config["url"].rstrip("/") + "/api/v3/queue/" + str(queue_id) + "?" + urllib.parse.urlencode(params)
@@ -893,6 +896,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 return journal.transition(key, "prepared", "cancelled", stop_reason="abandoned_before_dispatch")
             verifier = OutcomeVerifier(config, qb, apis, old["context"], old["dispatched_at"])
             return reconcile(journal, key, verifier.observe)
+        reason = workflow.manual_handling_reason(report)
+        if reason is not None:
+            raise SafetyError(reason)
         # Both sender modes share related-record holds. A single-test approval
         # must never provide an alternate route around a public-attempt hold.
         # Recovery of this exact existing operation above remains read-only.
@@ -900,6 +906,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
         require_connectivity(config, apis[report["instance"]], report["instance"])
         fresh = recheck_candidate(report, config, qb, apis)
         check_fresh(report, fresh)
+        reason = workflow.manual_handling_reason(fresh["assessment"])
+        if reason is not None:
+            raise SafetyError(reason)
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
         policy = metadata_policy(fresh["assessment"])
         if policy is not None:
@@ -928,6 +937,9 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             # events already present before this send cannot become its outcome.
             final_snapshot = recheck_candidate(report, config, qb, apis)
             check_fresh(report, final_snapshot)
+            reason = workflow.manual_handling_reason(final_snapshot["assessment"])
+            if reason is not None:
+                raise SafetyError(reason)
             validate()
             refreshed_context = capture_context(config, apis[report["instance"]],
                 final_snapshot["assessment"], digest(approval["nonce"]),

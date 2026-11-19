@@ -78,20 +78,22 @@ class MetadataTests(unittest.TestCase):
         event = list(json_events([report], {}, "test time"))[0]
         self.assertEqual(event["proposed_actions"], report["proposed_actions"])
 
-    def test_file_failure_human_and_json_proposals_still_blocklist(self):
+    def test_file_failure_human_and_json_proposals_request_manual_review(self):
         self.t["state"] = "stalledUP"
         self.f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
         report = self.assess()
-        self.assertIn("blocklist_release_in_owning_sonarr", report["proposed_actions"])
-        self.assertIn("blocklists and handles retry", human_report([report], {}, "test time"))
+        self.assertEqual(report["proposed_actions"], ["review_release_manually_in_sonarr"])
+        output = human_report([report], {}, "test time")
+        self.assertIn("Manual review in Sonarr required", output)
+        self.assertNotIn("blocklists and handles retry", output)
         event = list(json_events([report], {}, "test time"))[0]
-        self.assertIn("blocklist_release_in_owning_sonarr", event["proposed_actions"])
+        self.assertEqual(event["manual_handling_reason"], "sonarr_blocklist_scope_unverifiable")
 
 
 class MetadataSenderTests(unittest.TestCase):
     def setUp(self):
         self.f = production_fixtures.ProductionTests()
-        self.f.setUp()
+        self.f.setUp(blocklist_verifiable=False)
         self.f.journal.allow_public_attempt = True
         self.t = self.f.qb.routes["/api/v2/torrents/info"][0]
         # Fixture's torrent is ten minutes old; use a matching older grab.

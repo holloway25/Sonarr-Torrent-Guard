@@ -36,6 +36,92 @@ class ContainerTests(unittest.TestCase):
         patcher.start(); self.addCleanup(patcher.stop)
         self.env = example_environment()
 
+    def test_journal_fingerprint_and_first_setup_work_without_hashlib_file_digest(self):
+        import hashlib
+
+        fixture = self.path / "sample"
+        contents = b"abcdef" * 200000
+        fixture.write_bytes(contents)
+        info = fixture.stat()
+        checksum = hashlib.sha256(contents).hexdigest()
+        expected = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{checksum}".encode()).hexdigest()
+        with patch.object(worker.hashlib, "file_digest", create=True, side_effect=AttributeError):
+            self.assertEqual(worker.journal_fingerprint(fixture), expected)
+            fixture.unlink()
+            result, cycle, _ = self.run_mode(self.env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+
+    def test_interrupted_sqlite_rollback_is_read_only_in_check_and_recovers_on_startup(self):
+        import fcntl
+        from safety import Journal
+        from contextlib import closing
+
+        self.legacy_hold()
+        env = dict(self.env, STGUARD_MODE="live")
+        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
+        path = self.path / worker.JOURNAL_FILE
+        rollback = path.with_name(path.name + "-journal")
+        command = """
+import os
+import sqlite3
+import sys
+
+database = sqlite3.connect(sys.argv[1])
+database.execute("PRAGMA cache_size=2")
+database.execute("PRAGMA cache_spill=ON")
+database.execute("BEGIN IMMEDIATE")
+database.execute("UPDATE actions SET stage='cleanup_resolved'")
+database.execute("CREATE TABLE abandoned_write (value BLOB)")
+for _ in range(12):
+    database.execute("INSERT INTO abandoned_write VALUES (zeroblob(16384))")
+os._exit(0)
+"""
+        subprocess.run([sys.executable, "-c", command, str(path)], check=True, timeout=10)
+        before = path.read_bytes(), rollback.read_bytes()
+
+        result, cycle, error = self.run_mode(env, "--check-config")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_rollback_required", error)
+        cycle.assert_not_called()
+        self.assertTrue(rollback.is_file())
+        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
+
+        # A repair must hold the worker lock and verify durable identity
+        # before SQLite is allowed to alter either file.
+        with (self.path / "guard.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result, cycle, _ = self.run_mode(env, "--once")
+            self.assertEqual(result, 1)
+            cycle.assert_not_called()
+        self.assertTrue(rollback.is_file())
+        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
+
+        marker = self.path / worker.JOURNAL_MARKER
+        binding = self.path / worker.JOURNAL_BINDING
+        original = json.loads(marker.read_text())
+        wrong = {"journal_id": "b" * 64}
+        for record in (marker, binding):
+            worker.atomic_json(record, wrong)
+        result, cycle, error = self.run_mode(env, "--once")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_identity_mismatch", error)
+        cycle.assert_not_called()
+        self.assertTrue(rollback.is_file())
+        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
+        for record in (marker, binding):
+            worker.atomic_json(record, original)
+
+        result, cycle, error = self.run_mode(env, "--once")
+        self.assertEqual(result, 0, error)
+        cycle.assert_called_once()
+        self.assertFalse(rollback.exists())
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
+            self.assertIsNone(journal.db.execute("SELECT name FROM sqlite_master "
+                                                 "WHERE name='abandoned_write'").fetchone())
+        self.assertEqual(self.run_mode(env, "--once")[0], 0)
+
     def test_environment_builds_both_owners_with_private_exclusions_only(self):
         config = worker.runtime_config(self.env)
         self.assertTrue(config["dry_run"])

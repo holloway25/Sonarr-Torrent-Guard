@@ -31,8 +31,8 @@ For file configuration:
 Guard checks the same classification during assessment and before dispatch.
 The full source policy is bound to each candidate's ownership fingerprint.
 A mode or list change invalidates a standalone grant whose approved scope no
-longer matches. In Docker, `STGUARD_MODE=live` enables qualifying cleanup
-within the confirmed scope. A changed list blocks live cleanup until the
+longer matches. In Docker, `STGUARD_MODE=live` permits qualifying metadata
+retries within the confirmed scope. File-policy findings stay manual. A changed list blocks live cleanup until the
 operator confirms the new scope. See [container setup](CONTAINER.md#live-mode-and-cutover).
 
 ## Existing configurations and migration

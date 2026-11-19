@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ from guard import GuardError, load_config, open_regular_file, source_policy_key
 from safety import ACTION_JOURNAL_FILE as JOURNAL_FILE
 from safety import CONTAINER_JOURNAL_BINDING as JOURNAL_BINDING
 from safety import CONTAINER_JOURNAL_MARKER as JOURNAL_MARKER
-from safety import Journal, SafetyError, open_lock_file
+from safety import Journal, SafetyError, open_lock_file, recover_bound_journal_rollback
 
 CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
@@ -102,7 +103,7 @@ def atomic_json(path, value):
             temporary.unlink()
 
 
-def configure(env, *, check_only=False, validate=None):
+def configure(env, *, check_only=False, validate=None, recover_journal=False):
     path = CONFIG_DIR / "connections.json"
     if path.is_symlink():
         raise GuardError("container_private_appdata_required")
@@ -143,7 +144,7 @@ def configure(env, *, check_only=False, validate=None):
         candidate = load_config(path)
     else:
         raise GuardError("container_configuration_invalid")
-    validate_journal_identity(candidate)
+    validate_journal_identity(candidate, recover=recover_journal and not check_only)
     if validate is not None:
         validate(candidate)
     if source == "env" and not check_only:
@@ -164,8 +165,10 @@ def require_journal_if_previously_bound(marker, binding):
 def journal_fingerprint(path):
     with open_regular_file(path, nofollow=True) as (file, _):
         info = os.fstat(file.fileno())
-        contents = hashlib.file_digest(file.buffer, "sha256").hexdigest()
-        return hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{contents}".encode()).hexdigest()
+        contents = hashlib.sha256()
+        for chunk in iter(lambda: file.buffer.read(1024 * 1024), b""):
+            contents.update(chunk)
+        return hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{contents.hexdigest()}".encode()).hexdigest()
 
 
 def check_journal_binding(journal, marker, binding):
@@ -186,15 +189,38 @@ def check_journal_binding(journal, marker, binding):
     raise SafetyError("container_journal_identity_mismatch")
 
 
-def validate_journal_identity(config):
-    from production import binding_digest
-
+def validate_journal_identity(config, *, recover=False):
     path = CONFIG_DIR / JOURNAL_FILE
     marker = read_container_journal_id(CONFIG_DIR)
     binding = read_container_journal_binding(CONFIG_DIR)
     if not path.exists() and not path.is_symlink():
         require_journal_if_previously_bound(marker, binding)
         return
+    try:
+        validate_journal_rows(config, path, marker, binding)
+    except sqlite3.OperationalError as error:
+        code = getattr(error, "sqlite_errorcode", None)
+        rollback = path.with_name(path.name + "-journal")
+        # CPython before 3.11 did not expose SQLite's extended result code.
+        if code != getattr(sqlite3, "SQLITE_READONLY_ROLLBACK", 776) and not (
+                code is None and str(error) == "attempt to write a readonly database" and rollback.is_file()):
+            raise
+        if not recover:
+            raise SafetyError("container_journal_rollback_required") from None
+        with open_lock_file(CONFIG_DIR / "guard.lock") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            marker = read_container_journal_id(CONFIG_DIR)
+            binding = read_container_journal_binding(CONFIG_DIR)
+            expected = binding["journal_id"] if binding is not None else marker
+            if marker is not None and marker != expected:
+                raise SafetyError("container_journal_identity_mismatch")
+            recover_bound_journal_rollback(path, expected)
+            validate_journal_rows(config, path, marker, binding)
+
+
+def validate_journal_rows(config, path, marker, binding):
+    from production import binding_digest
+
     with closing(Journal(path, read_only=True)) as journal:
         check_journal_binding(journal, marker, binding)
         keys = journal.db.execute("SELECT key FROM actions").fetchall()
@@ -356,7 +382,8 @@ def main():
                 elif approved != expected:
                     raise SafetyError("container_live_scope_confirmation_required")
 
-            path = configure(os.environ, check_only=args.check_config, validate=validate_scope)
+            path = configure(os.environ, check_only=args.check_config, validate=validate_scope,
+                             recover_journal=not args.check_config)
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0
@@ -389,7 +416,8 @@ def main():
         reason = "another_container_worker_is_active"
     except SafetyError as error:
         allowed = {"container_live_scope_confirmation_required", "container_journal_missing",
-                   "container_journal_identity_mismatch", "container_journal_marker_missing", "invalid_worker_lock"}
+                   "container_journal_identity_mismatch", "container_journal_marker_missing",
+                   "container_journal_rollback_required", "invalid_worker_lock"}
         reason = str(error) if str(error) in allowed else "container_configuration_or_startup_unavailable"
     except Exception:
         # Environment/config/HTTP exceptions can contain credentials: never print them.

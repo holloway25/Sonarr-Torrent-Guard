@@ -14,7 +14,13 @@ from tools.tests.test_guard import FakeApi, manifest
 
 
 class ProductionTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self, *, blocklist_verifiable=True):
+        # Exercise historical file-action safeguards solely with synthetic
+        # blocklist parity and mocked outbound requests.
+        if blocklist_verifiable:
+            proof = patch("workflow.BLOCKLIST_SCOPE_VERIFIABLE", True)
+            proof.start()
+            self.addCleanup(proof.stop)
         for name, value in (("wait_for_event_boundary", None), ("event_boundary_reached", True)):
             boundary = patch("production." + name, return_value=value)
             boundary.start()
@@ -1395,6 +1401,53 @@ class ProductionTests(unittest.TestCase):
             self.assertIn(param, request.full_url)
         with self.assertRaises(SafetyError):
             production.RejectDeleteRedirect().redirect_request(None)
+
+
+class ManualBlocklistTests(unittest.TestCase):
+    def setUp(self):
+        self.f = ProductionTests()
+        self.f.setUp(blocklist_verifiable=False)
+        self.addCleanup(self.f.doCleanups)
+        self.addCleanup(self.f.tearDown)
+        self.f.journal.allow_public_attempt = True
+
+    def test_public_history_with_hidden_private_grabs_is_manual_in_workers_and_senders(self):
+        import public
+        from workflow import BLOCKLIST_MANUAL_REASON, preview_failure
+
+        f = self.f
+        private = dict(f.grab, id=6, episodeId=444,
+                       data={**f.grab["data"], "indexer": "Private Source"})
+        # Sonarr's blocklisting code can see both rows. Its public history
+        # endpoint omits the private grab after its episode has been deleted.
+        internal_history = [f.grab, private]
+        visible = [row for row in internal_history if row["episodeId"] == 3]
+        f.s.routes["/api/v3/history"] = {"totalRecords": len(visible), "records": visible}
+        f.qb.login = Mock()
+        for parts in ((4, 0, 20, 3014), (4, 0, 0, 748)):
+            version = ".".join(map(str, parts))
+            with self.subTest(version=version), patch("public.require_connectivity"), patch(
+                    "production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                    "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                    "production._send_queue_delete") as remove:
+                f.s.routes["/api/v3/system/status"] = {"version": version}
+                result = public.cycle(f.config, f.qb, f.apis, f.journal, {})
+                report, = result["assessment"]
+                self.assertEqual(report.get("manual_handling_reason"), BLOCKLIST_MANUAL_REASON)
+                self.assertEqual(report["safeguards"]["status"], "manual_review")
+                self.assertEqual(report["proposed_actions"], ["review_release_manually_in_sonarr"])
+                self.assertIsNone(preview_failure(report, {})["request_preview"])
+                for execute in (production.execute_single_test, production.execute_public_attempt):
+                    with self.assertRaisesRegex(SafetyError, BLOCKLIST_MANUAL_REASON):
+                        execute(f.config, f.qb, f.apis, f.journal, report, f.approval)
+                self.assertEqual(f.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+                remove.assert_not_called()
+
+    def test_transport_blocks_file_action_even_when_other_release_gates_are_enabled(self):
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
+            with self.assertRaisesRegex(SafetyError, "^sonarr_blocklist_scope_unverifiable$"):
+                production._send_queue_delete(self.f.s, 7, blocklist=True)
+        opener.assert_not_called()
 
 
 if __name__ == "__main__":

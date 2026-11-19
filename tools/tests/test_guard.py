@@ -610,16 +610,13 @@ class ReportingWorkflowTests(unittest.TestCase):
                        "public_source_confirmed": True, "queue_ids": [7, 9]}
         self.ready = {"status": "verified", "automatic_retry": True, "interactive_retry": True}
 
-    def test_proposal_has_one_sonarr_operation_and_no_extra_search(self):
+    def test_file_failure_preview_requires_manual_review_without_a_delete_request(self):
         plan = preview_failure(self.report, self.ready)
-        self.assertEqual(plan["request_preview"], {
-            "method": "DELETE", "path": "/api/v3/queue/7",
-            "params": {"removeFromClient": True, "blocklist": True,
-                       "skipRedownload": False, "changeCategory": False}})
+        self.assertEqual(plan["status"], "manual_review")
+        self.assertIsNone(plan["request_preview"])
         self.assertFalse(plan["live_enabled"])
         self.assertFalse(plan["extra_search"])
-        self.assertIn("fresh_recheck_required", plan["blockers"])
-        self.assertIn("live_sender_disabled", plan["blockers"])
+        self.assertEqual(plan["blockers"], ["sonarr_blocklist_scope_unverifiable"])
 
     def test_disabled_or_unverified_retries_are_explicit_blockers(self):
         cases = [({}, "retry_settings_unverified"),
@@ -627,7 +624,8 @@ class ReportingWorkflowTests(unittest.TestCase):
                  (dict(self.ready, interactive_retry=False), "interactive_retry_disabled")]
         for ready, reason in cases:
             with self.subTest(reason=reason):
-                self.assertIn(reason, preview_failure(self.report, ready)["blockers"])
+                metadata = dict(self.report, reasons=["metadata_timeout"], episode_ids=[3])
+                self.assertIn(reason, preview_failure(metadata, ready)["blockers"])
 
     def test_protected_or_invalid_candidates_have_no_request_preview(self):
         cases = [dict(self.report, decision="keep"), dict(self.report, decision="skip"),

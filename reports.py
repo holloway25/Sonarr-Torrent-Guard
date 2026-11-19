@@ -3,6 +3,8 @@
 import collections
 import json
 
+from workflow import manual_handling_reason
+
 
 REASONS = {
     "metadata_timeout": "metadata unavailable 30 minutes after addition (not a malware verdict)",
@@ -14,6 +16,7 @@ REASONS = {
     "private_source_protected": "private source protected",
     "unclassified_source_protected": "source has not been classified",
     "conflicting_queue_source_protected": "the Sonarr queue source disagrees with the verified grab",
+    "sonarr_blocklist_scope_unverifiable": "Sonarr may blocklist grabs that its history API does not show",
     "work_limit_reached": "deferred to a later batch",
     "torrent_identity_scan_time_limit_reached": "could not verify all qBittorrent identities within the cycle budget",
     "sonarr_downloader_binding_mismatch": "Sonarr downloader no longer matches its binding",
@@ -58,6 +61,10 @@ def human_report(reports, readiness, timestamp):
                 message += ": " + safety["reason"].replace("_", " ")
             lines.append("  Fresh recheck/journal: " + message + " (live execution disabled)")
         if report["decision"] == "would_fail":
+            reason = report.get("manual_handling_reason") or manual_handling_reason(report)
+            if reason is not None:
+                lines.append("  Manual review in Sonarr required. " + REASONS.get(reason, reason.replace("_", " ")) + ".")
+                continue
             if report.get("reasons") == ["metadata_timeout"]:
                 lines.append("  Proposed after approval/checks: Sonarr removes torrent/data WITHOUT blocklisting; "
                              "after confirmed removal and final checks, request an affected-episode search.")

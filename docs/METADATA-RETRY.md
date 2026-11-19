@@ -24,8 +24,9 @@ no hash/indexer timeout ban and no new attempt-counter database. Repeated metada
 timeouts may therefore lead to repeated searches until the trial expires or the
 existing bounded journal reaches capacity and fails closed.
 
-File-policy failures are unchanged: immediately blocklist and let Sonarr's native
-failed-download retry run. Never add a second search for those failures. Existing
+File-policy failures require manual review in Sonarr because Guard cannot
+verify the complete blocklist scope. The metadata retry workflow does not
+apply to those failures. Existing
 blocklist entries are not removed or bypassed: Sonarr can reject the same known
 hash across indexers for the series. No direct qBittorrent deletion, file deletion,
 selection, resume, tracker/DHT change, indexer selection or scoring change is added.
