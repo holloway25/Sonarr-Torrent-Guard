@@ -19,7 +19,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "routine_authorization_revoked_or_changed", "container_live_scope_confirmation_required",
                          "routine_candidate_not_authorized", "target_reappeared", "replacement_already_queued",
                          "replacement_already_grabbed", "replacement_history_ambiguous", "replacement_client_unknown",
-                         "replacement_history_identity_invalid", "replacement_history_event_invalid",
+                         "replacement_history_identity_invalid", "replacement_history_event_invalid", "replacement_history_unavailable",
                          "replacement_queue_identity_invalid", "replacement_blocklisted",
                          "replacement_blocklist_uncertain", "run_time_limit_reached",
                          "container_journal_missing", "container_journal_identity_mismatch",

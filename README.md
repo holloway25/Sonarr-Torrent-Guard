@@ -53,8 +53,9 @@ JSON-line events suitable for future UI/scheduler integration. Optional
 JSON events or log files. Runtime reports must stay outside the repository.
 
 Use `--check-safeguards` to perform a second, targeted read-only assessment for
-each failure candidate and record it in a private `action-journal.sqlite3` beside
-the external configuration. Both Sonarr queues are reread to preserve duplicate
+eligible candidates and record it in a private `preview-journal.sqlite3` beside
+the external configuration. Manual-only candidates skip the recheck and receive
+no preview entry. Both Sonarr queues are reread to preserve duplicate
 ownership checks. Endpoint/category/source/content identities and complete file
 selections must still match, retry settings must be enabled, and the new snapshot
 must be at most ten seconds old. The journal records preview checks only; this
@@ -193,9 +194,11 @@ and is not automatically invoked by workers or constructors.
 python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
 ```
 
-Preflight rereads the candidate and retry settings, captures old history/blocklist
-IDs, checks that Sonarr reports a 4.x version, and exercises independent read-only
-outcome checks. It does not prepare a dispatch journal entry or generate approval.
+Preflight reports `manual_review` for file-policy candidates. For eligible
+metadata timeouts it rereads the candidate and retry settings, captures history
+and blocklist IDs, checks the Sonarr 4.x version, and reports read-only outcomes
+including replacement-grab evidence. Preflight creates no dispatch journal
+entry or approval.
 The verifier matches failure history by original hash and episode identity. New
 replacement grabs must have different valid hashes for the affected episodes and
 the same bound client, or a corroborated newer incarnation of the same hash.

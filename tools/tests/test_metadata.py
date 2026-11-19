@@ -645,6 +645,80 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertTrue(row["confirmed"]["replacement_grab_observed"])
         search.assert_not_called()
 
+    def test_incomplete_initial_history_blocks_search_even_if_final_read_omits_the_grab(self):
+        from contextlib import closing
+        from pathlib import Path
+        import tempfile
+
+        f = self.f
+        queue = f.s.routes["/api/v3/queue"]
+        original = f.s.call
+        for total in (1, 2):
+            with self.subTest(total=total), tempfile.TemporaryDirectory() as folder, closing(
+                    Journal(Path(folder) / "test.sqlite3", allow_public_attempt=True)) as journal:
+                f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                f.s.routes["/api/v3/queue"] = queue
+                replacement = None
+
+                def remove(*args, **kwargs):
+                    nonlocal replacement
+                    self.removed()
+                    stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+                    replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
+
+                def call(route, params=None):
+                    if replacement is not None and route == "/api/v3/history" and "eventType" not in params:
+                        return {"totalRecords": total, "records": [replacement]}
+                    # The unscoped final history read never repeats the grab.
+                    return original(route, params)
+
+                with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+                        f.s, "call", side_effect=call), patch(
+                        "production._send_queue_delete", side_effect=remove) as send, patch(
+                        "production._send_episode_search", return_value=41) as search:
+                    row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+                    recovered = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
+                self.assertIs(row["current_observation"]["torrent_absent"], True)
+                self.assertEqual(recovered, row)
+                if total == 1:
+                    self.assertEqual(row["stage"], "retry_superseded")
+                    self.assertIs(row["current_observation"]["replacement_grab_observed"], True)
+                else:
+                    self.assertEqual(row["stage"], "retry_search_blocked")
+                    self.assertEqual(row["stop_reason"], "replacement_history_unavailable")
+                    self.assertIsNone(row["current_observation"]["replacement_grab_observed"])
+                send.assert_called_once()
+                search.assert_not_called()
+
+    def test_metadata_preflight_reports_replacement_grab_observations(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        f = self.f
+        stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+        replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
+        original = f.s.call
+        f.qb.login = Mock()
+
+        def call(route, params=None):
+            if route == "/api/v3/history" and "eventType" not in params:
+                return {"totalRecords": 1, "records": [replacement]}
+            return original(route, params)
+
+        args = ["production.py", "--config", "connections.json", "--preflight", "HD", f.hash]
+        with patch("sys.argv", args), patch("production.load_config", return_value=f.config), patch(
+                "production.Api", side_effect=[f.qb, f.s]), patch.object(f.s, "call", side_effect=call), patch(
+                "production.Journal") as journal, redirect_stdout(StringIO()) as output:
+            self.assertEqual(production.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["preflight"], "verified")
+        self.assertIs(result["live_sender_enabled"], False)
+        observation = result["observation"]
+        self.assertIs(observation.get("replacement_grab_observed"), True)
+        self.assertIs(observation.get("any_replacement_observed"), True)
+        self.assertIs(observation.get("replacement_grab_ambiguous"), False)
+        journal.assert_not_called()
+
     def test_later_page_timeout_preserves_the_grab_seen_on_the_first_page(self):
         f = self.f
         original = f.s.call

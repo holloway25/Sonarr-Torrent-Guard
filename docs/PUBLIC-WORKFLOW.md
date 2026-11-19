@@ -200,9 +200,11 @@ Sonarr 5.x, other major versions and missing or malformed versions hold producti
 verification and actions. API response validation still applies to each 4.x
 operation. Responses with duplicate JSON keys are treated as unavailable evidence.
 
-`production.py --preflight INSTANCE HASH` rereads an exact candidate, confirms
-retry settings and reviewed-version/client binding, and captures baseline IDs.
-Its read-only verifier independently checks qBittorrent torrent absence, new
+`production.py --preflight INSTANCE HASH` reports `manual_review` for file-policy
+candidates. For eligible metadata timeouts it rereads the candidate, confirms
+retry settings and the Sonarr version and client binding, then captures baseline
+IDs. Its read-only verifier reports replacement-grab observations and checks
+qBittorrent torrent absence, new
 Sonarr failure history, new blocklist records and newer replacement grabs for
 the affected episodes. Recovery reads bounded, paginated history for each
 affected episode, including the whole second containing dispatch. An incomplete

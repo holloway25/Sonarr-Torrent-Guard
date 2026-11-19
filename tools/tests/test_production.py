@@ -1446,6 +1446,27 @@ class ManualBlocklistTests(unittest.TestCase):
                 self.assertEqual(f.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
                 remove.assert_not_called()
 
+    def test_preflight_reports_manual_review_for_file_policy_candidates(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+
+        f = self.f
+        f.qb.login = Mock()
+        args = ["production.py", "--config", "connections.json", "--preflight", "HD", f.hash]
+        with patch("sys.argv", args), patch("production.load_config", return_value=f.config), patch(
+                "production.Api", side_effect=[f.qb, f.s]), patch(
+                "production.capture_context", wraps=production.capture_context) as capture, patch(
+                "production.Journal") as journal, redirect_stdout(StringIO()) as output:
+            self.assertEqual(production.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["preflight"], "manual_review")
+        self.assertEqual(result["reason"], "sonarr_blocklist_scope_unverifiable")
+        self.assertIs(result["live_sender_enabled"], False)
+        self.assertNotIn("observation", result)
+        capture.assert_not_called()
+        journal.assert_not_called()
+
     def test_transport_blocks_file_action_even_when_other_release_gates_are_enabled(self):
         with patch("production.ROUTINE_RELEASE_ENABLED", True), patch("urllib.request.build_opener") as opener:
             with self.assertRaisesRegex(SafetyError, "^sonarr_blocklist_scope_unverifiable$"):

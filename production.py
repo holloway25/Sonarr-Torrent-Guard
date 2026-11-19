@@ -377,8 +377,8 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
     if policy is not None:
         context["queue_rows"] = report["queue_rows"]
+        context["metadata_retry"] = policy
         if dispatch is not None:
-            context["metadata_retry"] = policy
             previous = dispatch["context"]
             try:
                 check_metadata_blocklist(blocklist, previous, dispatch["dispatched_at"])
@@ -746,6 +746,9 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
             raise SafetyError(c["metadata_search_hold"])
         if row["confirmed"].get("replacement_grab_ambiguous") is True:
             raise SafetyError("replacement_history_ambiguous")
+        # Only a complete observation can rule out a replacement at this point.
+        if row["current_observation"].get("replacement_grab_observed") is not False:
+            raise SafetyError("replacement_history_unavailable")
         require_connectivity(config, apis[c["instance"]], c["instance"])
         # The first absence observation is insufficient if another actor has
         # re-added the hash or queued a replacement while intent was committed.
@@ -924,9 +927,7 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
         if reason is not None:
             raise SafetyError(reason)
         context = capture_context(config, apis[report["instance"]], fresh["assessment"], digest(approval["nonce"]))
-        policy = metadata_policy(fresh["assessment"])
-        if policy is not None:
-            context["metadata_retry"] = policy
+        policy = context.get("metadata_retry")
         if authority is not None:
             context["routine_grant_digest"] = authority.identifier
         row = journal.prepare(report, mode=mode, context=context)
@@ -1045,17 +1046,23 @@ def main():
                 finally:
                     journal.close()
         qb.login()
+        result = {"dry_run": True, "live_sender_enabled": False, "instance": target[0], "hash": target[1]}
         with hard_deadline(deadline):
             reports = run(config, qb, apis, target=target)
             if len(reports) != 1:
                 raise SafetyError("target_not_in_owned_queue")
-            fresh = recheck_candidate(reports[0], config, qb, apis)
-            check_fresh(reports[0], fresh)
-            context = capture_context(config, apis[target[0]], fresh["assessment"], digest("preflight_only"))
-            observation = OutcomeVerifier(config, qb, apis, context).observe()
-        print(json.dumps({"dry_run": True, "live_sender_enabled": False, "instance": target[0],
-                          "hash": target[1], "preflight": "verified", "observation": observation,
-                          "data_deletion_note": "requires_independent_verification"}))
+            report = reports[0]
+            reason = workflow.manual_handling_reason(report)
+            if reason is not None:
+                result.update(preflight="manual_review", reason=reason)
+            else:
+                fresh = recheck_candidate(report, config, qb, apis)
+                check_fresh(report, fresh)
+                context = capture_context(config, apis[target[0]], fresh["assessment"], digest("preflight_only"))
+                observation = OutcomeVerifier(config, qb, apis, context).observe()
+                result.update(preflight="verified", observation=observation,
+                              data_deletion_note="requires_independent_verification")
+        print(json.dumps(result))
         return 0
     except (SafetyError, GuardError) as e:
         print(json.dumps({"dry_run": True, "error": str(e)}), file=sys.stderr)

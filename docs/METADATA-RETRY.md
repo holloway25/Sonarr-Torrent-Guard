@@ -69,8 +69,11 @@ grab also vetoes another search, even if qBittorrent has yet to confirm a
 replacement download under that hash. Guard persists this separately as
 `replacement_grab_observed` as each episode's history is verified. An outage
 reading a later page or episode leaves pack-wide coverage unknown and keeps the
-earlier search veto. If neither kind of observation vetoes the search,
-record `retry_search_recorded` durably before the second request. After this commit, repeat
+earlier search veto. An incomplete initial post-removal history read also
+holds the search with `replacement_history_unavailable` if no replacement
+was confirmed. A later empty history read cannot clear that hold. If the
+complete observation permits a search, record `retry_search_recorded` durably
+before the second request. After this commit, repeat
 Sonarr-side connectivity, Sonarr 4.x compatibility and endpoint checks; reject a
 reappearing original hash or newly queued affected episode. After qBittorrent
 confirms absence, Guard ignores each stale original row whose queue ID, episode
