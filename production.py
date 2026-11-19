@@ -320,8 +320,8 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
         raise SafetyError("identity_or_manifest_changed") from None
     if sorted(grab["id"] for grab in grabs) != report["grab_ids"] or sources != {report["indexer"]}:
         raise SafetyError("identity_or_manifest_changed")
-    titles = {g.get("sourceTitle") for g in grabs}
-    if len(titles) != 1 or not all(isinstance(t, str) and t for t in titles):
+    titles = [grab.get("sourceTitle") for grab in grabs]
+    if any(not isinstance(title, str) or not title.strip() for title in titles) or len(set(titles)) != 1:
         raise SafetyError("ambiguous_release_title_evidence")
     policy = metadata_policy(report)
     start = (time.time() if now is None else now) - 300
@@ -370,7 +370,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
         "episode_ids": report["episode_ids"], "queue_id": min(report["queue_ids"]),
         "client_id": client["id"], "indexer": report["indexer"],
         "binding_digest": binding_digest(config, report["instance"]),
-        "client_name_digest": digest(client["name"]), "release_title_digest": digest(next(iter(titles))),
+        "client_name_digest": digest(client["name"]), "release_title_digest": digest(titles[0]),
         "window_start": start, "baseline_history_ids": [r["id"] for r in baseline_history],
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }

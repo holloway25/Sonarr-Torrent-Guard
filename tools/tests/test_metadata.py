@@ -224,6 +224,59 @@ class MetadataSenderTests(unittest.TestCase):
                 remove.assert_not_called()
                 search.assert_not_called()
 
+    def test_malformed_release_title_holds_only_its_own_metadata_attempt(self):
+        from contextlib import closing
+        from pathlib import Path
+        import tempfile
+
+        import routine
+
+        f = self.f
+        authority = self.routine_authority()
+        other_hash = "b" * 40
+        valid_title = "  Example Show S01E02  "
+        other_torrent = dict(self.t, hash=other_hash)
+        first_queue, = f.s.routes["/api/v3/queue"]["records"]
+        other_queue = dict(first_queue, id=8, downloadId=other_hash.upper(), episodeId=4)
+        other_grab = dict(f.grab, id=6, downloadId=other_hash.upper(), episodeId=4, sourceTitle=valid_title)
+        f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, other_grab]}
+
+        for invalid in ("", "  	 ", None, [], {"title": valid_title}):
+            with self.subTest(title=invalid), tempfile.TemporaryDirectory() as folder, closing(
+                    Journal(Path(folder) / "test.sqlite3", allow_public_attempt=True)) as journal:
+                f.grab["sourceTitle"] = invalid
+                f.qb.routes["/api/v2/torrents/info"] = [self.t, other_torrent]
+                f.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [first_queue, other_queue]}
+                f.s.routes["/api/v3/blocklist"] = {"totalRecords": 0, "records": []}
+                reports = run(f.config, f.qb, f.apis)
+                proposal = {"assessment": [dict(report, safeguards={"status": "fresh_attempt_verified"})
+                                           for report in reports], "recovery": []}
+
+                def remove(api, queue_id, *, blocklist):
+                    self.assertEqual(queue_id, 8)
+                    self.assertFalse(blocklist)
+                    f.qb.routes["/api/v2/torrents/info"] = [self.t]
+                    f.s.routes["/api/v3/queue"] = {"totalRecords": 1, "records": [first_queue]}
+                    stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+                    f.s.routes["/api/v3/blocklist"] = {"totalRecords": 1, "records": [
+                        {"id": 1, "seriesId": 2, "episodeIds": [4], "indexer": "Public Source",
+                         "sourceTitle": valid_title, "date": stamp.isoformat(), "protocol": "torrent"}]}
+
+                with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete", side_effect=remove) as send, patch(
+                        "production._send_episode_search") as search:
+                    result = routine.cycle(f.config, f.qb, f.apis, journal, authority, {}, proposal)
+                self.assertEqual(result["status"], "completed")
+                first, second = result["actions"]
+                self.assertEqual((first["hash"], first["stage"], first["stop_reason"]),
+                                 (f.hash, "held", "ambiguous_release_title_evidence"))
+                self.assertEqual((second["hash"], second["stage"]), (other_hash, "manual_review"))
+                self.assertIs(second["current_observation"]["blocklisted"], True)
+                self.assertEqual(journal.get(second["key"])["context"]["release_title_digest"],
+                                 production.digest(valid_title))
+                send.assert_called_once_with(f.s, 8, blocklist=False)
+                search.assert_not_called()
+
     def test_metadata_arriving_before_dispatch_cancels_even_if_new_file_is_bad(self):
         f = self.f
         def wait(*args):

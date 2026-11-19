@@ -25,7 +25,7 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "container_journal_missing", "container_journal_identity_mismatch",
                          "container_journal_marker_missing", "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
                          "sonarr_blocklist_scope_unverified", "sonarr_blocklist_scope_unverifiable", "retry_settings_not_ready",
-                         "metadata_timeout_no_longer_confirmed"}
+                         "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
