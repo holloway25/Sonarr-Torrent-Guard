@@ -583,6 +583,25 @@ class WorkflowTests(unittest.TestCase):
         self.qb.routes["/api/v2/torrents/info"][0].update(state="downloading", added_on=999)
         self.assertEqual(self.check()["reason"], "torrent_too_new_or_age_unknown")
 
+    def test_malformed_torrent_state_skips_only_its_own_candidate(self):
+        other = "b" * 40
+        self.s.routes["/api/v3/queue"] = {"totalRecords": 2, "records": [
+            self.row, dict(self.row, id=2, episodeId=5, downloadId=other)]}
+        self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [
+            self.grab, dict(self.grab, id=5, episodeId=5, downloadId=other)]}
+        self.qb.routes["/api/v2/torrents/info"].append(dict(self.t, hash=other))
+
+        for state in ({"value": "downloading"}, ["downloading"], None, 0, "unknown"):
+            with self.subTest(state=state):
+                self.t["state"] = state
+                self.qb.calls.clear()
+                first, second = run(self.config, self.qb, {"HD": self.s}, now=1000)
+                self.assertEqual((first["hash"], first["decision"], first["reason"]),
+                                 (self.h, "skip", "metadata_or_transitional_state"))
+                self.assertEqual((second["hash"], second["decision"]), (other, "would_fail"))
+                self.assertEqual([params["hash"] for route, params in self.qb.calls
+                                  if route == "/api/v2/torrents/files"], [other])
+
     def test_api_failure_not_interpreted_as_bad_torrent(self):
         self.qb.routes["/api/v2/torrents/files"] = GuardError("api_request_or_response_failed")
         self.assertEqual(self.check()["decision"], "skip")

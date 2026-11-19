@@ -811,7 +811,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("metadata_timeout_not_reached")
                 if not metadata_still_pending(t):
                     raise GuardError("metadata_state_inconsistent")
-            elif state not in safe_states:
+            elif not isinstance(state, str) or state not in safe_states:
                 raise GuardError("metadata_or_transitional_state")
             files = qb.call("/api/v2/torrents/files", {"hash": h})
             if metadata_pending:
