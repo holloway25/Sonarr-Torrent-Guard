@@ -311,7 +311,7 @@ def check_visible_native_grabs(api, instance, report, max_pages):
         raise SafetyError("sonarr_blocklist_scope_unverified") from None
 
 
-def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
+def execute_native_file_removal(config, qb, apis, report, authority, lock_path, *, on_removal_accepted=None):
     """Ask the owning Sonarr to remove, blocklist and natively retry once this pass."""
     if config.get("dry_run") is not False or ROUTINE_RELEASE_ENABLED is not True or not file_policy_removal(report):
         raise SafetyError("live_execution_disabled")
@@ -346,6 +346,8 @@ def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
 
         # Remove first so Sonarr's native retry cannot race the old queue entry.
         _send_queue_delete(api, min(current["queue_ids"]), blocklist=False, alternate_hash_cleanup=True)
+        if on_removal_accepted is not None:
+            on_removal_accepted()
         try:
             torrent, _ = observed_torrent(qb, current)
             if torrent is not None:
@@ -699,7 +701,10 @@ def _send_history_failure(api, grab_id):
         with hard_deadline(deadline):
             with urllib.request.build_opener(RejectDeleteRedirect()).open(
                     request, timeout=min(15, deadline - time.monotonic())) as response:
-                if not 200 <= response.status < 300 or len(response.read(4097)) > 4096:
+                raw = response.read(4097)
+                if (response.status != 200 or response.headers.get_content_type() != "application/json"
+                        or len(raw) > 4096
+                        or json.loads(raw, object_pairs_hook=unique_response_keys) != {}):
                     raise ValueError()
     except Exception:
         raise SafetyError("alternate_hash_blocklist_request_uncertain") from None

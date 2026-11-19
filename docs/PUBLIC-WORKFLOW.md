@@ -104,9 +104,11 @@ confirms the torrent is absent, Guard rechecks the authorized grab and asks the
 owning Sonarr to mark that grab failed. Sonarr writes its blocklist entry and
 applies its own retry settings. Removing the queue item first lets Sonarr
 evaluate replacements without that download in the queue. The two requests can
-complete independently. If the second cannot be verified, the live log shows
-`sonarr_remove_accepted_blocklist_unverified`. An interrupted pass cannot
-resume a previous request. [Queue removal](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs#L67-L86) · [Mark as Failed by history ID](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/History/HistoryController.cs#L119-L124)
+complete independently. The live log records `sonarr_remove_accepted_blocklist_pending`
+as soon as Sonarr accepts removal. A second record gives the outcome when Guard
+completes the follow-up. If Sonarr's success response cannot be verified, Guard
+logs `sonarr_remove_accepted_blocklist_unverified`. Later passes use the current
+queue and never resume a previous request. [Queue removal](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Queue/QueueController.cs#L67-L86) · [Mark as Failed by history ID](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/History/HistoryController.cs#L131-L136)
 
 ### File-policy blocklist scope
 
@@ -138,7 +140,8 @@ With `guard.py --check-safeguards`, eligible dry-run assessments receive a fresh
 recheck and include its result in the report and optional log. The recheck
 compares ownership and manifest fingerprints and requires a snapshot no more
 than ten seconds old. Manifest fingerprints use names, sizes, indices and
-priorities. The scheduled dry-run also checks the visible Sonarr grab titles
+priorities. The standalone preview marks the operation undetermined when the
+grab and queue hashes differ. The scheduled dry-run checks the visible Sonarr grab titles
 before logging a file candidate as `would_remove`. A metadata timeout that
 passes the dry-run checks is logged as `metadata_candidate`. The live worker
 still has to verify the release title and other removal prerequisites.

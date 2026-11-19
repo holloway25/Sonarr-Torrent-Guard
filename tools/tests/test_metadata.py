@@ -80,6 +80,8 @@ class MetadataTests(unittest.TestCase):
 
     def test_file_failure_human_and_json_proposals_show_native_sonarr_cleanup(self):
         self.t["state"] = "stalledUP"
+        self.f.s.routes["/api/v3/history"]["records"][0]["downloadId"] = (
+            self.f.s.routes["/api/v3/queue"]["records"][0]["downloadId"])
         self.f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
         report = self.assess()
         self.assertIn("blocklist_release_in_owning_sonarr", report["proposed_actions"])

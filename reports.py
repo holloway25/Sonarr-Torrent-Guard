@@ -3,7 +3,7 @@
 import collections
 import json
 
-from workflow import manual_handling_reason
+from workflow import file_removal_needs_history_check, manual_handling_reason
 
 
 REASONS = {
@@ -70,6 +70,8 @@ def human_report(reports, readiness, timestamp):
             if report.get("reasons") == ["metadata_timeout"]:
                 lines.append("  Proposed after approval/checks: Sonarr removes torrent/data WITHOUT blocklisting; "
                              "after confirmed removal and final checks, request an affected-episode search.")
+            elif file_removal_needs_history_check(report):
+                lines.append("  Operation undetermined until the Sonarr blocklist scope is checked.")
             else:
                 lines.append("  Proposed after approval/checks: Sonarr removes torrent/data, blocklists and handles retry.")
             blockers = report.get("workflow", {}).get("blockers", [])

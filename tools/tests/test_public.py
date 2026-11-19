@@ -92,6 +92,26 @@ class PublicTests(unittest.TestCase):
             self.assertEqual(guard.main(), 0)
         self.assertIn("preview verified", output.getvalue())
 
+    def test_guard_preview_does_not_claim_one_step_cleanup_with_different_grab_hash(self):
+        import contextlib
+        import io
+        import json
+        import guard
+
+        f = self.f
+        f.hybrid_report()
+        directory = Path(f.folder.name)
+        args = ["guard.py", "--config", str(directory / "connections.json"), "--check-safeguards", "--format", "json"]
+        with contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.argv", args), patch(
+                "guard.load_config", return_value=f.config), patch("guard.Api", side_effect=[f.qb, f.s]):
+            self.assertEqual(guard.main(), 0)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        assessment, = [row for row in rows if row["event"] == "assessment"]
+        self.assertEqual(assessment["safeguards"]["status"], "operation_unverified")
+        self.assertEqual(assessment["workflow"]["status"], "operation_unverified")
+        self.assertIsNone(assessment["workflow"]["request_preview"])
+
+
 class MaintenanceTests(unittest.TestCase):
     def setUp(self):
         self.f = fixtures.ProductionTests()

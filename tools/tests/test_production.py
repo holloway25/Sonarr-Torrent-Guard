@@ -1090,7 +1090,7 @@ class FileCleanupTests(unittest.TestCase):
                     publishedDate=f.grab["date"])
         original_title = f.grab["sourceTitle"]
         for case in ("complete", "unsafe_release_hash", "torrent_still_present", "history_changed",
-                     "history_outcome_uncertain"):
+                     "history_outcome_uncertain", "sign_in_page", "error_document"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder, patch(
                     "production.METADATA_RETRY_RELEASE_ENABLED", False):
                 f.qb.routes["/api/v2/torrents/info"] = [torrent]
@@ -1114,7 +1114,14 @@ class FileCleanupTests(unittest.TestCase):
                         self.assertEqual(f.qb.routes["/api/v2/torrents/info"], [])
                         if case == "history_outcome_uncertain":
                             raise TimeoutError()
-                    response = Mock(status=200, read=Mock(return_value=b"{}"))
+                    body, content_type = b"{}", "application/json"
+                    if request.get_method() == "POST":
+                        if case == "sign_in_page":
+                            body, content_type = b"<html>Sign in</html>", "text/html"
+                        elif case == "error_document":
+                            body = b'{"error":"denied"}'
+                    response = Mock(status=200, read=Mock(return_value=body))
+                    response.headers.get_content_type.return_value = content_type
                     response.__enter__ = Mock(return_value=response)
                     response.__exit__ = Mock(return_value=False)
                     return response
@@ -1131,10 +1138,38 @@ class FileCleanupTests(unittest.TestCase):
                 else:
                     reasons = {"torrent_still_present": "alternate_hash_removal_unverified",
                                "history_changed": "sonarr_blocklist_scope_unverified",
-                               "history_outcome_uncertain": "alternate_hash_blocklist_request_uncertain"}
+                               "history_outcome_uncertain": "alternate_hash_blocklist_request_uncertain",
+                               "sign_in_page": "alternate_hash_blocklist_request_uncertain",
+                               "error_document": "alternate_hash_blocklist_request_uncertain"}
                     self.assertEqual((action["stage"], action["stop_reason"]),
                                      ("sonarr_remove_accepted_blocklist_unverified", reasons[case]))
-                    self.assertEqual(methods, ["DELETE", "POST"] if case == "history_outcome_uncertain" else ["DELETE"])
+                    follow_up = case in ("history_outcome_uncertain", "sign_in_page", "error_document")
+                    self.assertEqual(methods, ["DELETE", "POST"] if follow_up else ["DELETE"])
+
+    def test_alternate_hash_removal_is_logged_before_interrupted_follow_up(self):
+        import json
+
+        f = self.f
+        f.hybrid_report()
+        f.grab["data"].update(torrentInfoHash=f.grab["downloadId"], protocol="2", size="100",
+                              publishedDate=f.grab["date"])
+
+        def remove(*args, **kwargs):
+            f.qb.routes["/api/v2/torrents/info"] = []
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+                "production._send_queue_delete", side_effect=remove) as send, patch(
+                "production.observed_torrent", side_effect=KeyboardInterrupt), patch(
+                "production._send_history_failure") as mark_failed:
+            path = Path(folder)
+            with self.assertRaises(KeyboardInterrupt):
+                self.container_cycle(path, Mock())
+            entry, = [json.loads(line) for line in (path / "routine.log").read_text().splitlines()]
+        self.assertEqual((entry["event"], entry["stage"], entry["hash"]),
+                         ("routine_action", "sonarr_remove_accepted_blocklist_pending", f.hash))
+        self.assertEqual(f.qb.routes["/api/v2/torrents/info"], [])
+        send.assert_called_once_with(f.s, 7, blocklist=False, alternate_hash_cleanup=True)
+        mark_failed.assert_not_called()
 
     def test_native_blocklist_holds_conflicting_visible_history(self):
         f = self.f

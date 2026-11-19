@@ -85,9 +85,15 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
         batch_state["dispatch_after"] = cursor
         action = {"instance": report["instance"], "hash": report["hash"],
                   "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier}
+
+        def record_removal_accepted():
+            if on_action is not None:
+                on_action(dict(action, stage="sonarr_remove_accepted_blocklist_pending", stop_reason=None))
+
         try:
             if file_policy_removal(report):
-                outcome = production.execute_native_file_removal(runtime, qb, apis, report, authority, lock_path)
+                outcome = production.execute_native_file_removal(
+                    runtime, qb, apis, report, authority, lock_path, on_removal_accepted=record_removal_accepted)
                 if outcome is None:
                     action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
                 else:
@@ -169,6 +175,10 @@ def main():
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.
         result["reason"] = "authorization_maintenance_or_safety_check_unavailable"
+    except (KeyboardInterrupt, SystemExit):
+        if handler is not None:
+            handler.close()
+        raise
     finally:
         production.ROUTINE_RELEASE_ENABLED = False
     line = json.dumps(result)

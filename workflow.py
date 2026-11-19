@@ -12,6 +12,12 @@ def file_policy_removal(report):
             and all(reason in FILE_FAILURE_REASONS for reason in reasons))
 
 
+def file_removal_needs_history_check(report):
+    grab_hashes = report.get("grab_download_ids")
+    return (file_policy_removal(report) and bool(grab_hashes)
+            and grab_hashes != [report.get("download_id_spelling")])
+
+
 def manual_handling_reason(report):
     if (report.get("decision") == "would_fail" and report.get("reasons") != ["metadata_timeout"]
             and not file_policy_removal(report)):
@@ -57,6 +63,10 @@ def preview_failure(report, readiness):
     reason = manual_handling_reason(report)
     if reason is not None:
         plan.update(status="manual_review", blockers=[reason])
+        return plan
+    if file_removal_needs_history_check(report):
+        plan["status"] = "operation_unverified"
+        plan["blockers"].append("sonarr_blocklist_scope_unverified")
         return plan
     if not file_policy_removal(report):
         if readiness.get("status") != "verified":

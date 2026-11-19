@@ -18,8 +18,8 @@ approving the reviewed code and configured public workflow. The file and parent
 directory must be owner-private, outside the checkout. It contains exactly:
 
 - `enabled`: true only for explicitly approved operation.
-- `rule`: `public-sonarr-cleanup-v5` (native remove-and-blocklist for file
-  failures and the separate metadata-timeout policy).
+- `rule`: `public-sonarr-cleanup-v6` (native remove-and-blocklist for file
+  failures, separate Sonarr requests for verified hybrid grabs, and metadata retry).
 - `grant_id`: a random lowercase 64-hex identifier, not an API credential.
 - `issued_at`, `expires_at`: UTC epoch times, no longer than seven days apart.
   Increasing the code limit does not extend an existing grant. Any extension
@@ -70,9 +70,9 @@ native Remove and Blocklist action. [Metadata retry](METADATA-RETRY.md) uses
 removal without blocklisting and may request an affected-episode search during
 the same pass. Logs include the grant digest for inspection.
 
-An older grant requires review under v5 because qBittorrent’s enabled filename
-exclusions now determine the selected-file rule. Later edits to that list take
-effect automatically. A reviewed code update also
+An older grant requires review under v6 because alternate-hash cleanup uses
+separate Sonarr removal and failure requests. Edits to qBittorrent's enabled
+filename exclusions still take effect automatically. A reviewed code update also
 requires a matching grant unless the existing ongoing grant explicitly opted
 into code updates within the same rule and scope. Preserve the original trial
 deadline when reissuing a grant for a code update.

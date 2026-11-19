@@ -113,7 +113,7 @@ class RoutineTests(unittest.TestCase):
         other = dict(verified, hash="b" * 40)
         tried = []
 
-        def attempt(config, qb, apis, report, authority, lock_path):
+        def attempt(config, qb, apis, report, authority, lock_path, **kwargs):
             tried.append(report["hash"])
             self.assertEqual(load_batch_state(state_path)["dispatch_after"], ["HD", report["hash"]])
             if report["hash"] == f.hash:
@@ -227,10 +227,10 @@ class RoutineTests(unittest.TestCase):
         proposal = {"assessment": [first, second]}
         execute = production.execute_native_file_removal
 
-        def interrupt_after_first(config, qb, apis, report, authority, lock_path):
+        def interrupt_after_first(config, qb, apis, report, authority, lock_path, **kwargs):
             if report["hash"] == second["hash"]:
                 raise production.GuardError("run_time_limit_reached")
-            return execute(config, qb, apis, report, authority, lock_path)
+            return execute(config, qb, apis, report, authority, lock_path, **kwargs)
 
         with contextlib.ExitStack() as stack:
             output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -278,6 +278,12 @@ class RoutineTests(unittest.TestCase):
                         {"rule": "other-workflow"}, {"grant_id": "bad"}):
             with self.subTest(changes=changes), self.assertRaises(SafetyError):
                 RoutineAuthorization(dict(self.grant, **changes), self.f.config)
+
+    def test_v5_ongoing_approval_cannot_carry_forward_to_hybrid_cleanup(self):
+        previous_grant = dict(self.ongoing_grant(), rule="public-sonarr-cleanup-v5",
+                              code_digest="e" * 64, allow_code_updates=True)
+        with self.assertRaisesRegex(SafetyError, "^routine_authorization_expired_or_scope_changed$"):
+            RoutineAuthorization(previous_grant, self.f.config)
 
     def test_source_scope_and_immutable_permission_changes_are_refused(self):
         with self.assertRaisesRegex(SafetyError, "routine_code_not_authorized"):

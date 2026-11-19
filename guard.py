@@ -22,7 +22,8 @@ import urllib.parse
 import urllib.request
 
 from reports import human_report, json_events
-from workflow import file_policy_removal, manual_handling_reason, preview_failure, read_readiness
+from workflow import (file_policy_removal, file_removal_needs_history_check, manual_handling_reason,
+                      preview_failure, read_readiness)
 from safety import SafetyError, check_fresh, open_lock_file
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
@@ -1134,7 +1135,9 @@ def main():
                                 continue
                             try:
                                 check_fresh(report, recheck_candidate(report, config, qb, apis))
-                                report["safeguards"] = {"status": "preview_verified", "live_enabled": False}
+                                status = ("operation_unverified" if file_removal_needs_history_check(report)
+                                          else "preview_verified")
+                                report["safeguards"] = {"status": status, "live_enabled": False}
                             except (SafetyError, GuardError) as error:
                                 report["safeguards"] = {"status": "blocked", "reason": str(error), "live_enabled": False}
             finally:

@@ -160,9 +160,9 @@ stop the container. A request already sent can still complete.
 
 Fresh appdata records the configured cleanup scope on the first live start.
 Subsequent image updates reuse the approved record while the scope and rule
-match. Upgrading to the v5 cleanup rule requires one scope confirmation to use
-qBittorrent’s enabled exclusion patterns. Later edits to the qBittorrent list take
-effect automatically. A worker configured
+match. Upgrading to the v6 cleanup rule requires one scope confirmation for
+separate Sonarr removal and failure requests on eligible hybrid torrents. Edits
+to the qBittorrent exclusion list take effect automatically. A worker configured
 as live reports `container_live_scope_confirmation_required` until that confirmation
 is recorded. Use the procedure below to approve the reviewed scope.
 

@@ -82,8 +82,9 @@ directory. A media library or download mount is unnecessary.
 Start with the default `STGUARD_MODE=dry-run`. Review the proposed actions
 and private-indexer settings for each Sonarr owner. Set `STGUARD_MODE=live`
 when the reviewed configuration is ready. Existing live installs must confirm
-the v5 cleanup policy once to start using qBittorrent as the source of filename
-exclusions. Later edits to that list take effect automatically.
+the v6 cleanup policy once to authorize hybrid-torrent removal and blocklisting
+through separate Sonarr requests. Edits to qBittorrent's exclusion list take
+effect automatically.
 
 Use the [reviewed release process](docs/DEPENDENCY-MAINTENANCE.md) to approve a
 candidate before it becomes `latest`. A source commit, a published candidate and
