@@ -112,6 +112,8 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.journal.archive_resolved(now=self.later, preview=False)["archived"], 1)
         self.assertEqual([r["key"] for r in self.journal.related("HD", alias)], [row["key"]])
         self.assertEqual(self.journal.related("UHD", alias), [])
+        renamed = self.journal.related("Renamed HD", alias, binding=context["binding_digest"])
+        self.assertEqual([record["key"] for record in renamed], [row["key"]])
         with self.assertRaisesRegex(SafetyError, "new_attempt_not_confirmed"):
             production.check_prior_attempts(self.journal, overlapping, config=f.config)
 
@@ -244,6 +246,13 @@ class RetentionTests(unittest.TestCase):
         finally:
             ro.close()
         self.assertEqual(self.journal.path.read_bytes(), before)
+
+    def test_related_filters_unrelated_active_rows_before_loading_records(self):
+        for number in range(1, 12):
+            self.make_row(number, stage="prepared")
+        with patch.object(self.journal, "get", wraps=self.journal.get) as get:
+            self.assertEqual(self.journal.related("Other", "a" * 40), [])
+        get.assert_not_called()
 
     def test_related_lookup_limit_fails_closed_instead_of_truncating(self):
         report, context, _ = self.make_row()

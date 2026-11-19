@@ -48,9 +48,9 @@ The additive migration creates the table and owner/hash index only when opening
 a read-write journal; it does not move records. An explicit archive application
 requires separate housekeeping permission. `Journal.get` checks both stores;
 `prepare` finds old keys before insertion, so an archived operation cannot be
-recreated. `Journal.related` checks bounded active records and uses the archive
-index to narrow the lookup to the same Sonarr instance. It then evaluates stored
-hashes and verified aliases for that instance. Older attempts continue to enforce
+recreated. `Journal.related` filters active and archived candidates by their
+owner label or durable downloader binding, then by stored hash or verified alias.
+Only matching rows are loaded as full records. Older attempts continue to enforce
 cross-mode holds and new-grab identity rules. This is not a permanent hash ban; a genuinely newer corroborated
 attempt can still pass the unchanged rules.
 

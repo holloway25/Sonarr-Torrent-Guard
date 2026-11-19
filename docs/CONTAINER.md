@@ -104,8 +104,11 @@ not replace the config. File mode preserves existing labels and settings.
 Both modes check active and archived journal owner identities and recorded live
 bindings read-only before scheduling. The check can read an older journal with
 missing optional columns. The worker adds those columns when it opens the journal
-for normal use. Mismatched or unreadable identity evidence blocks startup. Retain the original config with the entire appdata;
-do not edit labels or delete evidence to work around a refusal.
+for normal use. On the first real start or scope approval, Guard binds the
+installation to that database through `container-live-journal.json`. An
+established installation with a missing journal or a different journal identity
+waits for the matching appdata to be restored. Keep the config, journal and
+binding marker together when backing up or restoring.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.

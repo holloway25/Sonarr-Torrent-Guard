@@ -382,6 +382,47 @@ class WorkflowTests(unittest.TestCase):
                 self.s.routes["/api/v3/queue"]["records"].reverse()
             self.assertEqual(assessed, [self.h, other, self.h, other])
 
+    def test_properties_scan_resumes_across_restarts_without_using_unverified_torrents(self):
+        import tempfile
+        from pathlib import Path
+
+        listed = self.qb.routes["/api/v2/torrents/info"]
+        self.t["total_size"] = 100
+        listed.extend(dict(self.t, hash=format(n, "040x"), category="unrelated") for n in range(1, 301))
+        now = [100.0]
+        asked = []
+        call = self.qb.call
+
+        def slow_properties(route, params=None):
+            if route.endswith("/properties"):
+                if now[0] + .35 >= self.qb.deadline:
+                    raise GuardError("run_time_limit_reached")
+                now[0] += .35
+                asked.append(params["hash"])
+            return call(route, params)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(self.qb, "call", side_effect=slow_properties), patch(
+                "guard.time.monotonic", side_effect=lambda: now[0]):
+            path = Path(folder) / "batch-state.json"
+            self.qb.deadline = 190.0
+            state = {}
+            first = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+            self.assertEqual(first[0]["reason"], "run_time_limit_reached")
+            self.assertGreater(len(asked), 200)
+            self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+            checked = set(asked)
+            save_batch_state(path, state)
+            asked.clear()
+            now[0] = 100.0
+            second = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=load_batch_state(path))
+            self.assertEqual(second[0]["decision"], "would_fail")
+            self.assertEqual(len(asked), len(listed) - len(checked))
+            self.assertFalse(checked.intersection(asked))
+            listed[0]["added_on"] += 1
+            asked.clear()
+            run(self.config, self.qb, {"HD": self.s}, now=1000, target=("HD", self.h))
+            self.assertEqual(asked, [self.h])
+
     def test_deadline_preserves_cursor_for_the_next_unfinished_torrent(self):
         hashes = [letter * 40 for letter in "abc"]
         self.s.routes["/api/v3/queue"] = {"totalRecords": 3, "records": [

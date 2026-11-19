@@ -496,6 +496,41 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertIs(f.journal.get(row["key"])["confirmed"]["replacement_grab_observed"], True)
         search.assert_not_called()
 
+    def test_later_episode_history_failure_preserves_an_already_confirmed_grab(self):
+        f = self.f
+        self.assess_season_pack()
+        baseline = f.s.routes["/api/v3/history/since"][:]
+        original = f.s.call
+        removed = False
+        failed_at = []
+
+        def remove(*args, **kwargs):
+            nonlocal removed
+            self.removed()
+            removed = True
+            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+            replacement = dict(f.grab, id=9, episodeId=3, downloadId="b" * 40, date=stamp.isoformat())
+            f.s.routes["/api/v3/history/since"] = [*baseline, replacement]
+
+        def episode_history(route, params=None):
+            if (removed and route == "/api/v3/history" and params.get("episodeId") == 4
+                    and "eventType" not in params):
+                failed_at.append(4)
+                f.s.routes["/api/v3/history/since"] = baseline
+                raise TimeoutError()
+            return original(route, params)
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+                f.s, "call", side_effect=episode_history), patch(
+                "production._send_queue_delete", side_effect=remove), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(failed_at, [4])
+        self.assertEqual(row["stage"], "retry_superseded")
+        self.assertIsNone(row["current_observation"]["replacement_observed"])
+        self.assertTrue(row["confirmed"]["replacement_grab_observed"])
+        search.assert_not_called()
+
     def assert_coordinator_restart_does_not_replay(self, crash_stage):
         f = self.f
         original_finish = production.finish_metadata_retry

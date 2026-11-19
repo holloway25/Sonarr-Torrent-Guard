@@ -19,8 +19,10 @@ still need maintenance.
   publishing a release or receiving registry credentials.
 - GitHub checks the maintenance cadence daily at 23:17 UTC (09:17 AEST /
   10:17 AEDT the following day, Melbourne). A lightweight gate permits an image
-  build only when the UTC day count since the Unix epoch is divisible by three: every 72 hours,
-  including across month/year boundaries. Off-days skip the build and publish
+  build only when the UTC day of the scheduled slot is divisible by three,
+  giving a 72-hour cadence across month and year boundaries. The gate uses the
+  workflow run's creation time to find the most recent 23:17 UTC slot, so a
+  runner delay past midnight does not skip the due build. Off-days skip the build and publish
   jobs; push/PR tests and explicitly requested manual builds are not delayed.
   A due build pulls the current official Python 3.15 Trixie base and renders
   that exact digest into a temporary Dockerfile without editing the checkout.

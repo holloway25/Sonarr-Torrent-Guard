@@ -84,14 +84,27 @@ def verify_client_binding(instance, monitored_url, client):
     pinned = endpoint_key(binding.get("endpoint"))
     if pinned != endpoint_key(monitored_url):
         raise GuardError("monitored_downloader_binding_mismatch")
-    fields = {f.get("name"): f.get("value") for f in client.get("fields", [])
-              if isinstance(f, dict)}
-    host, port, ssl = fields.get("host"), fields.get("port"), fields.get("useSsl")
-    base = fields.get("urlBase") or ""
+    required = ("host", "port", "useSsl", "urlBase", "tvCategory")
+    raw_fields = client.get("fields")
+    if not isinstance(raw_fields, list) or any(not isinstance(f, dict) for f in raw_fields):
+        raise GuardError("invalid_sonarr_downloader_endpoint")
+    fields = {}
+    for field in raw_fields:
+        name = field.get("name")
+        if name not in required:
+            continue
+        if name in fields:
+            raise GuardError("invalid_sonarr_downloader_endpoint")
+        fields[name] = field.get("value")
+    if set(fields) != set(required):
+        raise GuardError("invalid_sonarr_downloader_endpoint")
+    host, port, ssl, base, category = (fields[name] for name in required)
     if (not isinstance(host, str) or not host or not integer(port) or not 1 <= port <= 65535
-            or not isinstance(ssl, bool) or not isinstance(base, str)
+            or not isinstance(ssl, bool) or (base is not None and not isinstance(base, str))
             or "/" in host or "@" in host or "?" in host or "#" in host):
         raise GuardError("invalid_sonarr_downloader_endpoint")
+    if not isinstance(category, str) or category != instance["category"]:
+        raise GuardError("ambiguous_download_client")
     if ":" in host and not host.startswith("["):
         host = "[" + host + "]"
     actual = ("https" if ssl else "http") + "://" + host + ":" + str(port)
@@ -110,6 +123,8 @@ class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         if config_path is not None:
             state_files = ("connections.json", ".connections-validation.json", "guard.lock", "batch-state.json",
                            "routine-authorization.json", "container-live-scope.json", "container-status.json",
+                           "container-live-journal.json", "preview-journal.sqlite3", "preview-journal.sqlite3-journal",
+                           "preview-journal.sqlite3-wal", "preview-journal.sqlite3-shm",
                            "container-worker.lock", "action-journal.sqlite3", "action-journal.sqlite3-journal",
                            "action-journal.sqlite3-wal", "action-journal.sqlite3-shm")
             reserved = {(config_path.parent / name).resolve() for name in state_files}
@@ -144,12 +159,17 @@ class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
             raise
 
 
+IDENTITY_CACHE_LIMIT = 10000
+IDENTITY_CACHE_SECONDS = 3600
+
+
 def load_batch_state(path):
     try:
         if not path.exists():
             return {}
         state = json.loads(path.read_text())
-        if not isinstance(state, dict) or set(state) - {"after", "timed_out", "verification_after", "dispatch_after", "recovery_after"}:
+        if not isinstance(state, dict) or set(state) - {
+                "after", "timed_out", "verification_after", "dispatch_after", "recovery_after", "identity_cache"}:
             raise ValueError()
         for key in ("after", "timed_out", "verification_after", "dispatch_after"):
             if key not in state:
@@ -159,6 +179,11 @@ def load_batch_state(path):
                     or not isinstance(cursor[0], str) or not cursor[0].strip()):
                 raise ValueError()
             torrent_hash(cursor[1])
+        if "identity_cache" in state:
+            mode = path.stat().st_mode
+            if path.is_symlink() or not stat.S_ISREG(mode) or (os.name != "nt" and mode & 0o077):
+                raise GuardError("invalid_batch_state")
+            validate_identity_cache(state["identity_cache"])
         if "recovery_after" in state:
             from safety import valid_digest
             if not valid_digest(state["recovery_after"]):
@@ -385,14 +410,65 @@ def classify_source(policy, source):
     return "unknown"
 
 
+def identity_cache_entry(canonical, entry):
+    if (not isinstance(entry, list) or len(entry) != 5
+            or any(not integer(value) or value <= 0 for value in entry[:3])):
+        raise GuardError("invalid_batch_state")
+    return bulk_hashes({"hash": canonical, "infohash_v1": entry[3], "infohash_v2": entry[4]})
+
+
+def validate_identity_cache(cache):
+    from safety import valid_digest
+    if (not isinstance(cache, dict) or set(cache) != {"scope", "entries"} or not valid_digest(cache["scope"])
+            or not isinstance(cache["entries"], dict) or len(cache["entries"]) > IDENTITY_CACHE_LIMIT):
+        raise GuardError("invalid_batch_state")
+    for canonical, entry in cache["entries"].items():
+        if torrent_hash(canonical) != canonical:
+            raise GuardError("invalid_batch_state")
+        identity_cache_entry(canonical, entry)
+
+
+def torrent_incarnation(torrent):
+    if torrent.get("state") in ("metaDL", "forcedMetaDL"):
+        return None
+    keys = [torrent.get("added_on"), torrent.get("total_size")]
+    return keys if all(integer(value) and value > 0 for value in keys) else None
+
+
+def setup_identity_cache(qb, config, torrents, state):
+    missing = {key: identity for key, torrent in torrents.items()
+               if not {"infohash_v1", "infohash_v2"} <= torrent.keys()
+               and (identity := torrent_incarnation(torrent)) is not None}
+    if not missing:
+        qb.identity_cache = None
+        state.pop("identity_cache", None)
+        return
+    scope = hashlib.sha256(json.dumps(endpoint_key(config["qbittorrent"]["url"])).encode()).hexdigest()
+    previous = state.get("identity_cache", {})
+    snapshot_time = time.time()
+    entries = {key: entry for key, entry in previous.get("entries", {}).items()
+               if previous.get("scope") == scope and missing.get(key) == entry[:2]
+               and 0 <= snapshot_time - entry[2] < IDENTITY_CACHE_SECONDS}
+    qb.identity_cache = entries
+    state["identity_cache"] = {"scope": scope, "entries": entries}
+
+
 def verified_hashes(qb, torrent):
     canonical = torrent_hash(torrent.get("hash"))
     if {"infohash_v1", "infohash_v2"} <= torrent.keys():
         return bulk_hashes(torrent)
+    cache = getattr(qb, "identity_cache", None)
+    incarnation = torrent_incarnation(torrent)
+    entry = cache.get(canonical) if cache is not None else None
+    if entry is not None and incarnation == entry[:2] and 0 <= time.time() - entry[2] < IDENTITY_CACHE_SECONDS:
+        return identity_cache_entry(canonical, entry)
     properties = qb.call("/api/v2/torrents/properties", {"hash": canonical})
     if not isinstance(properties, dict) or torrent_hash(properties.get("hash")) != canonical:
         raise GuardError("torrent_hash_identity_unavailable")
-    return bulk_hashes(properties)
+    aliases = bulk_hashes(properties)
+    if cache is not None and incarnation is not None and (canonical in cache or len(cache) < IDENTITY_CACHE_LIMIT):
+        cache[canonical] = [*incarnation, int(time.time()), properties["infohash_v1"], properties["infohash_v2"]]
+    return aliases
 
 
 def bulk_hashes(torrent):
@@ -564,6 +640,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
     deadline = min((stamp for stamp in deadlines if stamp is not None), default=float("inf"))
     reports, queues, clients = [], {}, {}
     by_hash = torrents_by_hash(qb.call("/api/v2/torrents/info"))
+    if batch_state is not None:
+        setup_identity_cache(qb, config, by_hash, batch_state)
     owners = collections.defaultdict(set)
     for label, api in sonarr_apis.items():
         queues[label] = records(api, "/api/v3/queue", {"includeUnknownSeriesItems": "true"}, max_pages)
@@ -601,9 +679,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     raise GuardError("missing_or_wrong_downloader_binding")
                 compatible = [x for x in clients[label] if isinstance(x, dict)
                               and integer(x.get("id")) and x["id"] == binding["id"]
-                              and x.get("enable") is True and x.get("implementation") == "QBittorrent"
-                              and any(isinstance(f, dict) and f.get("name") == "tvCategory"
-                                      and f.get("value") == category for f in x.get("fields", []))]
+                              and x.get("enable") is True and x.get("implementation") == "QBittorrent"]
                 if len(compatible) != 1:
                     raise GuardError("ambiguous_download_client")
                 client = compatible[0]
@@ -615,6 +691,8 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                         raise GuardError("wrong_download_client")
                     if cid is None and cname != client_name:
                         raise GuardError("unconfirmed_download_client")
+                    if "downloadClient" in row and cname != client_name:
+                        raise GuardError("wrong_download_client")
                 candidates.append((label, h, rows, t, report, client_name))
             except GuardError as e:
                 report.update(decision="skip", reason=str(e))
@@ -855,7 +933,7 @@ def main():
                     readiness = read_readiness(apis)
                     reports = run(config, qb, apis, batch_state=batch_state, include_titles=args.show_titles)
                     if args.check_safeguards:
-                        journal = Journal(args.config.parent / "action-journal.sqlite3")
+                        journal = Journal(args.config.parent / "preview-journal.sqlite3")
                         try:
                             for report in reports:
                                 if report["decision"] != "would_fail":

@@ -70,7 +70,7 @@ def main():
                 or (leaf.startswith("connections") and leaf.endswith(".json"))
                 or leaf.startswith(".guard-") or leaf == ".connections-validation.json"
                 or leaf in ("config.json", "batch-state.json", "routine-authorization.json",
-                            "container-live-scope.json")
+                            "container-live-scope.json", "container-live-journal.json")
                 or leaf.endswith((".log", ".lock", ".zip", ".sqlite3")) or ".sqlite3-" in leaf or ".log." in leaf
                 or any(x in ("local", "downloads", "staging") for x in parts)):
             issues.append((name, "prohibited runtime or handoff artifact"))

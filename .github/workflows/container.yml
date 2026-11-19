@@ -23,6 +23,10 @@ jobs:
   cadence:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       run_build: ${{ steps.cadence.outputs.run_build }}
     steps:
@@ -33,8 +37,12 @@ jobs:
           # Epoch-day modulo stays 72-hourly across month/year boundaries.
           run_build=true
           if [ "$GITHUB_EVENT_NAME" = schedule ]; then
-            epoch_seconds=$(date -u +%s)
-            if [ "$(( (epoch_seconds / 86400) % 3 ))" -ne 0 ]; then
+            created_at=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.created_at')
+            epoch_seconds=$(date -u -d "$created_at" +%s)
+            # Use the daily schedule slot before the run was queued, not
+            # the calendar day when a delayed runner starts.
+            slot_day=$(( (epoch_seconds - (23 * 3600 + 17 * 60)) / 86400 ))
+            if [ "$(( slot_day % 3 ))" -ne 0 ]; then
               run_build=false
             fi
           fi

@@ -183,6 +183,43 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(report["decision"], "would_fail")
         return report
 
+    def test_renaming_owner_keeps_an_unresolved_hold_for_same_binding(self):
+        previous = self.journal.prepare(self.report, mode="single_test", context=self.context)
+        self.journal.transition(previous["key"], "prepared", "dispatch_recorded")
+        self.journal.transition(previous["key"], "dispatch_recorded", "uncertain")
+        self.config["sonarr"]["Renamed HD"] = self.config["sonarr"].pop("HD")
+        apis = {"Renamed HD": self.s}
+        current = run(self.config, self.qb, apis)[0]
+        self.assertEqual(current["decision"], "would_fail")
+        approval = dict(self.approval, **{key: current[key] for key in (
+            "instance", "ownership_fingerprint", "manifest_fingerprint")})
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch("production._send_queue_delete") as send:
+            with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
+                production.execute_single_test(self.config, self.qb, apis, self.journal, current, approval)
+        send.assert_not_called()
+        self.assertEqual(self.journal.get(previous["key"])["stage"], "uncertain")
+
+    def test_malformed_client_settings_and_contradictory_queue_name_cannot_send(self):
+        fields = self.s.routes["/api/v3/downloadclient"][0]["fields"]
+        original = copy.deepcopy(fields)
+        queue_row = self.s.routes["/api/v3/queue"]["records"][0]
+        for problem in ("duplicate_category", "non_text_base", "other_client_name", "null_client_name"):
+            with self.subTest(problem=problem):
+                fields[:] = copy.deepcopy(original)
+                queue_row.pop("downloadClient", None)
+                if problem == "duplicate_category":
+                    fields.append({"name": "tvCategory", "value": "another-category"})
+                elif problem == "non_text_base":
+                    next(field for field in fields if field["name"] == "urlBase")["value"] = []
+                else:
+                    queue_row["downloadClient"] = "A Different Client" if problem == "other_client_name" else None
+                self.assertEqual(run(self.config, self.qb, self.apis)[0]["decision"], "skip")
+                with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
+                        "production._send_queue_delete") as send, self.assertRaises(SafetyError):
+                    production.execute_single_test(self.config, self.qb, self.apis,
+                                                   self.journal, self.report, self.approval)
+                send.assert_not_called()
+
     def test_hybrid_hashes_bind_history_and_send_only_through_sonarr(self):
         report = self.hybrid_report()
         approval = {**self.approval, **{key: report[key] for key in (

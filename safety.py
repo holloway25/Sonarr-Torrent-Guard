@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+import secrets
 
 OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
 DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
@@ -178,6 +179,25 @@ class Journal:
                             "mode TEXT NOT NULL, payload TEXT NOT NULL, archived_at REAL NOT NULL)")
             self.db.execute("CREATE INDEX IF NOT EXISTS archive_owner_hash ON actions_archive(instance,hash)")
 
+    def installation_id(self, *, create=False):
+        """Keep a durable journal identity separate from live scope approval."""
+        if create:
+            if self.read_only:
+                raise SafetyError("container_journal_identity_mismatch")
+            with self.db:
+                self.db.execute("CREATE TABLE IF NOT EXISTS installation_identity "
+                                "(singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL)")
+                if self.db.execute("SELECT 1 FROM installation_identity").fetchone() is None:
+                    self.db.execute("INSERT INTO installation_identity VALUES (1,?)", (secrets.token_hex(32),))
+        exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                 "AND name='installation_identity'").fetchone()
+        if exists is None:
+            return None
+        rows = self.db.execute("SELECT singleton,id FROM installation_identity").fetchall()
+        if len(rows) != 1 or rows[0][0] != 1 or not valid_digest(rows[0][1]):
+            raise SafetyError("container_journal_identity_mismatch")
+        return rows[0][1]
+
     def close(self):
         self.db.close()
 
@@ -343,31 +363,33 @@ class Journal:
                             (command_id, time.time(), key))
         return self.get(key)
 
-    def related(self, instance, hash_value, aliases=()):
-        """Find holds for the same owner and any overlapping recorded identity."""
+    def related(self, instance, hash_value, aliases=(), *, binding=None):
+        """Find overlapping identity under the same owner label or durable binding."""
         from guard import torrent_hash
 
-        hashes = sorted({torrent_hash(h) for h in (*aliases, hash_value)})
-        result = []
-        for (key,) in self.db.execute(
-                "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt')").fetchall():
-            row = self.get(key)
-            if row["evidence"]["instance"] != instance:
-                continue
-            recorded = {row["evidence"]["hash"], *row["context"].get("hash_aliases", ())}
-            if recorded.intersection(hashes):
-                result.append(row)
-        keys = self.db.execute(
-            "SELECT key FROM actions_archive WHERE instance=? AND mode IN ('single_test','public_attempt') "
-            "AND (hash IN (SELECT value FROM json_each(?)) OR EXISTS ("
+        hashes = json.dumps(sorted({torrent_hash(h) for h in (*aliases, hash_value)}))
+        # The read-only legacy projection can supply an empty context when
+        # that column predates binding and alias evidence.
+        context = "context" if "context" in self._action_projection.split(",") else "'{}'"
+        active = self.db.execute(
+            "SELECT key FROM actions WHERE mode IN ('single_test','public_attempt') AND "
+            f"(json_extract(evidence, '$.instance')=? OR json_extract({context}, '$.binding_digest')=?) AND "
+            "(json_extract(evidence, '$.hash') IN (SELECT value FROM json_each(?)) OR EXISTS ("
+            f"SELECT 1 FROM json_each({context}, '$.hash_aliases') AS alias "
+            "WHERE alias.value IN (SELECT value FROM json_each(?)))) LIMIT ?",
+            (instance, binding, hashes, hashes, RELATED_RECORD_LIMIT + 1),
+        ).fetchall()
+        cold = self.db.execute(
+            "SELECT key FROM actions_archive WHERE mode IN ('single_test','public_attempt') AND "
+            "(instance=? OR json_extract(json_extract(payload, '$.context'), '$.binding_digest')=?) AND "
+            "(hash IN (SELECT value FROM json_each(?)) OR EXISTS ("
             "SELECT 1 FROM json_each(json_extract(payload, '$.context'), '$.hash_aliases') AS alias "
             "WHERE alias.value IN (SELECT value FROM json_each(?)))) LIMIT ?",
-            (instance, json.dumps(hashes), json.dumps(hashes), RELATED_RECORD_LIMIT + 1),
+            (instance, binding, hashes, hashes, RELATED_RECORD_LIMIT + 1),
         ).fetchall() if self.has_archive else []
-        if len(result) + len(keys) > RELATED_RECORD_LIMIT:
+        if len(active) + len(cold) > RELATED_RECORD_LIMIT:
             raise SafetyError("journal_history_limit_reached")
-        result.extend(self.get(key) for (key,) in keys)
-        return result
+        return [self.get(key) for (key,) in active + cold]
 
     def archive_resolved(self, now=None, batch_limit=100, preview=True):
         """Move old resolved production records atomically, preserving ALL columns.

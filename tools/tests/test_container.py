@@ -354,6 +354,48 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         cycle.assert_called_once()
 
+    def test_partial_restore_cannot_create_a_new_live_journal(self):
+        from contextlib import closing
+        from safety import Journal
+
+        self.legacy_hold()
+        env = dict(self.env, STGUARD_MODE="live")
+        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
+        result, cycle, _ = self.run_mode(env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+        path = self.path / worker.JOURNAL_FILE
+        marker = self.path / worker.JOURNAL_MARKER
+        self.assertTrue(marker.exists())
+        saved = path.read_bytes()
+        path.unlink()
+        for command in ("--check-config", "--once", "--approve-live-scope"):
+            with self.subTest(command=command):
+                result, cycle, error = self.run_mode(env, command)
+                self.assertEqual(result, 1)
+                self.assertIn("container_journal_missing", error)
+                cycle.assert_not_called()
+                self.assertFalse(path.exists())
+        with closing(Journal(path)) as orphan:
+            orphan.installation_id(create=True)
+        result, cycle, error = self.run_mode(env, "--once")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_identity_mismatch", error)
+        cycle.assert_not_called()
+        path.write_bytes(saved)
+        self.assertEqual(self.run_mode(env, "--once")[0], 0)
+
+    def test_legacy_approved_scope_without_journal_refuses_live_start(self):
+        from authorization import container_scope_record
+        config = worker.runtime_config(self.env)
+        worker.atomic_json(self.path / "connections.json", config)
+        worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, container_scope_record(config))
+        result, cycle, error = self.run_mode(dict(self.env, STGUARD_MODE="live"), "--once")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_missing", error)
+        cycle.assert_not_called()
+        self.assertFalse((self.path / worker.JOURNAL_FILE).exists())
+
     def test_scope_change_requires_confirmation_even_after_restart(self):
         env = dict(self.env, STGUARD_MODE="live")
         self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)

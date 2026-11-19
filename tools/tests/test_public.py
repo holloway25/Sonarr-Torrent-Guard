@@ -471,6 +471,44 @@ class PublicTests(unittest.TestCase):
                 row = reconcile(f.journal, row["key"], verifier.observe)
                 self.assertEqual(row["stage"], "cleanup_resolved")
 
+    def test_future_records_cannot_resolve_cleanup(self):
+        f = self.f
+
+        def future_results(*args):
+            self.result()
+            timestamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
+            for record in f.s.routes["/api/v3/history/since"][1:]:
+                record["date"] = timestamp
+            f.s.routes["/api/v3/blocklist"]["records"][0]["date"] = timestamp
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=future_results):
+            row = self.execute()
+        self.assertEqual(row["stage"], "uncertain")
+        for field in ("failed", "blocklisted", "replacement_observed"):
+            self.assertIsNone(row["current_observation"][field])
+            self.assertNotIn(field, row["confirmed"])
+
+    def test_guard_preview_uses_separate_capacity_from_production(self):
+        import contextlib
+        import io
+        import guard
+
+        f = self.f
+        directory = Path(f.folder.name)
+        production_path = directory / "action-journal.sqlite3"
+        preview_path = directory / "preview-journal.sqlite3"
+        args = ["guard.py", "--config", str(directory / "connections.json"), "--check-safeguards"]
+        with contextlib.redirect_stdout(io.StringIO()), patch("sys.argv", args), patch(
+                "guard.load_config", return_value=f.config), patch("guard.Api", side_effect=[f.qb, f.s]):
+            self.assertEqual(guard.main(), 0)
+        self.assertFalse(production_path.exists())
+        with contextlib.closing(Journal(preview_path, read_only=True)) as journal:
+            self.assertEqual(journal.db.execute("SELECT mode,stage FROM actions").fetchall(),
+                             [("preview", "preview_verified")])
+        with contextlib.closing(Journal(production_path, limit=1, allow_public_attempt=True)) as journal:
+            self.assertEqual(journal.prepare(f.report, mode="public_attempt", context=f.context)["stage"], "prepared")
+
     def test_old_negative_does_not_end_recovery_when_current_failure_is_unknown(self):
         f = self.f
         row = f.journal.prepare(f.report, mode="public_attempt", context=f.context)

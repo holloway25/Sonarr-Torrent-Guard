@@ -19,6 +19,8 @@ from guard import GuardError, load_config, source_policy_key
 from safety import SafetyError
 
 CONFIG_DIR = Path("/config")
+JOURNAL_FILE = "action-journal.sqlite3"
+JOURNAL_MARKER = "container-live-journal.json"
 APP_DIR = Path(__file__).resolve().parent
 INTERVAL_SECONDS = 600
 CYCLE_TIMEOUT = 210
@@ -140,11 +142,25 @@ def configure(env, *, check_only=False, validate=None):
 def validate_journal_identity(config):
     from production import binding_digest
     from safety import Journal
-    path = CONFIG_DIR / "action-journal.sqlite3"
+    path = CONFIG_DIR / JOURNAL_FILE
+    marker = CONFIG_DIR / JOURNAL_MARKER
     if not path.exists() and not path.is_symlink():
+        scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
+        if marker.exists() or marker.is_symlink() or (CONFIG_DIR / "container-status.json").exists():
+            raise SafetyError("container_journal_missing")
+        if scope_path.exists() and read_container_scope(scope_path)["scope_digest"] is not None:
+            raise SafetyError("container_journal_missing")
         return
     journal = Journal(path, read_only=True)
     try:
+        if marker.exists() or marker.is_symlink():
+            from authorization import read_grant
+            try:
+                identity = journal.installation_id()
+                if identity is None or read_grant(marker) != {"journal_id": identity}:
+                    raise SafetyError("container_journal_identity_mismatch")
+            except SafetyError:
+                raise SafetyError("container_journal_identity_mismatch") from None
         keys = journal.db.execute("SELECT key FROM actions").fetchall()
         if journal.has_archive:
             keys += journal.db.execute("SELECT key FROM actions_archive").fetchall()
@@ -157,6 +173,22 @@ def validate_journal_identity(config):
                 raise GuardError("container_identity_migration_required")
     finally:
         journal.close()
+
+
+def initialize_journal():
+    from safety import Journal
+
+    marker = CONFIG_DIR / JOURNAL_MARKER
+    if marker.exists():
+        return
+    # Hold the same lock as standalone workers during a one-time adoption.
+    with (CONFIG_DIR / "guard.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        journal = Journal(CONFIG_DIR / JOURNAL_FILE)
+        try:
+            atomic_json(marker, {"journal_id": journal.installation_id(create=True)})
+        finally:
+            journal.close()
 
 
 def healthcheck():
@@ -279,6 +311,7 @@ def main():
             if args.check_config:
                 print(json.dumps({"event": "container_configuration_valid", "mode": mode, "actions_sent": False}))
                 return 0
+            initialize_journal()
             if scope_update is not None:
                 atomic_json(scope_path, scope_update)
             if args.approve_live_scope:
@@ -306,8 +339,9 @@ def main():
     except BlockingIOError:
         reason = "another_container_worker_is_active"
     except SafetyError as error:
-        reason = (str(error) if str(error) == "container_live_scope_confirmation_required"
-                  else "container_configuration_or_startup_unavailable")
+        allowed = {"container_live_scope_confirmation_required", "container_journal_missing",
+                   "container_journal_identity_mismatch"}
+        reason = str(error) if str(error) in allowed else "container_configuration_or_startup_unavailable"
     except Exception:
         # Environment/config/HTTP exceptions can contain credentials: never print them.
         reason = "container_configuration_or_startup_unavailable"

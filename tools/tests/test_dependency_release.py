@@ -252,17 +252,21 @@ with patch('pathlib.Path', side_effect=fixture_path):
             root = Path(folder)
             output = root / "output"
 
-            def run(event, stamp, clock='date() { printf "%s\\n" "$TEST_NOW"; }\n'):
+            def run(event, stamp, created=None):
+                clock = ('gh() { printf "%s\\n" "$TEST_CREATED"; }\n'
+                         'date() { if [ "$2" = "-d" ]; then printf "%s\\n" "$3"; '
+                         'else printf "%s\\n" "$TEST_NOW"; fi; }\n')
                 output.write_text("")
                 env = dict(os.environ, GITHUB_EVENT_NAME=event, GITHUB_OUTPUT=str(output),
-                           TEST_NOW=str(stamp))
+                           TEST_NOW=str(stamp), TEST_CREATED=str(stamp if created is None else created),
+                           GITHUB_REPOSITORY="example/project", GITHUB_RUN_ID="1")
                 # A shell clock fixture needs no executable files on /tmp,
                 # which is intentionally noexec in the hardened CI container.
                 return subprocess.run(["bash", "-c", clock + script], env=env, capture_output=True,
                                       text=True, timeout=5)
 
-            def due(event, stamp):
-                result = run(event, stamp)
+            def due(event, stamp, created=None):
+                result = run(event, stamp, created)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, "")
                 value = output.read_text().strip()
@@ -280,6 +284,8 @@ with patch('pathlib.Path', side_effect=fixture_path):
                     with self.subTest(day=day):
                         result = due("schedule", stamp)
                         self.assertEqual(result, (stamp // 86400) % 3 == 0)
+                        self.assertEqual(due("schedule", stamp + 3600, stamp + 44 * 60), result)
+                        self.assertEqual(due("schedule", stamp + 90000, stamp), result)
                         results.append(result)
                 due_days = [i for i, result in enumerate(results) if result]
                 self.assertTrue(all(b - a == 3 for a, b in zip(due_days, due_days[1:])))

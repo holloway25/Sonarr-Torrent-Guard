@@ -33,6 +33,7 @@ ROUTINE_RELEASE_ENABLED = False
 # Reviewed metadata policy; sender gates and explicit grants still required.
 METADATA_RETRY_RELEASE_ENABLED = True
 SUPPORTED_SONARR_VERSION = "4.0.20.3014"
+EVENT_CLOCK_SKEW_SECONDS = 120
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
                   "window_start", "baseline_history_ids", "baseline_blocklist_ids", "approval_digest"}
@@ -131,9 +132,7 @@ def bound_client(config, api, label):
         raise SafetyError("invalid_client_response")
     matches = [c for c in clients if isinstance(c, dict) and integer(c.get("id"))
                and c["id"] == item["download_client_binding"]["id"]
-               and c.get("enable") is True and c.get("implementation") == "QBittorrent"
-               and any(isinstance(f, dict) and f.get("name") == "tvCategory" and
-                       f.get("value") == item["category"] for f in c.get("fields", []))]
+               and c.get("enable") is True and c.get("implementation") == "QBittorrent"]
     if len(matches) != 1:
         raise SafetyError("ambiguous_download_client")
     verify_client_binding(item, config["qbittorrent"]["url"], matches[0])
@@ -154,7 +153,7 @@ def history_since(api, start):
     return rows
 
 
-def outcome_history(api, series, episodes, start, max_pages):
+def outcome_history(api, series, episodes, start, max_pages, *, on_episode=None):
     rows = []
     ids = set()
     for episode in episodes:
@@ -167,6 +166,8 @@ def outcome_history(api, series, episodes, start, max_pages):
                     or row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000):
                 raise SafetyError("invalid_history_response")
             ids.add(row["id"])
+        if on_episode is not None:
+            on_episode(relevant)
         rows.extend(relevant)
     return rows
 
@@ -194,6 +195,8 @@ def event_time(row):
 def event_after(row, boundary):
     """A truncated timestamp represents an interval, not an exact instant."""
     start = event_time(row)
+    if start > time.time() + EVENT_CLOCK_SKEW_SECONDS:
+        return None
     match = re.search(r"T\d{2}:\d{2}:\d{2}(?:[.,](\d+))?", row["date"])
     if match is None:
         raise SafetyError("invalid_event_timestamp")
@@ -413,11 +416,30 @@ class OutcomeVerifier:
                 result["torrent_absent"] = None
         except Exception:
             pass
+        baseline_ids = set(c["baseline_history_ids"])
+
+        def observe_episode(rows):
+            for event in rows:
+                if event["id"] in baseline_ids:
+                    continue
+                try:
+                    if history_event_type(event) != "grabbed" or event_after(event, self.not_before) is not True:
+                        continue
+                    data = event.get("data")
+                    if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
+                        continue
+                    torrent_hash(event.get("downloadId"))
+                except (GuardError, SafetyError):
+                    continue
+                result["replacement_grab_observed"] = True
+                return
+
         try:
-            # Keep the entire dispatch second for timestamps with truncated precision.
+            # Preserve a known grab even if a later episode fails to load.
             rows = outcome_history(api, c["series_id"], c["episode_ids"], math.floor(self.not_before),
-                                   self.config.get("max_pages", 20))
-            new = [r for r in rows if r["id"] not in c["baseline_history_ids"]]
+                                   self.config.get("max_pages", 20),
+                                   on_episode=observe_episode if metadata_retry else None)
+            new = [r for r in rows if r["id"] not in baseline_ids]
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
             aliases = set(c.get("hash_aliases", [c["hash"]]))
@@ -442,9 +464,7 @@ class OutcomeVerifier:
                 if metadata_retry and kind == "grabbed":
                     # A verified Sonarr grab can veto a search before qBittorrent
                     # can confirm that it is downloading a replacement.
-                    if confirmed and h is not None:
-                        result["replacement_grab_observed"] = True
-                    else:
+                    if not confirmed or h is None:
                         uncertain_grab = True
                 if kind == "downloadFailed":
                     title = r.get("sourceTitle")
@@ -743,7 +763,9 @@ def confirmed_successor(previous, report, config):
 
 
 def check_prior_attempts(journal, report, approval_digest=None, config=None):
-    for previous in journal.related(report["instance"], report["hash"], report.get("hash_aliases", ())):
+    binding = binding_digest(config, report["instance"]) if config is not None else None
+    for previous in journal.related(report["instance"], report["hash"], report.get("hash_aliases", ()),
+                                    binding=binding):
         if previous["stage"] in ("cancelled", "dispatch_blocked"):
             if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
                 raise SafetyError("approval_already_consumed")

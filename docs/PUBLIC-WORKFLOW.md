@@ -30,12 +30,17 @@ rule out a collision and holds cleanup.
 
 Fresh checks bind the verified identities into the ownership fingerprint and
 retain them in the action context. Prior-attempt lookup checks overlapping
-hashes for both active and archived records. A legacy record contributes
+hashes for both active and archived records using the Sonarr label and the
+durable Sonarr/downloader binding. Renaming an owner preserves its existing holds. A legacy record contributes
 only its stored hash. Recovery and the final metadata retry check use
 qBittorrent's bulk torrent list to check every advertised hash, even for legacy
 single-hash records. When rows omit the infohash fields, Guard uses the same
 per-torrent properties fallback as assessment, within the current phase
-deadline. If the available identity evidence cannot rule out a match, torrent
+deadline. Verified hashes for a stable torrent can carry over to the next pass
+through private batch state. Guard checks the current downloader, primary hash,
+addition time and size before reuse. The cache expires after one hour, and a
+torrent waiting for metadata needs a fresh read. If the available identity
+evidence cannot rule out a match, torrent
 absence stays unknown. Guard checks failure and replacement history against both
 the saved and currently verified hashes. A new alias alone does not establish a
 replacement.
@@ -48,7 +53,8 @@ ambiguous source identity are protected before manifest assessment. A policy
 change needs review and a new grant for standalone live workers. Preserve the journal.
 Dispatch/recovery behaviour is tested using simulations and mocked production
 adapters. Enable
-`--check-safeguards` to exercise rechecks and preview journaling against the APIs.
+`--check-safeguards` to exercise rechecks against the APIs. New preview entries go
+into `preview-journal.sqlite3` so they have their own capacity.
 
 ## Proposed normal path
 
@@ -222,6 +228,7 @@ after that timestamp as well as absent from the pre-dispatch baselines. Sonarr's
 truncated timestamps are interpreted as intervals at their published precision.
 An interval overlapping dispatch (including the same whole second) is unknown,
 not false or confirmed: the API cannot establish ordering inside that interval.
+Timestamps more than two minutes ahead of the worker's clock remain uncertain.
 No blanket one-second tolerance accepts potentially pre-dispatch evidence.
 Unknown failure/blocklist evidence after removal remains uncertain; explicit
 negative or contradictory evidence still requires review. Missing
