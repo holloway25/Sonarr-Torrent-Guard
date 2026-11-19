@@ -24,9 +24,8 @@ no hash/indexer timeout ban and no new attempt-counter database. Repeated metada
 timeouts may therefore lead to repeated searches until the trial expires or the
 existing bounded journal reaches capacity and fails closed.
 
-File-policy failures require manual review in Sonarr because Guard cannot
-verify the complete blocklist scope. The metadata retry workflow does not
-apply to those failures. Existing
+File-policy failures use a [separate eligibility check and repeat-search limit](PUBLIC-WORKFLOW.md#live-file-policy-cleanup).
+Both workflows request removal without blocklisting. Existing
 blocklist entries are not removed or bypassed: Sonarr can reject the same known
 hash across indexers for the series. No direct qBittorrent deletion, file deletion,
 selection, resume, tracker/DHT change, indexer selection or scoring change is added.
@@ -57,7 +56,7 @@ blocklist observations may correctly be false; never invent positive evidence.
 `retry_removed` requires current confirmation that the original torrent is gone
 and no new matching blocklist entry was found. If the post-removal blocklist
 result is uncertain, the retry stays on hold for read-only recovery.
-A newly matched blocklist record for any affected episode requires manual review. Ordinary file cleanup still requires a match for every affected episode
+A newly matched blocklist record for any affected episode requires manual review. Verification of historical blocklisting operations still requires a match for every affected episode
 to confirm blocklisting. Data deletion stays unknown and remains Sonarr's
 responsibility.
 

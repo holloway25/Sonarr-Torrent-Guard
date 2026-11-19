@@ -5,11 +5,24 @@
 # No supported API supplies equivalent evidence for automatic blocklisting.
 BLOCKLIST_SCOPE_VERIFIABLE = False
 BLOCKLIST_MANUAL_REASON = "sonarr_blocklist_scope_unverifiable"
+FILE_FAILURE_REASONS = ("contains_exe", "contains_scr", "blocked_file_selected",
+                        "all_files_unselected", "only_txt_nfo_selected")
+
+
+def file_policy_removal(report):
+    reasons = report.get("reasons", ())
+    return (not BLOCKLIST_SCOPE_VERIFIABLE and report.get("decision") == "would_fail"
+            and isinstance(reasons, (list, tuple)) and bool(reasons)
+            and all(reason in FILE_FAILURE_REASONS for reason in reasons))
+
+
+def removal_without_blocklist(context):
+    return context.get("file_cleanup") is True or context.get("metadata_retry", {}).get("blocklist") is False
 
 
 def manual_handling_reason(report):
     if (report.get("decision") == "would_fail" and report.get("reasons") != ["metadata_timeout"]
-            and not BLOCKLIST_SCOPE_VERIFIABLE):
+            and not BLOCKLIST_SCOPE_VERIFIABLE and not file_policy_removal(report)):
         return BLOCKLIST_MANUAL_REASON
     return None
 
@@ -37,7 +50,8 @@ def preview_failure(report, readiness):
     """Describe one future Sonarr operation per torrent, never send it.
 
     A preview is not authorization or a substitute for a fresh assessment.
-    Both retry switches are required conservatively, regardless of grab origin.
+    Both retry switches are required for a replacement search. Metadata
+    retries also require them before removal.
     """
     plan = {"status": "preview_only", "live_enabled": False,
             "blockers": ["live_sender_disabled", "fresh_recheck_required"],
@@ -66,9 +80,16 @@ def preview_failure(report, readiness):
     }
     if report.get("reasons") == ["metadata_timeout"]:
         plan["blockers"].append("explicit_metadata_retry_authorization_required")
+    if report.get("reasons") == ["metadata_timeout"] or file_policy_removal(report):
+        episodes = report.get("episode_ids")
+        if (not isinstance(episodes, list) or not episodes
+                or any(type(episode) is not int or episode <= 0 for episode in episodes)):
+            plan["blockers"].append("affected_episode_identity_unverified")
+            plan["request_preview"] = None
+            return plan
         plan["request_preview"]["params"].update(blocklist=False, skipRedownload=True)
         plan["extra_search"] = True
         plan["search_preview"] = {"method": "POST", "path": "/api/v3/command",
-                                  "body": {"name": "EpisodeSearch", "episodeIds": report["episode_ids"]},
+                                  "body": {"name": "EpisodeSearch", "episodeIds": episodes},
                                   "requires": "confirmed_removal_and_fresh_authorization"}
     return plan

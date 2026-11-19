@@ -1406,7 +1406,7 @@ class ProductionTests(unittest.TestCase):
             production.RejectDeleteRedirect().redirect_request(None)
 
 
-class ManualBlocklistTests(unittest.TestCase):
+class FileCleanupTests(unittest.TestCase):
     def setUp(self):
         self.f = ProductionTests()
         self.f.setUp(blocklist_verifiable=False)
@@ -1414,39 +1414,205 @@ class ManualBlocklistTests(unittest.TestCase):
         self.addCleanup(self.f.tearDown)
         self.f.journal.allow_public_attempt = True
 
-    def test_public_history_with_hidden_private_grabs_is_manual_in_workers_and_senders(self):
-        import public
-        from workflow import BLOCKLIST_MANUAL_REASON, preview_failure
+    def container_cycle(self, folder, send, *, mode="live"):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+        import os
+        import container_worker
+        import routine
 
         f = self.f
+        f.qb.login = Mock()
+        config = dict(f.config, dry_run=True)
+        config["qbittorrent"].update(username="downloader", password="REPLACE_ME")
+        path = folder / "connections.json"
+        with patch.object(container_worker, "CONFIG_DIR", folder):
+            if not path.exists():
+                container_worker.atomic_json(path, config)
+                container_worker.initialize_journal()
+                container_worker.atomic_json(folder / container_worker.CONTAINER_SCOPE_FILE,
+                                             container_worker.container_scope_record(config))
+        args = ["routine.py", "--config", str(path), "--container-mode", "--container-journal",
+                "--live", "--log-file", str(folder / "routine.log")]
+        adapters = [f.qb, *f.apis.values()]
+        with patch("sys.argv", args), patch.dict(os.environ, {"STGUARD_MODE": mode}), patch(
+                "routine.Api", side_effect=adapters), patch("public.require_connectivity"), patch(
+                "urllib.request.build_opener", return_value=Mock(open=send)), redirect_stdout(StringIO()) as output:
+            self.assertEqual(routine.main(), 0)
+        return json.loads(output.getvalue())
+
+    def sonarr_transport(self, request, **kwargs):
+        import json
+        from urllib.parse import parse_qs, urlsplit
+
+        url = urlsplit(request.full_url)
+        self.assertEqual(url.netloc, "sonarr.example.invalid")
+        if request.get_method() == "DELETE":
+            self.assertEqual(url.path, "/api/v3/queue/7")
+            self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["false"],
+                                                  "skipRedownload": ["true"], "changeCategory": ["false"]})
+            self.f.qb.routes["/api/v2/torrents/info"] = []
+            body = b""
+        else:
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(url.path, "/api/v3/command")
+            self.assertEqual(json.loads(request.data), {"name": "EpisodeSearch", "episodeIds": [3]})
+            body = b'{"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
+        response = Mock(status=200, read=Mock(return_value=body))
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        return response
+
+    def test_live_container_removes_each_file_policy_failure_through_sonarr_without_blocklisting(self):
+        f = self.f
+        torrents = f.qb.routes["/api/v2/torrents/info"]
+        cases = [
+            (manifest(("episode.mkv", 1), ("PAYLOAD.EXE", 0)), "contains_exe"),
+            (manifest(("episode.mkv", 1), ("payload.scr", 0)), "contains_scr"),
+            (manifest(("episode.mkv", 1), ("archive.RAR", 1)), "blocked_file_selected"),
+            (manifest(("episode.mkv", 0)), "all_files_unselected"),
+            (manifest(("info.nfo", 1), ("notes.txt", 1), ("padding", 0)), "only_txt_nfo_selected"),
+        ]
+        # Sonarr's blocklisting connector can see history for a deleted
+        # episode which the public history API omits. No request may ask it to blocklist.
         private = dict(f.grab, id=6, episodeId=444,
                        data={**f.grab["data"], "indexer": "Private Source"})
-        # Sonarr's blocklisting code can see both rows. Its public history
-        # endpoint omits the private grab after its episode has been deleted.
-        internal_history = [f.grab, private]
-        visible = [row for row in internal_history if row["episodeId"] == 3]
-        f.s.routes["/api/v3/history"] = {"totalRecords": len(visible), "records": visible}
-        f.qb.login = Mock()
-        for parts in ((4, 0, 20, 3014), (4, 0, 0, 748)):
-            version = ".".join(map(str, parts))
-            with self.subTest(version=version), patch("public.require_connectivity"), patch(
-                    "production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
-                    "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
-                    "production._send_queue_delete") as remove:
-                f.s.routes["/api/v3/system/status"] = {"version": version}
-                result = public.cycle(f.config, f.qb, f.apis, f.journal, {})
-                report, = result["assessment"]
-                self.assertEqual(report.get("manual_handling_reason"), BLOCKLIST_MANUAL_REASON)
-                self.assertEqual(report["safeguards"]["status"], "manual_review")
-                self.assertEqual(report["proposed_actions"], ["review_release_manually_in_sonarr"])
-                self.assertIsNone(preview_failure(report, {})["request_preview"])
-                for execute in (production.execute_single_test, production.execute_public_attempt):
-                    with self.assertRaisesRegex(SafetyError, BLOCKLIST_MANUAL_REASON):
-                        execute(f.config, f.qb, f.apis, f.journal, report, f.approval)
-                self.assertEqual(f.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
-                remove.assert_not_called()
+        f.s.routes["/api/v3/history"]["records"] = [
+            row for row in (f.grab, private) if row["episodeId"] == 3]
+        for files, reason in cases:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder, patch(
+                    "production.METADATA_RETRY_RELEASE_ENABLED", False):
+                f.qb.routes["/api/v2/torrents/info"] = torrents
+                f.qb.routes["/api/v2/torrents/files"] = files
+                send = Mock(side_effect=self.sonarr_transport)
+                result = self.container_cycle(Path(folder), send)
+                self.assertEqual(result["status"], "completed")
+                self.assertIn(reason, result["assessment"][0]["reasons"])
+                self.assertEqual(len(result["actions"]), 1)
+                action, = result["actions"]
+                self.assertEqual(action["stage"], "retry_requested")
+                self.assertIs(action["confirmed"]["torrent_absent"], True)
+                self.assertIsNone(action["current_observation"]["data_deleted"])
+                self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST"])
 
-    def test_preflight_reports_manual_review_for_file_policy_candidates(self):
+    def test_live_container_rejects_healthy_private_ambiguous_and_dry_run_candidates(self):
+        f = self.f
+        row = f.s.routes["/api/v3/queue"]["records"][0]
+        for case in ("healthy", "private", "ambiguous", "dry-run"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                f.qb.routes["/api/v2/torrents/files"] = (
+                    manifest(("episode.mkv", 1), ("extras.rar", 0), ("link.lnk", 0))
+                    if case == "healthy" else manifest(("bad.scr", 0)))
+                row["indexer"] = "Private Source" if case == "private" else "Public Source"
+                f.config["sonarr"].pop("UHD", None)
+                f.apis.pop("UHD", None)
+                if case == "ambiguous":
+                    from copy import deepcopy
+                    other = FakeApi(deepcopy(f.s.routes))
+                    other.config = dict(f.s.config, url="https://other.example.invalid", category="tv-uhd")
+                    f.config["sonarr"]["UHD"] = other.config
+                    f.apis["UHD"] = other
+                send = Mock()
+                result = self.container_cycle(Path(folder), send, mode="dry-run" if case == "dry-run" else "live")
+                self.assertEqual(result["actions"], [])
+                if case != "dry-run":
+                    self.assertEqual(result["status"], "completed")
+                    if case == "ambiguous":
+                        self.assertIn("ambiguous_instance_ownership", {r.get("reason") for r in result["assessment"]})
+                send.assert_not_called()
+
+    def test_file_removal_does_not_depend_on_retry_settings_or_blocklist_availability(self):
+        from guard import GuardError
+
+        f = self.f
+        torrents = f.qb.routes["/api/v2/torrents/info"]
+        for ready, blocklist, reason in (
+                (False, {"totalRecords": 0, "records": []}, "retry_settings_not_ready"),
+                (True, GuardError("sonarr_unavailable"), "replacement_blocklist_uncertain")):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder:
+                f.qb.routes["/api/v2/torrents/info"] = torrents
+                f.s.routes["/api/v3/config/downloadclient"]["autoRedownloadFailed"] = ready
+                f.s.routes["/api/v3/blocklist"] = blocklist
+                send = Mock(side_effect=self.sonarr_transport)
+                result = self.container_cycle(Path(folder), send)
+                action, = result["actions"]
+                self.assertEqual((action["stage"], action["stop_reason"]), ("retry_search_blocked", reason))
+                self.assertIs(action["confirmed"]["torrent_absent"], True)
+                self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE"])
+
+    def test_file_removal_with_lost_response_is_never_replayed(self):
+        f = self.f
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            send = Mock(side_effect=TimeoutError)
+            first = self.container_cycle(folder, send)
+            action, = first["actions"]
+            self.assertEqual(action["stage"], "uncertain")
+            second = self.container_cycle(folder, send)
+            self.assertEqual(second["actions"], [])
+            self.assertEqual(second["assessment"][0]["safeguards"]["reason"], "previous_attempt_unresolved")
+            f.qb.routes["/api/v2/torrents/info"] = []
+            third = self.container_cycle(folder, send)
+            recovered, = third["recovery"]
+            self.assertEqual(recovered["stage"], "retry_removed")
+            self.assertEqual(third["actions"], [])
+        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE"])
+
+    def test_live_container_removes_a_verified_regrab_without_searching_for_it_again(self):
+        from contextlib import closing
+
+        f = self.f
+        torrent = f.qb.routes["/api/v2/torrents/info"][0]
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            send = Mock(side_effect=self.sonarr_transport)
+            first = self.container_cycle(folder, send)
+            action, = first["actions"]
+            self.assertEqual(action["stage"], "retry_requested")
+            with closing(Journal(folder / "action-journal.sqlite3", read_only=True)) as journal:
+                previous = journal.get(action["key"])
+            added = int(previous["dispatched_at"]) + 3
+            latest = dict(f.grab, id=50, date=datetime.datetime.fromtimestamp(added, datetime.timezone.utc).isoformat())
+            f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, latest]}
+            f.s.routes["/api/v3/history/since"] = [f.grab, latest]
+            f.qb.routes["/api/v2/torrents/info"] = [dict(torrent, added_on=added)]
+            with patch("time.time", return_value=added + 200):
+                second = self.container_cycle(folder, send)
+            with closing(Journal(folder / "action-journal.sqlite3", read_only=True)) as journal:
+                self.assertEqual(journal.get(action["key"]), previous)
+        action, = second["actions"]
+        self.assertEqual((action["stage"], action["stop_reason"]), ("retry_search_blocked", "file_policy_repeat_search_held"))
+        self.assertIs(action["confirmed"]["torrent_absent"], True)
+        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST", "DELETE"])
+
+    def test_file_manifest_changes_during_final_sonarr_read_hold_removal(self):
+        f = self.f
+        version = production.require_sonarr_v4
+        final_check = False
+        refresh = Journal.refresh_baselines
+
+        def mark_refreshed(journal, *args):
+            nonlocal final_check
+            result = refresh(journal, *args)
+            final_check = True
+            return result
+
+        def replace_manifest(api):
+            version(api)
+            if final_check:
+                f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1))
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+                Journal, "refresh_baselines", mark_refreshed), patch(
+                "production.require_sonarr_v4", side_effect=replace_manifest):
+            send = Mock()
+            result = self.container_cycle(Path(folder), send)
+        action, = result["actions"]
+        self.assertEqual((action["stage"], action["stop_reason"]), ("dispatch_blocked", "identity_or_manifest_changed"))
+        send.assert_not_called()
+
+    def test_preflight_verifies_file_policy_removal_read_only(self):
         from contextlib import redirect_stdout
         from io import StringIO
         import json
@@ -1460,11 +1626,10 @@ class ManualBlocklistTests(unittest.TestCase):
                 "production.Journal") as journal, redirect_stdout(StringIO()) as output:
             self.assertEqual(production.main(), 0)
         result = json.loads(output.getvalue())
-        self.assertEqual(result["preflight"], "manual_review")
-        self.assertEqual(result["reason"], "sonarr_blocklist_scope_unverifiable")
+        self.assertEqual(result["preflight"], "verified")
         self.assertIs(result["live_sender_enabled"], False)
-        self.assertNotIn("observation", result)
-        capture.assert_not_called()
+        self.assertIs(result["observation"]["torrent_absent"], False)
+        capture.assert_called_once()
         journal.assert_not_called()
 
     def test_transport_blocks_file_action_even_when_other_release_gates_are_enabled(self):

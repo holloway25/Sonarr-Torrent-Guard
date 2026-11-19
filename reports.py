@@ -3,7 +3,7 @@
 import collections
 import json
 
-from workflow import manual_handling_reason
+from workflow import file_policy_removal, manual_handling_reason
 
 
 REASONS = {
@@ -11,6 +11,7 @@ REASONS = {
     "metadata_timeout_not_reached": "waiting for metadata; 30-minute timeout not reached",
     "contains_exe": "contains an .exe (selected or unselected)",
     "contains_scr": "contains an .scr (selected or unselected)",
+    "blocked_file_selected": "a blocked file type is selected",
     "all_files_unselected": "all files are unselected",
     "only_txt_nfo_selected": "only .txt/.nfo files are selected",
     "private_source_protected": "private source protected",
@@ -39,7 +40,7 @@ def human_report(reports, readiness, timestamp):
                  counts["would_fail"], counts["keep"], counts["skip"])]
     for label, state in readiness.items():
         if state.get("status") != "verified":
-            message = "retry settings unavailable; future live workflow blocked"
+            message = "retry settings unavailable; replacement search blocked"
         elif state.get("automatic_retry") is not True:
             message = "automatic retry OFF; future replacement workflow blocked"
         elif state.get("interactive_retry") is not True:
@@ -66,7 +67,7 @@ def human_report(reports, readiness, timestamp):
             if reason is not None:
                 lines.append("  Manual review in Sonarr required. " + REASONS.get(reason, reason.replace("_", " ")) + ".")
                 continue
-            if report.get("reasons") == ["metadata_timeout"]:
+            if report.get("reasons") == ["metadata_timeout"] or file_policy_removal(report):
                 lines.append("  Proposed after approval/checks: Sonarr removes torrent/data WITHOUT blocklisting; "
                              "after confirmed removal and final checks, request an affected-episode search.")
             else:

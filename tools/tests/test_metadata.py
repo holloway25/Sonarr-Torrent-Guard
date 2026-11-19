@@ -78,16 +78,16 @@ class MetadataTests(unittest.TestCase):
         event = list(json_events([report], {}, "test time"))[0]
         self.assertEqual(event["proposed_actions"], report["proposed_actions"])
 
-    def test_file_failure_human_and_json_proposals_request_manual_review(self):
+    def test_file_failure_human_and_json_proposals_show_removal_without_blocklisting(self):
         self.t["state"] = "stalledUP"
         self.f.qb.routes["/api/v2/torrents/files"] = guard_fixtures.manifest(("payload.exe", 0))
         report = self.assess()
-        self.assertEqual(report["proposed_actions"], ["review_release_manually_in_sonarr"])
+        self.assertIn("remove_torrent_and_data_through_sonarr_without_blocklisting", report["proposed_actions"])
         output = human_report([report], {}, "test time")
-        self.assertIn("Manual review in Sonarr required", output)
+        self.assertIn("WITHOUT blocklisting", output)
         self.assertNotIn("blocklists and handles retry", output)
         event = list(json_events([report], {}, "test time"))[0]
-        self.assertEqual(event["manual_handling_reason"], "sonarr_blocklist_scope_unverifiable")
+        self.assertEqual(event["proposed_actions"], report["proposed_actions"])
 
 
 class MetadataSenderTests(unittest.TestCase):
@@ -557,7 +557,7 @@ class MetadataSenderTests(unittest.TestCase):
     def test_crash_after_removal_does_not_cause_recovery_search(self):
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=self.removed), patch(
-                "production.finish_metadata_retry", side_effect=RuntimeError("simulated crash")):
+                "production.finish_replacement_search", side_effect=RuntimeError("simulated crash")):
             with self.assertRaises(RuntimeError):
                 self.execute()
         row = self.f.journal.related("HD", self.f.hash)[0]
@@ -807,7 +807,7 @@ class MetadataSenderTests(unittest.TestCase):
 
     def assert_coordinator_restart_does_not_replay(self, crash_stage):
         f = self.f
-        original_finish = production.finish_metadata_retry
+        original_finish = production.finish_replacement_search
         original_transition = f.journal.transition
         def finish(*args, **kwargs):
             if crash_stage == "retry_removed":
@@ -820,7 +820,7 @@ class MetadataSenderTests(unittest.TestCase):
             return row
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=self.removed), patch(
-                "production.finish_metadata_retry", side_effect=finish), patch.object(
+                "production.finish_replacement_search", side_effect=finish), patch.object(
                 f.journal, "transition", side_effect=transition):
             with self.assertRaises(RuntimeError):
                 self.execute()

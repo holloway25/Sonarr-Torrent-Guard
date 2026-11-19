@@ -8,9 +8,9 @@ A standard-library Python public-download checker. The normal command reports
 proposals only. A separately gated single-test sender and read-only production
 verifier exist for review; both sender release gates are disabled. No live requests
 are currently enabled by default. The routine CLI requires explicit scope-bound
-trial or ongoing permission. A metadata-only removal and additional episode search is
-implemented with a reviewed policy gate; actual sending still requires separate
-authorization and sender gates. No resume, extraction,
+trial or ongoing permission. Live cleanup removes verified public file-policy
+failures and stalled metadata downloads through Sonarr. A replacement search
+requires confirmed removal and separate safety checks. No resume, extraction,
 priority change or filesystem cleanup is implemented.
 
 ## Docker / Unraid
@@ -19,7 +19,7 @@ A non-root Docker image and GitHub build/publish workflow are implemented.
 Runtime environment variables supply connections and credentials; nothing private
 is baked into the image. Persistent appdata keeps journal/config/logs across
 updates. The container defaults to dry-run. `STGUARD_MODE=live` only allows
-qualifying metadata retries. Existing installs confirm their scope once at cutover
+qualifying public file cleanup and metadata retries. Existing installs confirm their scope once at cutover
 and again only if it changes. Publishing never deploys it. See
 [container setup](docs/CONTAINER.md) before activation or migration.
 Retention application remains separately disabled.
@@ -57,8 +57,8 @@ eligible candidates and record it in a private `preview-journal.sqlite3` beside
 the external configuration. Manual-only candidates skip the recheck and receive
 no preview entry. Both Sonarr queues are reread to preserve duplicate
 ownership checks. Endpoint/category/source/content identities and complete file
-selections must still match, retry settings must be enabled, and the new snapshot
-must be at most ten seconds old. The journal records preview checks only; this
+selections must still match, and the new snapshot must be at most ten seconds
+old. Metadata timeouts also require verified retry settings. The journal records preview checks only; this
 option cannot send removal, blocklist or replacement requests.
 
 Optional `--log-file /path/outside/checkout/guard.log` enables one-MiB rotation
@@ -100,10 +100,11 @@ exceptions for both owners, including separate freeleech aliases.
 | Manifest / selection | Decision |
 | --- | --- |
 | Any `.exe` or `.scr`, selected or not | Would fail |
+| Selected `.lnk`, `.arj`, `.zipx`, `.001`, `.rar`, `.gz`, `.lz`, `.lzh`, `.uue` or `.iso` | Would fail |
 | Every file unselected | Would fail |
 | Only `.txt`/`.nfo` selected, regardless of size | Would fail |
 | Selected media plus unselected `.lnk` or archive extras | Keep |
-| Other selected files and no `.exe`/`.scr` | Keep under this narrow rule |
+| Other manifests with selected files | Keep |
 
 The same conditions apply to paused/stopped public torrents. Stopping alone is
 never failure. No torrent is resumed. Existing seeding/removal policies remain
@@ -126,10 +127,12 @@ There is no three-attempt escalation. Sonarr selects the replacement using its
 normal rules; it may choose the same release again. The separate metadata-retry
 policy gate is enabled. Sender gates and explicit live mode still apply. Docker
 uses its mode switch and standalone routine workers use a private grant.
-File-policy failures require manual review in Sonarr. Guard cannot verify
-the full blocklist scope from public history, so it sends no automated removal
-for those candidates. See [metadata retry](docs/METADATA-RETRY.md) and the
-[blocklist scope limitation](docs/PUBLIC-WORKFLOW.md#file-policy-blocklist-scope).
+Live file-policy cleanup asks the owning Sonarr to remove the torrent and its
+download data without adding a blocklist entry. A new grab of the same bad
+torrent can be removed again after its identity is verified. Guard sends at most
+one replacement search for the same torrent hash or verified alias and affected
+episodes in the retained journal. See [public cleanup](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup)
+and [metadata retry](docs/METADATA-RETRY.md).
 
 JSON events/logs include instance, hash, indexer, file counts, queue IDs, torrent
 state, reason, system-local timestamp with UTC offset and proposed actions. They omit credentials,
@@ -141,8 +144,8 @@ Read-only readiness checks inspect both failed-download retry switches. Disabled
 missing or unreadable switches block the proposed replacement workflow; this
 program does not change settings. Request previews are data only. The API adapter
 never sends DELETE or replacement searches. See
-[public workflow](docs/PUBLIC-WORKFLOW.md) for the reviewed request sequence,
-verification and recovery requirements before live implementation.
+[public workflow](docs/PUBLIC-WORKFLOW.md) for the request sequence,
+verification and recovery requirements.
 
 ## Verification and privacy
 
@@ -194,9 +197,8 @@ and is not automatically invoked by workers or constructors.
 python3 production.py --config /path/outside/checkout/connections.json --preflight INSTANCE TORRENT_HASH
 ```
 
-Preflight reports `manual_review` for file-policy candidates. For eligible
-metadata timeouts it rereads the candidate and retry settings, captures history
-and blocklist IDs, checks the Sonarr 4.x version, and reports read-only outcomes
+Preflight rereads eligible file-policy and metadata candidates and retry settings,
+checks the Sonarr 4.x version, and reports read-only outcomes
 including replacement-grab evidence. Preflight creates no dispatch journal
 entry or approval.
 The verifier matches failure history by original hash and episode identity. New
@@ -225,8 +227,8 @@ approval file is created by the app. There is no single-test CLI live switch. It
 worker lock, captures baselines, rechecks immediately before intent/dispatch,
 commits the exact queue operation context and dispatch timestamp, and sends only
 the owning Sonarr queue DELETE. Redirects and automatic retries are refused.
-Sonarr owns the downloader operation. Only the separately gated metadata
-retry can send an additional search.
+Sonarr owns the downloader operation. Eligible file-policy and metadata
+removals can request an affected-episode search after the final checks.
 
 After the dispatch-intent commit completes, the sender rereads Sonarr's reviewed
 version, then revalidates the saved final snapshot's freshness and approval expiry

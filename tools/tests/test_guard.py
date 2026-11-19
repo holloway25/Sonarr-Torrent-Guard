@@ -38,6 +38,13 @@ class FilesTests(unittest.TestCase):
         files[0]["size"] = 10**12
         self.assertEqual(assess_files(files), ["only_txt_nfo_selected"])
 
+    def test_blocked_suffixes_require_selection_except_executables_and_screen_savers(self):
+        for suffix in ("lnk", "arj", "zipx", "001", "rar", "gz", "lz", "lzh", "uue", "iso"):
+            with self.subTest(suffix=suffix):
+                extra = "extra." + suffix.upper()
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 1))), ["blocked_file_selected"])
+                self.assertEqual(assess_files(manifest(("episode.mkv", 1), (extra, 0))), [])
+
     def test_invalid_or_partial_manifest_is_not_failure(self):
         invalid = [[], None, {}, [{"name": "payload.exe"}]]
         for field, value in (("priority", None), ("priority", True), ("index", 2),
@@ -629,16 +636,17 @@ class ReportingWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.report = {"instance": "HD", "hash": "a" * 40, "dry_run": True,
                        "decision": "would_fail", "reasons": ["contains_exe", "all_files_unselected"],
-                       "public_source_confirmed": True, "queue_ids": [7, 9]}
+                       "public_source_confirmed": True, "queue_ids": [7, 9], "episode_ids": [3]}
         self.ready = {"status": "verified", "automatic_retry": True, "interactive_retry": True}
 
-    def test_file_failure_preview_requires_manual_review_without_a_delete_request(self):
+    def test_file_failure_previews_removal_without_blocklisting_and_conditional_search(self):
         plan = preview_failure(self.report, self.ready)
-        self.assertEqual(plan["status"], "manual_review")
-        self.assertIsNone(plan["request_preview"])
+        self.assertEqual(plan["status"], "preview_only")
+        self.assertEqual(plan["request_preview"]["params"], {
+            "removeFromClient": True, "blocklist": False, "skipRedownload": True, "changeCategory": False})
         self.assertFalse(plan["live_enabled"])
-        self.assertFalse(plan["extra_search"])
-        self.assertEqual(plan["blockers"], ["sonarr_blocklist_scope_unverifiable"])
+        self.assertTrue(plan["extra_search"])
+        self.assertEqual(plan["search_preview"]["body"]["episodeIds"], [3])
 
     def test_disabled_or_unverified_retries_are_explicit_blockers(self):
         cases = [({}, "retry_settings_unverified"),

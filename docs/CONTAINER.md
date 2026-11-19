@@ -70,7 +70,7 @@ by the operator; they are not claimed to be hidden from root.
 
 | Variables | Meaning |
 | --- | --- |
-| `STGUARD_MODE` | Defaults to `dry-run`. Live mode permits qualifying metadata retries. File-policy findings require manual review. |
+| `STGUARD_MODE` | Defaults to `dry-run`. Live mode permits verified public file-policy cleanup and qualifying metadata retries. |
 | `STGUARD_CONFIG_SOURCE` | Defaults to `env`; `file` preserves `/config/connections.json` |
 | `STGUARD_SOURCE_POLICY` | New template: `private_exclusions`; known source names are public unless listed as private |
 | `TZ` | Defaults to `Australia/Melbourne` |
@@ -171,8 +171,8 @@ Docker log rotation on the host too. No automatic journal archival is enabled.
 
 ## Live mode and cutover
 
-`STGUARD_MODE=live` permits qualifying metadata retries through Sonarr.
-File-policy findings still require manual review. Unset the variable or set it
+`STGUARD_MODE=live` permits qualifying file-policy cleanup and metadata retries
+through the owning Sonarr. Unset the variable or set it
 to `dry-run` for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.

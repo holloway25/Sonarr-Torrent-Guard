@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 
 from reports import human_report, json_events
-from workflow import manual_handling_reason, preview_failure, read_readiness
+from workflow import file_policy_removal, manual_handling_reason, preview_failure, read_readiness
 from safety import Journal, SafetyError, open_lock_file, record_preview
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
@@ -250,6 +250,19 @@ def torrent_hash(value):
     return value.lower()
 
 
+FILE_ASSESSMENT_STATES = {
+    "downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
+    "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP", "forcedDL", "forcedUP",
+}
+BLOCKED_SELECTED_SUFFIXES = {".lnk", ".arj", ".zipx", ".001", ".rar", ".gz", ".lz", ".lzh", ".uue", ".iso"}
+
+
+def manifest_fingerprint(files):
+    manifest = [{key: item[key] for key in ("index", "name", "size", "priority")}
+                for item in sorted(files, key=lambda item: item["index"])]
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+
+
 def assess_files(files):
     """Return failure reasons only for a structurally valid full manifest."""
     if not isinstance(files, list) or not files:
@@ -278,6 +291,8 @@ def assess_files(files):
     if indexes != set(range(len(files))):
         raise GuardError("incomplete_manifest_indexes")
     reasons = ["contains_" + s[1:] for s in sorted(dangerous)]
+    if BLOCKED_SELECTED_SUFFIXES.intersection(selected):
+        reasons.append("blocked_file_selected")
     if not selected:
         reasons.append("all_files_unselected")
     elif all(s in (".txt", ".nfo") for s in selected):
@@ -802,16 +817,13 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                         or private_source_key(queue_source) != private_source_key(source)):
                     raise GuardError("conflicting_queue_source_protected")
             state = t.get("state", "")
-            safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
-                           "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
-                           "forcedDL", "forcedUP"}
             metadata_pending = state in METADATA_STATES
             if metadata_pending:
                 if now - added < METADATA_TIMEOUT_SECONDS:
                     raise GuardError("metadata_timeout_not_reached")
                 if not metadata_still_pending(t):
                     raise GuardError("metadata_state_inconsistent")
-            elif not isinstance(state, str) or state not in safe_states:
+            elif not isinstance(state, str) or state not in FILE_ASSESSMENT_STATES:
                 raise GuardError("metadata_or_transitional_state")
             files = qb.call("/api/v2/torrents/files", {"hash": h})
             if metadata_pending:
@@ -848,14 +860,14 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             if "hash_aliases" in report:
                 ownership["hash_aliases"] = aliases
-            manifest = [{k: f[k] for k in ("index", "name", "size", "priority")}
-                        for f in sorted(files, key=lambda f: f["index"])]
             if metadata_pending:
                 manifest = {"metadata_pending": True, "timeout_seconds": METADATA_TIMEOUT_SECONDS}
+                report["manifest_fingerprint"] = hashlib.sha256(
+                    json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+            else:
+                report["manifest_fingerprint"] = manifest_fingerprint(files)
             report["ownership_fingerprint"] = hashlib.sha256(
                 json.dumps(ownership, sort_keys=True).encode()).hexdigest()
-            report["manifest_fingerprint"] = hashlib.sha256(
-                json.dumps(manifest, sort_keys=True).encode()).hexdigest()
             report["checked_at"] = time.time() if now is None else now
             if include_titles and isinstance(t.get("name"), str):
                 report["title"] = t["name"]
@@ -866,7 +878,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     report["proposed_actions"] = ["review_release_manually_in_sonarr"]
                 else:
                     report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
-                    if reasons == ["metadata_timeout"]:
+                    if reasons == ["metadata_timeout"] or file_policy_removal(report):
                         report["queue_rows"] = sorted([r["id"], r["episodeId"], h] for r in rows)
                         report["proposed_actions"] = [
                             "remove_torrent_and_data_through_sonarr_without_blocklisting",

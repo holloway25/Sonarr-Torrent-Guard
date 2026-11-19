@@ -75,6 +75,7 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
                 "current_observation": row["current_observation"], "stop_reason": row["stop_reason"],
                 "routine_grant_digest": authority.identifier,
                 "metadata_retry": row["context"].get("metadata_retry"),
+                **({"file_cleanup": True} if row["context"].get("file_cleanup") is True else {}),
                 "search_command_id": row["search_command_id"]})
         except (GuardError, SafetyError) as error:
             if str(error) == "run_time_limit_reached":

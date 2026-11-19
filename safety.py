@@ -11,6 +11,8 @@ import stat
 import time
 import secrets
 
+from workflow import file_policy_removal, removal_without_blocklist
+
 OBSERVATION_FIELDS = ("torrent_absent", "data_deleted", "failed", "blocklisted", "replacement_observed")
 DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessment_expired",
                          "unreviewed_sonarr_version", "live_execution_disabled", "dispatch_validation_failed",
@@ -25,7 +27,8 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "container_journal_missing", "container_journal_identity_mismatch",
                          "container_journal_marker_missing", "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
                          "sonarr_blocklist_scope_unverified", "sonarr_blocklist_scope_unverifiable", "retry_settings_not_ready",
-                         "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence"}
+                         "metadata_timeout_no_longer_confirmed", "ambiguous_release_title_evidence",
+                         "file_policy_repeat_search_held"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
@@ -113,8 +116,8 @@ def check_fresh(original, refreshed, now=None, maximum_age=10):
     if (isinstance(checked, bool) or not isinstance(checked, (int, float))
             or not 0 <= now - checked <= maximum_age):
         raise SafetyError("fresh_assessment_expired")
-    if (readiness.get("status") != "verified" or readiness.get("automatic_retry") is not True
-            or readiness.get("interactive_retry") is not True):
+    if not file_policy_removal(fresh) and (readiness.get("status") != "verified"
+            or readiness.get("automatic_retry") is not True or readiness.get("interactive_retry") is not True):
         raise SafetyError("retry_settings_not_ready")
     return after
 
@@ -418,7 +421,7 @@ class Journal:
                 raise SafetyError("invalid_journal_transition")
             if stage.startswith("retry_"):
                 if (row["mode"] not in ("single_test", "public_attempt") or
-                        row["context"].get("metadata_retry", {}).get("blocklist") is not False):
+                        not removal_without_blocklist(row["context"])):
                     raise SafetyError("invalid_retry_transition")
                 if stage in ("retry_search_recorded", "retry_superseded") and not (
                         (row["mode"] == "single_test" and self.allow_single_test) or
@@ -432,7 +435,7 @@ class Journal:
             current = dict(row["current_observation"]) if retained else (
                 {} if observation is None else clean_observation(observation))
             if stage == "retry_removed" and (current.get("torrent_absent") is not True
-                    or current.get("blocklisted") is not False):
+                    or (row["context"].get("file_cleanup") is not True and current.get("blocklisted") is not False)):
                 raise SafetyError("cleanup_not_verified")
             if stage == "retry_superseded" and not replacement_already_observed(row):
                 raise SafetyError("replacement_not_observed")
@@ -468,7 +471,7 @@ class Journal:
             self.db.execute("BEGIN IMMEDIATE")
             row = self.get(key)
             if (row is None or row["stage"] != "retry_search_recorded" or
-                    row["context"].get("metadata_retry", {}).get("blocklist") is not False):
+                    not removal_without_blocklist(row["context"])):
                 raise SafetyError("invalid_retry_transition")
             if not ((row["mode"] == "single_test" and self.allow_single_test) or
                     (row["mode"] == "public_attempt" and self.allow_public_attempt)):
@@ -622,7 +625,9 @@ def reconcile(journal, key, observe):
         return journal.transition(key, row["stage"], "uncertain")
     known = dict(row["observation"])
     known.update({k: v for k, v in observation.items() if v is not None})
-    if row["context"].get("metadata_retry", {}).get("blocklist") is False:
+    if row["context"].get("file_cleanup") is True:
+        stage = "retry_removed" if observation.get("torrent_absent") is True else "uncertain"
+    elif removal_without_blocklist(row["context"]):
         if observation.get("blocklisted") is True:
             stage = "manual_review"
         elif observation.get("torrent_absent") is True and observation.get("blocklisted") is False:
