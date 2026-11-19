@@ -15,8 +15,8 @@ the reported infohashes, including the shortened v2 ID where applicable.
 It reads each affected episode's paginated grab history back to two minutes
 before the torrent was added, regardless of how many hashes it has. It compares
 hashes without regard to case and selects the newest matching grab for each
-episode. When a lower-ID grab has a later timestamp and points to a different
-indexer or downloader, the conflicting evidence blocks cleanup. The selected
+episode. A lower-ID grab with an equal or later timestamp and a conflicting
+indexer or downloader blocks cleanup for manual review. The selected
 grab must name the uniquely configured, bound downloader before Guard trusts its
 indexer. A different or missing downloader name blocks cleanup.
 A private indexer on any matching queue row also blocks cleanup, even when grab

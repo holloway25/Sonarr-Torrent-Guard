@@ -20,7 +20,7 @@ from authorization import (ContainerAuthorization, read_bound_container_journal_
                            read_container_journal_binding, read_container_journal_id)
 from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
-                   records, recheck_candidate, run, select_latest_grabs, torrent_hash,
+                   metadata_still_pending, records, recheck_candidate, run, select_latest_grabs, torrent_hash,
                    torrent_hash_ownership, torrents_by_hash, unique_client_name, unique_response_keys, verified_hashes,
                    verify_client_binding)
 from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
@@ -392,6 +392,20 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
     if policy is None and dispatch is None:
         check_blocklist_scope(api, report["download_id_spelling"], context, config.get("max_pages", 20))
     return validate_context(context)
+
+
+def require_current_metadata_timeout(qb, context, category):
+    """Recheck only the target immediately before the Sonarr removal."""
+    target = context["hash"]
+    torrents = torrents_by_hash(qb.call("/api/v2/torrents/info", {"hashes": target}))
+    if set(torrents) != {target}:
+        raise SafetyError("metadata_timeout_no_longer_confirmed")
+    torrent = torrents[target]
+    added = torrent.get("added_on")
+    if (not integer(added) or added != context["download_added_on"]
+            or torrent.get("category") != category or not metadata_still_pending(torrent)
+            or qb.call("/api/v2/torrents/files", {"hash": target}) != []):
+        raise SafetyError("metadata_timeout_no_longer_confirmed")
 
 
 def observed_torrent(qb, context):
@@ -960,6 +974,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                 check_blocklist_scope(apis[report["instance"]],
                                       final_snapshot["assessment"]["download_id_spelling"], context,
                                       config.get("max_pages", 20))
+            else:
+                require_current_metadata_timeout(qb, context, config["sonarr"][report["instance"]]["category"])
             validate()
             check_fresh(report, final_snapshot)
             if not event_boundary_reached(row["dispatched_at"]):

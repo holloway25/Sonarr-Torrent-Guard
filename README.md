@@ -37,9 +37,10 @@ ID and its exact endpoint. The pinned endpoint must match both the monitored
 qBittorrent URL and Sonarr's current host, port, SSL flag and URL base. The pinned
 ID selects the client before uniqueness checks, so other clients using the same
 category do not interfere; duplicate records for the pinned ID remain invalid.
-Default ports are normalized. Missing or changed bindings fail closed. Different proxy
-aliases are not assumed to reach the same server; configure a shared verified
-endpoint instead. Credentials and bindings stay in the external configuration.
+Default ports are normalized. Each Sonarr owner needs a distinct normalized
+URL and category. Missing or changed bindings hold cleanup. If a downloader
+uses proxy aliases, configure a shared verified endpoint. Credentials and
+bindings stay in the external configuration.
 
 ```sh
 python3 guard.py --config /path/outside/checkout/connections.json

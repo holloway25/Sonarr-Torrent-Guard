@@ -247,16 +247,18 @@ class ProductionTests(unittest.TestCase):
         self.grab["data"]["indexer"] = "Private Source"
         self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
         self.grab["data"]["indexer"] = "Public Source"
-        private = dict(self.grab, id=6, downloadId=self.hash,
+        later = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=1)
+        private = dict(self.grab, id=6, downloadId=self.hash, date=later.isoformat(),
                        data={**self.grab["data"], "indexer": "Private Source"})
         self.s.routes["/api/v3/history"] = {"records": [private, self.grab], "totalRecords": 2}
         self.assertEqual(run(self.config, self.qb, self.apis)[0]["reason"], "private_source_protected")
 
     def test_history_from_other_downloader_cannot_override_bound_private_grab(self):
         private = dict(self.grab, data={**self.grab["data"], "indexer": "Private Source"})
+        later = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=1)
         for client_name in ("Other Downloader", None, 123):
             with self.subTest(client_name=client_name):
-                other = dict(self.grab, id=6, data={**self.grab["data"],
+                other = dict(self.grab, id=6, date=later.isoformat(), data={**self.grab["data"],
                              "downloadClientName": client_name})
                 self.s.routes["/api/v3/history"] = {"records": [other, private], "totalRecords": 2}
                 self.qb.calls.clear()
@@ -584,7 +586,8 @@ class ProductionTests(unittest.TestCase):
 
     def test_newer_private_grab_never_falls_back_to_older_public_grab(self):
         self.digit_hash_report()
-        private = dict(self.grab, id=self.grab["id"] + 1,
+        later = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=1)
+        private = dict(self.grab, id=self.grab["id"] + 1, date=later.isoformat(),
                        data={**self.grab["data"], "indexer": "Private Source"})
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [self.grab, private]}
         for download_id, reason in ((self.hash, "private_source_protected"),

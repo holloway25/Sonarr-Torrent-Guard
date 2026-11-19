@@ -332,6 +332,34 @@ os._exit(0)
         self.assertNotIn("private-marker", output.getvalue())
         self.assertIs(json.loads(output.getvalue())["actions_sent"], False)
 
+    def test_check_config_rejects_duplicate_normalized_sonarr_endpoints(self):
+        shared = "https://sonarr.example.invalid/instance"
+        equivalent = "https://SONARR.example.invalid:443/instance/"
+        env = dict(self.env, STGUARD_SONARR_HD_URL=shared, STGUARD_SONARR_UHD_URL=equivalent)
+        path = worker.CONFIG_DIR / "connections.json"
+
+        result, cycle, error = self.run_mode(env, "--check-config")
+        self.assertEqual(result, 1)
+        self.assertIn("duplicate_sonarr_endpoint", error)
+        self.assertNotIn(shared, error)
+        self.assertFalse(path.exists())
+        cycle.assert_not_called()
+
+        config = worker.runtime_config(env)
+        worker.atomic_json(path, config)
+        before = path.read_bytes()
+        result, cycle, error = self.run_mode({"STGUARD_CONFIG_SOURCE": "file"}, "--check-config")
+        self.assertEqual(result, 1)
+        self.assertIn("duplicate_sonarr_endpoint", error)
+        self.assertEqual(path.read_bytes(), before)
+        cycle.assert_not_called()
+
+        config["sonarr"]["Sonarr-UHD"]["url"] = equivalent.replace("/instance/", "/another/")
+        worker.atomic_json(path, config)
+        result, cycle, _ = self.run_mode({"STGUARD_CONFIG_SOURCE": "file"}, "--check-config")
+        self.assertEqual(result, 0)
+        cycle.assert_not_called()
+
     def test_check_config_rejects_invalid_sonarr_ports(self):
         for port in ("notaport", "0", "65536"):
             with self.subTest(port=port):

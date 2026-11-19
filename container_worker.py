@@ -414,8 +414,8 @@ def main():
         return 0
     except BlockingIOError:
         reason = "another_container_worker_is_active"
-    except SafetyError as error:
-        allowed = {"container_live_scope_confirmation_required", "container_journal_missing",
+    except (SafetyError, GuardError) as error:
+        allowed = {"duplicate_sonarr_endpoint", "container_live_scope_confirmation_required", "container_journal_missing",
                    "container_journal_identity_mismatch", "container_journal_marker_missing",
                    "container_journal_rollback_required", "invalid_worker_lock"}
         reason = str(error) if str(error) in allowed else "container_configuration_or_startup_unavailable"

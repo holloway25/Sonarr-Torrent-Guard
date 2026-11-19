@@ -36,7 +36,12 @@ selection, resume, tracker/DHT change, indexer selection or scoring change is ad
 For metadata-only timeouts, the locked coordinator persists a validated immutable
 `metadata_retry` context (`blocklist: false`, `search: EpisodeSearch`) alongside
 the existing attempt identity, exact episode IDs, owner/binding, baselines and
-grant reference. All pre-dispatch checks and cancellation reasons still apply.
+grant reference. After journaling and the final Sonarr checks, Guard reads
+only the target torrent and its files from qBittorrent. It requires the same
+hash, addition time and category, a metadata-pending state, zero progress and
+an empty file list. This is the last remote check before removal. A change
+between the check and Sonarr's request is still possible because the two
+services have separate APIs.
 
 ```text
 DELETE /api/v3/queue/{currentQueueId}
@@ -100,11 +105,11 @@ When post-removal observation finds an ambiguous grab, Guard records the hold
 even if a later read omits it. Immediately before sending the separate search,
 Guard rereads both Sonarr retry switches. A disabled or unreadable switch blocks
 the search with `retry_settings_not_ready` and preserves the removal result.
-Validate history event types before any exclusion: accept only supported v4
-numeric types1–7 or their exact API names; missing, malformed, unsupported and
+After excluding known unrelated shows and episodes, validate event types for
+potentially relevant rows, including baseline rows. Accept supported v4 numeric
+types 1–7 or their exact API names. Missing, malformed, unsupported and
 `Unknown` (0/`unknown`) values block with `replacement_history_event_invalid`.
-Only known non-grab types can be ignored as non-grabs. This also validates event
-types of baseline rows; a baseline is not a waiver for malformed schema.
+Only a recognized non-grab type rules out a potentially relevant row as a grab.
 The final queue read explicitly includes items Sonarr could not map to a
 series. Each queue row first requires a positive integer series ID. A positively
 identified different series is excluded without requiring its episode ID:

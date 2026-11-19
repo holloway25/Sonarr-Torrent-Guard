@@ -24,6 +24,7 @@ from workflow import manual_handling_reason, preview_failure, read_readiness
 from safety import Journal, SafetyError, open_lock_file, record_preview
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
+METADATA_STATES = ("metaDL", "forcedMetaDL")
 
 
 class GuardError(Exception):
@@ -617,7 +618,7 @@ def select_latest_grabs(history, hashes, identities, require_all=True):
         newest_id = max(grabs, key=lambda grab: grab["id"])
         newest_id_stamp = grab_timestamp(newest_id)
         source = grab_source(newest_id)
-        if any(grab_timestamp(grab) > newest_id_stamp and grab_source(grab) != source
+        if any(grab_timestamp(grab) >= newest_id_stamp and grab_source(grab) != source
                for grab in grabs):
             raise GuardError("conflicting_grab_source_order")
         latest.append(newest_id)
@@ -663,6 +664,13 @@ def source_for(api, hashes, rows, max_pages, added, client_name):
     if len(sources) != 1:
         raise GuardError("ambiguous_indexer_identity")
     return next(iter(sources)), grab_ids, grab_time_floor
+
+
+def metadata_still_pending(torrent):
+    progress, size = torrent.get("progress"), torrent.get("total_size")
+    return (torrent.get("state") in METADATA_STATES
+            and isinstance(progress, (int, float)) and not isinstance(progress, bool) and progress == 0
+            and integer(size) and size in (-1, 0))
 
 
 def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=False, target=None):
@@ -797,12 +805,11 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
                            "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
                            "forcedDL", "forcedUP"}
-            metadata_pending = state in {"metaDL", "forcedMetaDL"}
+            metadata_pending = state in METADATA_STATES
             if metadata_pending:
                 if now - added < METADATA_TIMEOUT_SECONDS:
                     raise GuardError("metadata_timeout_not_reached")
-                if (isinstance(t.get("progress"), bool) or t.get("progress") != 0
-                        or not integer(t.get("total_size")) or t["total_size"] not in (-1, 0)):
+                if not metadata_still_pending(t):
                     raise GuardError("metadata_state_inconsistent")
             elif state not in safe_states:
                 raise GuardError("metadata_or_transitional_state")
@@ -934,7 +941,8 @@ def load_config(path):
             val = config.get(key, default)
             if not integer(val) or not 1 <= val <= limit:
                 raise GuardError("invalid_work_limits")
-        categories = set()
+        categories, sonarr_endpoints = set(), set()
+        qb_endpoint = endpoint_key(config["qbittorrent"]["url"])
         for label, item in config["sonarr"].items():
             if (not label.strip() or not isinstance(item, dict) or
                     any(not isinstance(item.get(key), str) or not item[key].strip()
@@ -943,15 +951,17 @@ def load_config(path):
             if item["category"] in categories:
                 raise GuardError("duplicate_instance_category")
             categories.add(item["category"])
+            sonarr_endpoint = endpoint_key(item["url"])
+            if sonarr_endpoint in sonarr_endpoints:
+                raise GuardError("duplicate_sonarr_endpoint")
+            sonarr_endpoints.add(sonarr_endpoint)
             source_policy_key(item["indexers"])
             binding = item.get("download_client_binding")
             if (not isinstance(binding, dict) or not integer(binding.get("id"))
                     or binding["id"] <= 0):
                 raise GuardError("missing_or_wrong_downloader_binding")
-            if endpoint_key(binding.get("endpoint")) != endpoint_key(config["qbittorrent"]["url"]):
+            if endpoint_key(binding.get("endpoint")) != qb_endpoint:
                 raise GuardError("monitored_downloader_binding_mismatch")
-        for item in [config["qbittorrent"], *config["sonarr"].values()]:
-            endpoint_key(item["url"])
         qbittorrent = config["qbittorrent"]
         if any(not isinstance(qbittorrent.get(key), str) or not qbittorrent[key].strip()
                for key in ("username", "password")):

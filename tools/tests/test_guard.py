@@ -68,6 +68,9 @@ class FakeApi:
             result = self.routes[route]
         if isinstance(result, Exception):
             raise result
+        if route == "/api/v2/torrents/info" and params and "hashes" in params:
+            hashes = params["hashes"].split("|")
+            result = [row for row in result if row["hash"] in hashes]
         if route == "/api/v3/history" and params and "downloadId" in params:
             rows = [row for row in result["records"] if row.get("downloadId") == params["downloadId"]
                     and row.get("eventType") in ("grabbed", 1)]

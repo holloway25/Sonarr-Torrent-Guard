@@ -113,6 +113,117 @@ class MetadataSenderTests(unittest.TestCase):
         self.f.tearDown()
         self.f.doCleanups()
 
+    def routine_authority(self):
+        from authorization import RULE, RoutineAuthorization, code_digest, scope_digest
+
+        config = self.f.config
+        now = time.time()
+        return RoutineAuthorization({"enabled": True, "rule": RULE, "grant_id": "e" * 64,
+                                     "issued_at": now - 1, "expires_at": now + 900,
+                                     "scope_digest": scope_digest(config), "code_digest": code_digest()}, config)
+
+    def test_conflicting_tied_grabs_hold_routine_but_distinguishably_later_public_grab_passes(self):
+        f = self.f
+        authority = self.routine_authority()
+        history = "/api/v3/history"
+        tied = [dict(f.grab, id=4, data={**f.grab["data"], field: value})
+                for field, value in (("indexer", "Private Source"), ("downloadClientName", "Other Downloader"))]
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=self.removed) as remove, patch(
+                "production._send_episode_search", return_value=41) as search:
+            for conflict in tied:
+                with self.subTest(data=conflict["data"]):
+                    f.s.routes[history] = {"totalRecords": 2, "records": [conflict, f.grab]}
+                    assessed, = run(f.config, f.qb, f.apis)
+                    self.assertEqual((assessed["decision"], assessed["reason"]),
+                                     ("skip", "conflicting_grab_source_order"))
+                    with self.assertRaisesRegex(SafetyError, "^candidate_no_longer_eligible$"):
+                        production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+            self.assertEqual(f.journal.db.execute("SELECT COUNT(*) FROM actions").fetchone()[0], 0)
+            remove.assert_not_called()
+            search.assert_not_called()
+
+            older = datetime.datetime.fromisoformat(f.grab["date"]) - datetime.timedelta(seconds=1)
+            f.s.routes[history] = {"totalRecords": 2, "records": [dict(tied[0], date=older.isoformat()), f.grab]}
+            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+        self.assertEqual(row["stage"], "retry_requested")
+        remove.assert_called_once_with(f.s, 7, blocklist=False)
+        search.assert_called_once()
+
+    def test_targeted_qbittorrent_checks_are_the_last_remote_reads_before_removal(self):
+        f = self.f
+        authority = self.routine_authority()
+        calls = []
+
+        qb_call, sonarr_call = f.qb.call, f.s.call
+
+        def qb(route, params=None):
+            calls.append(("qb", route, params))
+            return qb_call(route, params)
+
+        def sonarr(route, params=None):
+            calls.append(("sonarr", route, params))
+            return sonarr_call(route, params)
+
+        def remove(*args, **kwargs):
+            self.assertEqual(calls[-2:], [
+                ("qb", "/api/v2/torrents/info", {"hashes": f.hash}),
+                ("qb", "/api/v2/torrents/files", {"hash": f.hash}),
+            ])
+            self.removed()
+
+        with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                f.qb, "call", side_effect=qb), patch.object(f.s, "call", side_effect=sonarr), patch(
+                "production._send_queue_delete", side_effect=remove) as send, patch(
+                "production._send_episode_search", return_value=41):
+            row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+        self.assertEqual(row["stage"], "retry_requested")
+        send.assert_called_once_with(f.s, 7, blocklist=False)
+
+    def test_final_metadata_recheck_holds_changed_target_after_last_sonarr_read(self):
+        f = self.f
+        authority = self.routine_authority()
+        original = dict(self.t)
+        verify, refresh = production.require_sonarr_v4, f.journal.refresh_baselines
+        cases = [
+            ({"state": "downloading", "progress": .15, "total_size": 100}, guard_fixtures.manifest(("episode.mkv", 1))),
+            ({"added_on": self.t["added_on"] + 1}, []),
+            ({"progress": .15}, []),
+            ({"category": "other"}, []),
+            ({}, guard_fixtures.manifest(("episode.mkv", 0))),
+            ({}, None),
+        ]
+        for changes, files in cases:
+            with self.subTest(changes=changes, files=files):
+                self.t.clear()
+                self.t.update(original)
+                f.qb.routes["/api/v2/torrents/files"] = []
+                refreshed = False
+
+                def mark_refresh(*args):
+                    nonlocal refreshed
+                    row = refresh(*args)
+                    refreshed = True
+                    return row
+
+                def change_after_final_sonarr_read(*args):
+                    version = verify(*args)
+                    if refreshed:
+                        self.t.update(changes)
+                        f.qb.routes["/api/v2/torrents/files"] = files
+                    return version
+
+                with patch("production.ROUTINE_RELEASE_ENABLED", True), patch.object(
+                        f.journal, "refresh_baselines", side_effect=mark_refresh), patch(
+                        "production.require_sonarr_v4", side_effect=change_after_final_sonarr_read), patch(
+                        "production._send_queue_delete") as remove, patch("production._send_episode_search") as search:
+                    row = production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, authority)
+                self.assertTrue(refreshed)
+                self.assertEqual(row["stage"], "dispatch_blocked")
+                self.assertEqual(row["stop_reason"], "metadata_timeout_no_longer_confirmed")
+                remove.assert_not_called()
+                search.assert_not_called()
+
     def test_metadata_arriving_before_dispatch_cancels_even_if_new_file_is_bad(self):
         f = self.f
         def wait(*args):

@@ -16,6 +16,7 @@ REASONS = {
     "private_source_protected": "private source protected",
     "unclassified_source_protected": "source has not been classified",
     "conflicting_queue_source_protected": "the Sonarr queue source disagrees with the verified grab",
+    "conflicting_grab_source_order": "Sonarr grab history disagrees on the source or downloader. Review manually",
     "sonarr_blocklist_scope_unverifiable": "Sonarr may blocklist grabs that its history API does not show",
     "work_limit_reached": "deferred to a later batch",
     "torrent_identity_scan_time_limit_reached": "could not verify all qBittorrent identities within the cycle budget",
