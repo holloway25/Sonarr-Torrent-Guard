@@ -62,7 +62,9 @@ def read_grant(path):
 
 def read_container_journal_id(directory, *, required=False):
     path = directory / CONTAINER_JOURNAL_MARKER
-    if not required and not path.exists() and not path.is_symlink():
+    if not path.exists() and not path.is_symlink():
+        if required:
+            raise SafetyError("container_journal_marker_missing")
         return None
     reason = "container_journal_identity_mismatch"
     try:

@@ -151,7 +151,8 @@ def main():
                 journal.close()
                 save_batch_state(batch_path, batch_state)
     except (SafetyError, GuardError) as error:
-        allowed = {"container_journal_missing", "container_journal_identity_mismatch", "invalid_worker_lock"}
+        allowed = {"container_journal_missing", "container_journal_identity_mismatch",
+                   "container_journal_marker_missing", "invalid_worker_lock"}
         reason = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
         result = {"dry_run": True, "status": "waiting", "reason": reason,
                   "live_sender_enabled": False, "retry_after_seconds": RETRY_AFTER_SECONDS}

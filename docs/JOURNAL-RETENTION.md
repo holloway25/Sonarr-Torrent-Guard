@@ -14,9 +14,9 @@ private consistent backup during the separately approved deployment.
 
 ## Conservative policy
 
-- Keep up to1,000 active action rows; capacity still fails closed.
+- Keep up to 1,000 active action rows. At capacity, Guard holds new actions.
 - Archive only confirmed resolved production records whose last update is at
-  least30 days old. Batch size is1–100; default100.
+  least 30 days old. Batch size ranges from 1 to 100 and defaults to 100.
 - Eligible stages are `cleanup_resolved` in the public-attempt namespace, and
   `complete` in production namespaces. Validate stored context/identity, a finite
   positive dispatch time no later than the last update, current observation
@@ -26,7 +26,7 @@ private consistent backup during the separately approved deployment.
 - Never archive preview/simulation, prepared, cancelled, blocked, uncertain,
   manual-review, replacement-pending or metadata retry records. A search receipt
   is not full completion. Unavailable/partial/contradictory evidence remains hot.
-- Keep at most10,000 archive rows. If the proposed batch would exceed that bound,
+- Keep at most 10,000 archive rows. If the proposed batch would exceed that bound,
   do not move any records; fail closed with `journal_archive_capacity_reached`.
   No oldest-record eviction, purge, expiry or silent unlimited growth.
 

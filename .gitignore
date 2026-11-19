@@ -13,6 +13,8 @@ config.json
 *.lock
 state*.json
 batch-state.json
+.batch-*
+container-status.json
 *.sqlite3
 *.sqlite3-*
 HANDOFF*

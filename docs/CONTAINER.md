@@ -54,9 +54,9 @@ No privileged mode, exposed port, host network or web UI is needed. Bridge
 networking must reach the configured API endpoints with normal TLS verification.
 The image includes timezone data and defaults to `TZ=Australia/Melbourne`.
 
-Default UID/GID is1000:1000. Own appdata with that non-root identity, or select a
+Default UID/GID is `1000:1000`. Own appdata with that non-root identity, or select a
 different `--user` with matching ownership. The worker restricts its dedicated
-mount to0700 and runtime files to0600; do not map a shared general-purpose folder.
+mount to `0700` and runtime files to `0600`. Use a dedicated folder.
 The root filesystem may be read-only, capabilities dropped and no-new-privileges
 enabled. `/tmp` may be a tmpfs. Image updates must preserve persistent appdata.
 
@@ -108,6 +108,9 @@ for normal use. On the first real start or scope approval, Guard binds the
 installation to that database through `container-live-journal.json`. Every
 scheduled cycle checks that binding again. If the journal is missing or has a
 different identity, the cycle waits for the matching appdata to be restored.
+An already-initialized journal with a missing marker also holds at startup,
+including during scope approval. Restore the matching journal and marker from
+the same backup. An uninitialized legacy journal can still be adopted.
 Live removal and search also check that the opened journal is still in place
 before sending. Keep the config, journal and binding marker together when
 backing up or restoring.
@@ -130,16 +133,15 @@ and live scope without sending API requests or saving the configuration or scope
 A lifetime lock prevents another container using the SAME appdata; it cannot
 detect independent workers using different copies elsewhere.
 
-The existing three-minute API deadline remains, with an outer210-second child
+The existing three-minute API deadline remains, with an outer 210-second child
 timeout measured against one monotonic deadline. Active child waits poll at most
-every0.25seconds; SIGTERM/SIGINT do NOT wait for that cycle deadline. Stop requests
+every 0.25 seconds. SIGTERM and SIGINT start shutdown immediately. Stop requests
 are checked before launch, immediately after creation and throughout active waits.
-Shutdown sends TERM with a2second grace, then KILL with a2second bounded reap.
-The worker-controlled waiting budget is at most4.25seconds after a stop request,
-not210seconds. The scheduler exits without starting a final heartbeat/appdata
+Shutdown sends TERM with a 2-second grace period, then KILL with up to 2 seconds to reap the child.
+The worker-controlled waiting budget is at most 4.25 seconds after a stop request. The scheduler exits without starting a final heartbeat/appdata
 fsync or another cycle. Repeated signals do not reset the shutdown waits.
 
-Configure Docker/Unraid's container stop timeout to at least10seconds, leaving
+Configure Docker/Unraid's container stop timeout to at least 10 seconds, leaving
 margin for process exit before the host escalates. Test stopping/restarting the
 container while idle and during an active check in dry-run staging; no array
 stop is required. This is a bound on
@@ -222,8 +224,8 @@ The same name/appdata can remain in use after the separately approved live cutov
 removing a staging suffix does not enable live actions or issue permission.
 It follows the reviewed `latest` release tag, references the
 approved darker PNG, uses bridge networking with no published ports and sets
-read-only root, non-root UID/GID1000:1000, dropped capabilities, no-new-privileges,
-a10second stop timeout and bounded Docker logs. API/password/username fields are
+read-only root, non-root UID/GID `1000:1000`, dropped capabilities, no-new-privileges,
+a 10-second stop timeout and bounded Docker logs. API/password/username fields are
 masked in the form but remain visible to host administrators. The form is not a
 secret vault; never share/export its populated XML or command output.
 
@@ -238,7 +240,7 @@ Before applying the template on Unraid:
 
 1. Choose the dedicated permanent appdata directory shown in the
    template. Inspect it first; do not overwrite existing appdata. Create it owned
-   by1000:1000 with0700 permissions (or explicitly choose a matching non-root
+   by `1000:1000` with `0700` permissions (or explicitly choose a matching non-root
    `--user`). Automatic root-owned creation will fail the worker's ownership check.
 2. Install the private XML as a user template using the host's supported template
    management, then select it in Docker/Add Container. Leave auto-start off until

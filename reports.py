@@ -14,6 +14,7 @@ REASONS = {
     "private_source_protected": "private source protected",
     "unclassified_source_protected": "source has not been classified",
     "work_limit_reached": "deferred to a later batch",
+    "torrent_identity_scan_time_limit_reached": "could not verify all qBittorrent identities within the cycle budget",
     "sonarr_downloader_binding_mismatch": "Sonarr downloader no longer matches its binding",
     "torrent_too_new_or_age_unknown": "torrent is too new or its age is unknown",
     "metadata_or_transitional_state": "metadata/state is not ready for assessment",

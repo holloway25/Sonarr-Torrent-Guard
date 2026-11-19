@@ -1,6 +1,6 @@
 """Read-only outcome verification and a disabled, exact-target single-test sender.
 
-The command line exposes preflight only. No live approval is generated here.
+The command line supports preflight and observation of existing journal entries.
 """
 
 import argparse
@@ -21,7 +21,7 @@ from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    records, recheck_candidate, run, select_latest_grabs, torrent_hash,
                    torrent_hash_ownership, torrents_by_hash, unique_client_name, unique_response_keys, verified_hashes,
                    verify_client_binding)
-from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
+from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, open_lock_file, reconcile, replacement_already_observed, valid_digest)
 from maintenance import require_connectivity
 
@@ -160,30 +160,43 @@ def history_since(api, start):
     return rows
 
 
-def outcome_history(api, series, episodes, start, max_pages, *, on_episode=None):
+def outcome_history(api, series, episodes, start, max_pages, *, on_page=None):
     rows = []
     ids = set()
     for episode in episodes:
-        relevant = records(api, "/api/v3/history", {
+        def validate_page(page):
+            for row in page:
+                if (not all(integer(row.get(key)) and row[key] == expected
+                            for key, expected in (("seriesId", series), ("episodeId", episode)))
+                        or row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000):
+                    raise SafetyError("invalid_history_response")
+                ids.add(row["id"])
+            if on_page is not None:
+                on_page(page)
+
+        rows.extend(records(api, "/api/v3/history", {
             "seriesIds": series, "episodeId": episode, "sortKey": "date", "sortDirection": "descending",
-        }, max_pages, since=start)
-        for row in relevant:
-            if (not all(integer(row.get(key)) and row[key] == expected
-                        for key, expected in (("seriesId", series), ("episodeId", episode)))
-                    or row["id"] <= 0 or row["id"] in ids or len(ids) >= 10000):
-                raise SafetyError("invalid_history_response")
-            ids.add(row["id"])
-        if on_episode is not None:
-            on_episode(relevant)
-        rows.extend(relevant)
+        }, max_pages, since=start, on_page=validate_page))
     return rows
 
 
 def blocklist_records(api, series_id, start, max_pages):
+    unscoped = False
+
+    def detect_unscoped(page):
+        nonlocal unscoped
+        unscoped = unscoped or any(
+            integer(row.get("seriesId")) and row["seriesId"] > 0 and row["seriesId"] != series_id for row in page)
+
     # Keep the entire boundary second so truncated Sonarr timestamps remain evidence.
-    return records(api, "/api/v3/blocklist",
-                   {"seriesIds": series_id, "sortKey": "date", "sortDirection": "descending"},
-                   max_pages, since=math.floor(start))
+    try:
+        return records(api, "/api/v3/blocklist",
+                       {"seriesIds": series_id, "sortKey": "date", "sortDirection": "descending"},
+                       max_pages, since=math.floor(start), on_page=detect_unscoped)
+    except GuardError as error:
+        if unscoped and str(error) == "pagination_limit_reached":
+            raise GuardError("sonarr_unscoped_blocklist_limit_reached") from None
+        raise
 
 
 def event_time(row):
@@ -421,7 +434,7 @@ class OutcomeVerifier:
             pass
         baseline_ids = set(c["baseline_history_ids"])
 
-        def observe_episode(rows):
+        def observe_history_page(rows):
             for event in rows:
                 if event["id"] in baseline_ids:
                     continue
@@ -438,10 +451,10 @@ class OutcomeVerifier:
                 return
 
         try:
-            # Preserve a known grab even if a later episode fails to load.
+            # Preserve a known grab even if a later history page fails to load.
             rows = outcome_history(api, c["series_id"], c["episode_ids"], math.floor(self.not_before),
                                    self.config.get("max_pages", 20),
-                                   on_episode=observe_episode if metadata_retry else None)
+                                   on_page=observe_history_page if metadata_retry else None)
             new = [r for r in rows if r["id"] not in baseline_ids]
             failed, replacement, ambiguous_failed, ambiguous_replacement = set(), set(), set(), set()
             regrab = set()
@@ -606,6 +619,9 @@ def metadata_history_type(event):
 
 def check_replacement_grabs(events, context, not_before):
     for event in events:
+        series = event.get("seriesId")
+        if integer(series) and series > 0 and series != context["series_id"]:
+            continue
         if metadata_history_type(event) != "grabbed":
             continue
         # A late grab can belong to the refreshed outcome baseline. Its
@@ -614,7 +630,7 @@ def check_replacement_grabs(events, context, not_before):
             continue
         if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
             raise SafetyError("replacement_history_identity_invalid")
-        if event["seriesId"] != context["series_id"] or event["episodeId"] not in context["episode_ids"]:
+        if event["episodeId"] not in context["episode_ids"]:
             continue
         after = event_after(event, not_before)
         if after is None:
@@ -907,13 +923,19 @@ def main():
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise SafetyError("another_run_is_active") from None
-                qb.login()
-                journal = Journal(args.config.parent / "action-journal.sqlite3")
+                from authorization import read_container_journal_id
+                journal_id = read_container_journal_id(args.config.parent)
+                try:
+                    journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, existing_only=True,
+                                      expected_installation_id=journal_id)
+                except FileNotFoundError:
+                    raise SafetyError("no_recorded_single_test") from None
                 try:
                     key = digest(["single_test", target[0], target[1]])
                     row = journal.get(key)
                     if row is None:
                         raise SafetyError("no_recorded_single_test")
+                    qb.login()
                     verifier = OutcomeVerifier(config, qb, apis, row["context"], row["dispatched_at"])
                     row = reconcile(journal, key, verifier.observe)
                     print(json.dumps({"live_sender_enabled": False, "instance": target[0], "hash": target[1],

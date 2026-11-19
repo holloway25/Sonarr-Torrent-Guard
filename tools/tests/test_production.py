@@ -920,7 +920,13 @@ class ProductionTests(unittest.TestCase):
             for row in rows:
                 row["date"] = recent
             wrapped.reset_mock()
-            with self.assertRaisesRegex(GuardError, "pagination_limit_reached"):
+            with self.assertRaisesRegex(GuardError, "^pagination_limit_reached$"):
+                production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+            self.assertEqual(sum(c.args[0] == "/api/v3/blocklist" for c in wrapped.call_args_list), 20)
+            for row in rows:
+                row["seriesId"] = 99
+            wrapped.reset_mock()
+            with self.assertRaisesRegex(GuardError, "^sonarr_unscoped_blocklist_limit_reached$"):
                 production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
             self.assertEqual(sum(c.args[0] == "/api/v3/blocklist" for c in wrapped.call_args_list), 20)
 
@@ -944,6 +950,42 @@ class ProductionTests(unittest.TestCase):
     def test_malformed_torrent_response_never_proves_absence(self):
         self.qb.routes["/api/v2/torrents/info"] = [{}]
         self.assertIsNone(self.observe()["torrent_absent"])
+
+    def test_observe_cli_requires_existing_journal_and_respects_the_container_marker(self):
+        import contextlib
+        import io
+        import json
+
+        from safety import ACTION_JOURNAL_FILE, CONTAINER_JOURNAL_MARKER
+
+        directory = Path(self.folder.name)
+        path = directory / ACTION_JOURNAL_FILE
+        marker = directory / CONTAINER_JOURNAL_MARKER
+        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
+
+        def observe_cli(expected):
+            with contextlib.redirect_stderr(io.StringIO()) as error, patch(
+                    "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
+                    "production.Api") as api:
+                self.assertEqual(production.main(), 1)
+            self.assertEqual(json.loads(error.getvalue())["error"], expected)
+            api.return_value.login.assert_not_called()
+
+        observe_cli("no_recorded_single_test")
+        self.assertFalse(path.exists())
+        with closing(Journal(path)) as journal:
+            actual = journal.installation_id(create=True)
+        before = path.read_bytes()
+        observe_cli("container_journal_marker_missing")
+        marker.write_text(json.dumps({"journal_id": "b" * 64}))
+        marker.chmod(0o600)
+        observe_cli("container_journal_identity_mismatch")
+        marker.write_text(json.dumps({"journal_id": actual}))
+        observe_cli("no_recorded_single_test")
+        self.assertEqual(path.read_bytes(), before)
+        path.unlink()
+        observe_cli("container_journal_missing")
+        self.assertFalse(path.exists())
 
     def test_observe_cli_cannot_reconcile_while_sender_holds_worker_lock(self):
         import contextlib

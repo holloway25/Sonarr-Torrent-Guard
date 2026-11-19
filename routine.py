@@ -151,7 +151,7 @@ def main():
             "routine_log_requires_private_config_directory", "run_time_limit_reached",
             "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused",
             "another_run_is_active", "invalid_worker_lock", "container_journal_missing",
-            "container_journal_identity_mismatch"}
+            "container_journal_identity_mismatch", "container_journal_marker_missing"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

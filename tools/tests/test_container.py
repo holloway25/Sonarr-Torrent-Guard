@@ -385,6 +385,41 @@ class ContainerTests(unittest.TestCase):
         path.write_bytes(saved)
         self.assertEqual(self.run_mode(env, "--once")[0], 0)
 
+    def test_initialized_journal_cannot_be_adopted_after_partial_restore_without_marker(self):
+        from contextlib import closing
+        from safety import Journal
+
+        self.legacy_hold()
+        env = dict(self.env, STGUARD_MODE="live")
+        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
+        path = self.path / worker.JOURNAL_FILE
+        marker = self.path / worker.JOURNAL_MARKER
+        saved_marker = marker.read_bytes()
+        saved_db = path.with_suffix(".saved")
+        path.replace(saved_db)
+        marker.unlink()
+        with closing(Journal(path)) as other:
+            other.installation_id(create=True)
+        replacement = path.read_bytes()
+
+        for command in ("--check-config", "--once", "--approve-live-scope"):
+            with self.subTest(command=command):
+                result, cycle, errors = self.run_mode(env, command)
+                self.assertEqual(result, 1)
+                self.assertIn("container_journal_marker_missing", errors)
+                cycle.assert_not_called()
+                self.assertFalse(marker.exists())
+                self.assertEqual(path.read_bytes(), replacement)
+
+        saved_db.replace(path)
+        marker.write_bytes(saved_marker)
+        marker.chmod(0o600)
+        result, cycle, _ = self.run_mode(env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
+
     def test_scheduled_children_refuse_a_missing_or_substituted_journal(self):
         from contextlib import closing
 

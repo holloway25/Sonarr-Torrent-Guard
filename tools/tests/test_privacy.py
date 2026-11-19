@@ -18,6 +18,8 @@ class PrivacyFilenameTests(unittest.TestCase):
                  "connections.production.json", "connections-local.json",
                  "nested/connections.production.json", ".connections-validation.json",
                  "nested/.guard-sample", "nested/routine.log.1")
+        newly_ignored = ("nested/.batch-example", "nested/container-status.json")
+        names += newly_ignored
         for name in names:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -25,7 +27,10 @@ class PrivacyFilenameTests(unittest.TestCase):
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text('{"password": "opaque-value"}', encoding="utf-8")
-                subprocess.run(["git", "-C", directory, "add", "--", name], check=True)
+                if name in newly_ignored:
+                    (root / ".gitignore").write_text((CHECKER.parents[1] / ".gitignore").read_text())
+                    subprocess.run(["git", "check-ignore", "--quiet", "--", name], cwd=root, check=True)
+                subprocess.run(["git", "-C", directory, "add", "--force", "--", name], check=True)
                 for flags in ([], ["--all"]):
                     result = subprocess.run([sys.executable, str(CHECKER), *flags],
                                             cwd=root, capture_output=True, text=True)

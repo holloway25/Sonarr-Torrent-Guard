@@ -532,6 +532,39 @@ class MetadataSenderTests(unittest.TestCase):
         self.assertTrue(row["confirmed"]["replacement_grab_observed"])
         search.assert_not_called()
 
+    def test_later_page_timeout_preserves_the_grab_seen_on_the_first_page(self):
+        f = self.f
+        original = f.s.call
+        after_remove = False
+        seen_pages = []
+
+        def remove(*args, **kwargs):
+            nonlocal after_remove
+            self.removed()
+            after_remove = True
+
+        def paginated(route, params=None):
+            if not after_remove or route != "/api/v3/history" or "eventType" in params:
+                return original(route, params)
+            seen_pages.append(params["page"])
+            if params["page"] == 2:
+                raise TimeoutError()
+            stamp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=1)
+            replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
+            rows = [replacement, *(dict(replacement, id=n, eventType="downloadFailed") for n in range(21, 120))]
+            return {"records": rows, "totalRecords": 101}
+
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch.object(
+                f.s, "call", side_effect=paginated), patch(
+                "production._send_queue_delete", side_effect=remove), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(seen_pages, [1, 2])
+        self.assertEqual(row["stage"], "retry_superseded")
+        self.assertIsNone(row["current_observation"]["replacement_observed"])
+        self.assertIs(row["confirmed"]["replacement_grab_observed"], True)
+        search.assert_not_called()
+
     def assert_coordinator_restart_does_not_replay(self, crash_stage):
         f = self.f
         original_finish = production.finish_metadata_retry
@@ -747,7 +780,11 @@ class MetadataSenderTests(unittest.TestCase):
                 date = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 other_series = dict(f.grab, id=18, seriesId=99, date=date)
                 other_episode = dict(f.grab, id=19, episodeId=99, date=date)
-                f.s.routes["/api/v3/history/since"] = [f.grab, other_series, other_episode]
+                unknown_other_series = dict(other_series, id=20, eventType="unknown")
+                missing_type_other_series = dict(other_series, id=21)
+                missing_type_other_series.pop("eventType")
+                f.s.routes["/api/v3/history/since"] = [
+                    f.grab, other_series, other_episode, unknown_other_series, missing_type_other_series]
             return row
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=self.removed), patch.object(

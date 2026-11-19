@@ -22,7 +22,8 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "replacement_history_identity_invalid", "replacement_history_event_invalid",
                          "replacement_queue_identity_invalid", "replacement_blocklisted",
                          "replacement_blocklist_uncertain", "run_time_limit_reached",
-                         "container_journal_missing", "container_journal_identity_mismatch"}
+                         "container_journal_missing", "container_journal_identity_mismatch",
+                         "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
@@ -121,7 +122,7 @@ class Journal:
     synchronization. Preview and simulation rows cannot authorize production work.
     """
     def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False,
-                 allow_archive=False, read_only=False, expected_installation_id=None):
+                 allow_archive=False, read_only=False, expected_installation_id=None, existing_only=False):
         self.path = Path(path)
         self.read_only = read_only is True
         self._action_projection = ",".join(ACTION_FIELDS)
@@ -152,7 +153,7 @@ class Journal:
                 raise
             return
         flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-        if expected_installation_id is None:
+        if expected_installation_id is None and not existing_only:
             flags |= os.O_CREAT
         try:
             fd = os.open(self.path, flags, 0o600)
@@ -190,8 +191,8 @@ class Journal:
             raise
         try:
             self.check_current_file()
-            if expected_installation_id is not None and self.installation_id() != expected_installation_id:
-                raise SafetyError("container_journal_identity_mismatch")
+            if expected_installation_id is not None or existing_only:
+                self.check_installation_id(expected_installation_id)
             self._initialize()
             self.has_archive = True
         except BaseException:
@@ -231,6 +232,13 @@ class Journal:
                             "key TEXT PRIMARY KEY, instance TEXT NOT NULL, hash TEXT NOT NULL, "
                             "mode TEXT NOT NULL, payload TEXT NOT NULL, archived_at REAL NOT NULL)")
             self.db.execute("CREATE INDEX IF NOT EXISTS archive_owner_hash ON actions_archive(instance,hash)")
+
+    def check_installation_id(self, expected):
+        actual = self.installation_id()
+        if expected is None and actual is not None:
+            raise SafetyError("container_journal_marker_missing")
+        if expected is not None and actual != expected:
+            raise SafetyError("container_journal_identity_mismatch")
 
     def installation_id(self, *, create=False):
         """Keep a durable journal identity separate from live scope approval."""

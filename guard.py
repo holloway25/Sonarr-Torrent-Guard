@@ -353,8 +353,10 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def records(api, route, params=None, max_pages=20, *, since=None):
+def records(api, route, params=None, max_pages=20, *, since=None, on_page=None):
     result, expected = [], None
+    seen_ids = set()
+    received = 0
     previous_date = None
     params = dict(params or {})
     for page in range(1, max_pages + 1):
@@ -369,22 +371,30 @@ def records(api, route, params=None, max_pages=20, *, since=None):
             expected = total
         if expected != total:
             raise GuardError("response_changed_during_pagination")
-        result.extend(rows)
-        if len(result) > total or (not rows and len(result) != total):
+        received += len(rows)
+        if received > total or (not rows and received != total):
             raise GuardError("incomplete_paginated_response")
-        if since is not None and len(result) < total and len(rows) != 100:
+        if since is not None and received < total and len(rows) != 100:
             raise GuardError("incomplete_paginated_response")
-        if since is not None:
-            for row in rows:
+        relevant = []
+        for row in rows:
+            identifier = row.get("id")
+            if not integer(identifier) or identifier in seen_ids:
+                raise GuardError("duplicate_or_invalid_response_ids")
+            seen_ids.add(identifier)
+            if since is not None:
                 stamp = grab_timestamp(row)
                 if previous_date is not None and stamp > previous_date:
                     raise GuardError("response_changed_during_pagination")
                 previous_date = stamp
-        if len(result) == total or (since is not None and previous_date is not None and previous_date < since):
-            ids = [r.get("id") for r in result]
-            if any(not integer(i) for i in ids) or len(set(ids)) != len(ids):
-                raise GuardError("duplicate_or_invalid_response_ids")
-            return result if since is None else [r for r in result if grab_timestamp(r) >= since]
+                if stamp < since:
+                    continue
+            relevant.append(row)
+        if on_page is not None:
+            on_page(relevant)
+        result.extend(relevant)
+        if received == total or (since is not None and previous_date is not None and previous_date < since):
+            return result
     raise GuardError("pagination_limit_reached")
 
 
@@ -465,21 +475,33 @@ def setup_identity_cache(qb, config, torrents, state):
     state["identity_cache"] = {"scope": scope, "entries": entries}
 
 
+def agrees_with_bulk_hashes(torrent, hashes):
+    return all(name not in torrent or (
+        isinstance(torrent[name], str) and torrent[name].lower() == value.lower())
+        for name, value in zip(("infohash_v1", "infohash_v2"), hashes))
+
+
 def verified_hashes(qb, torrent):
     canonical = torrent_hash(torrent.get("hash"))
+    cache = getattr(qb, "identity_cache", None)
+    entry = cache.get(canonical) if cache is not None else None
+    if entry is not None and not agrees_with_bulk_hashes(torrent, entry[3:]):
+        del cache[canonical]
+        entry = None
     if {"infohash_v1", "infohash_v2"} <= torrent.keys():
         return bulk_hashes(torrent)
-    cache = getattr(qb, "identity_cache", None)
     incarnation = torrent_incarnation(torrent)
-    entry = cache.get(canonical) if cache is not None else None
     if entry is not None and incarnation == entry[:2] and 0 <= time.time() - entry[2] < IDENTITY_CACHE_SECONDS:
         return identity_cache_entry(canonical, entry)
     properties = qb.call("/api/v2/torrents/properties", {"hash": canonical})
     if not isinstance(properties, dict) or torrent_hash(properties.get("hash")) != canonical:
         raise GuardError("torrent_hash_identity_unavailable")
     aliases = bulk_hashes(properties)
+    hashes = (properties["infohash_v1"], properties["infohash_v2"])
+    if not agrees_with_bulk_hashes(torrent, hashes):
+        raise GuardError("ambiguous_torrent_hash_identity")
     if cache is not None and incarnation is not None and (canonical in cache or len(cache) < IDENTITY_CACHE_LIMIT):
-        cache[canonical] = [*incarnation, int(time.time()), properties["infohash_v1"], properties["infohash_v2"]]
+        cache[canonical] = [*incarnation, int(time.time()), *hashes]
     return aliases
 
 
@@ -733,7 +755,12 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             if not integer(added) or added <= 0 or now - added < minimum_age:
                 raise GuardError("torrent_too_new_or_age_unknown")
             if hash_ownership is None:
-                hash_ownership = torrent_hash_ownership(by_hash, lambda torrent: verified_hashes(qb, torrent))
+                try:
+                    hash_ownership = torrent_hash_ownership(by_hash, lambda torrent: verified_hashes(qb, torrent))
+                except GuardError as error:
+                    if str(error) == "run_time_limit_reached":
+                        raise GuardError("torrent_identity_scan_time_limit_reached") from None
+                    raise
             claims, aliases_by_hash, hash_errors = hash_ownership
             if h in hash_errors:
                 raise GuardError(hash_errors[h])
@@ -830,13 +857,15 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                     ]
                 report["live_prerequisite"] = "fresh_ownership_source_and_manifest_recheck"
         except GuardError as e:
-            if str(e) == "run_time_limit_reached" or time.monotonic() >= deadline:
+            reason = str(e)
+            if reason in ("run_time_limit_reached", "torrent_identity_scan_time_limit_reached") or time.monotonic() >= deadline:
                 # Move past a stalled first candidate next cycle without
                 # advancing the cursor that records completed assessments.
                 if started and number == 0 and batch_state is not None:
                     batch_state["timed_out"] = [label, h]
-                reports.append({"instance": label, "hash": h, "dry_run": True,
-                                "decision": "skip", "reason": "run_time_limit_reached"})
+                reports.append({"instance": label, "hash": h, "dry_run": True, "decision": "skip",
+                                "reason": reason if reason == "torrent_identity_scan_time_limit_reached"
+                                else "run_time_limit_reached"})
                 break
             report.update(decision="skip", reason=str(e))
         if batch_state is not None:
@@ -850,6 +879,8 @@ def recheck_candidate(original, config, qb, apis):
     """Refetch both queues and the target's complete ownership/manifest evidence."""
     target = (original["instance"], torrent_hash(original["hash"]))
     reports = run(config, qb, apis, target=target)
+    if len(reports) == 1 and reports[0].get("reason") == "torrent_identity_scan_time_limit_reached":
+        raise SafetyError("torrent_identity_scan_time_limit_reached")
     if len(reports) != 1 or reports[0].get("decision") != "would_fail":
         raise SafetyError("candidate_no_longer_eligible")
     readiness = read_readiness({target[0]: apis[target[0]]})[target[0]]

@@ -382,6 +382,65 @@ class WorkflowTests(unittest.TestCase):
                 self.s.routes["/api/v3/queue"]["records"].reverse()
             self.assertEqual(assessed, [self.h, other, self.h, other])
 
+    def test_partial_bulk_conflict_cannot_be_overridden_by_cached_properties(self):
+        self.t["total_size"] = 100
+        owners = {"HD": self.s}
+        state = {}
+        original, = run(self.config, self.qb, owners, now=1000, batch_state=state)
+        self.assertEqual(original["decision"], "would_fail")
+        self.assertIn(self.h, self.qb.identity_cache)
+
+        self.t["infohash_v2"] = "b" * 64
+        self.qb.calls.clear()
+        with self.assertRaisesRegex(SafetyError, "^candidate_no_longer_eligible$"):
+            recheck_candidate(original, self.config, self.qb, owners)
+        self.assertIn(("/api/v2/torrents/properties", {"hash": self.h}), self.qb.calls)
+        self.assertNotIn(self.h, self.qb.identity_cache)
+
+        held, = run(self.config, self.qb, owners, now=1000, batch_state=state)
+        self.assertEqual((held["decision"], held["reason"]), ("skip", "ambiguous_torrent_hash_identity"))
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
+        # Independently refreshed full properties can resolve the discrepancy.
+        self.qb.routes["/api/v2/torrents/properties"] = {
+            "hash": self.h, "infohash_v1": self.h, "infohash_v2": self.t["infohash_v2"].upper()}
+        refreshed, = run(self.config, self.qb, owners, now=1000, batch_state=state)
+        self.assertEqual(refreshed["decision"], "would_fail")
+        self.assertIn("b" * 64, refreshed["hash_aliases"])
+        self.assertNotEqual(refreshed["ownership_fingerprint"], original["ownership_fingerprint"])
+
+    def test_uncacheable_pending_magnets_report_ownership_scan_exhaustion_each_cycle(self):
+        self.t.update(total_size=100, infohash_v1=self.h, infohash_v2="")
+        listed = self.qb.routes["/api/v2/torrents/info"]
+        listed.extend({"hash": format(n, "040x"), "category": "unrelated", "state": "metaDL",
+                       "total_size": -1, "added_on": 100} for n in range(1, 301))
+        now = [100.0]
+        requested = []
+        state = {}
+        original = self.qb.call
+
+        def slow_properties(route, params=None):
+            if route.endswith("/properties"):
+                if now[0] + .35 >= self.qb.deadline:
+                    raise GuardError("run_time_limit_reached")
+                now[0] += .35
+                requested.append(params["hash"])
+            return original(route, params)
+
+        self.qb.deadline = 190.0
+        with patch.object(self.qb, "call", side_effect=slow_properties), patch(
+                "guard.time.monotonic", side_effect=lambda: now[0]):
+            for _ in range(3):
+                now[0] = 100.0
+                requested.clear()
+                report, = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
+                self.assertEqual((report["decision"], report["reason"]),
+                                 ("skip", "torrent_identity_scan_time_limit_reached"))
+                self.assertGreater(len(requested), 200)
+                self.assertLess(len(requested), 300)
+                self.assertFalse(self.qb.identity_cache)
+        self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
+
     def test_properties_scan_resumes_across_restarts_without_using_unverified_torrents(self):
         import tempfile
         from pathlib import Path
@@ -407,7 +466,7 @@ class WorkflowTests(unittest.TestCase):
             self.qb.deadline = 190.0
             state = {}
             first = run(self.config, self.qb, {"HD": self.s}, now=1000, batch_state=state)
-            self.assertEqual(first[0]["reason"], "run_time_limit_reached")
+            self.assertEqual(first[0]["reason"], "torrent_identity_scan_time_limit_reached")
             self.assertGreater(len(asked), 200)
             self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
             checked = set(asked)

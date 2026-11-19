@@ -38,10 +38,13 @@ single-hash records. When rows omit the infohash fields, Guard uses the same
 per-torrent properties fallback as assessment, within the current phase
 deadline. Verified hashes for a stable torrent can carry over to the next pass
 through private batch state. Guard checks the current downloader, primary hash,
-addition time and size before reuse. The cache expires after one hour, and a
-torrent waiting for metadata needs a fresh read. If the available identity
-evidence cannot rule out a match, torrent
-absence stays unknown. Guard checks failure and replacement history against both
+addition time and size before reuse. Each infohash supplied by the bulk list
+must also agree with the cache. A disagreement requires fresh properties that
+agree with the supplied fields. The cache expires after one hour, and a
+torrent waiting for metadata needs a fresh read. If a large group of unresolved
+magnets exhausts this shared scan, Guard reports
+`torrent_identity_scan_time_limit_reached` and holds cleanup. If the available
+identity evidence cannot rule out a match, torrent absence stays unknown. Guard checks failure and replacement history against both
 the saved and currently verified hashes. A new alias alone does not establish a
 replacement.
 
@@ -210,7 +213,14 @@ history read leaves the history outcomes unknown. Queue disappearance alone
 cannot establish outcomes.
 Blocklist reads use Sonarr's descending date order and stop once they reach
 records older than the evidence window. Exceeding the page limit within that
-window leaves the evidence unknown. Guard correlates torrent blocklist entries
+window leaves the evidence unknown. Some older Sonarr 4.x releases, including
+[v4.0.0.748](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs),
+return a global blocklist when Guard requests a single series. If entries from
+other series are seen and the read reaches the page limit, Guard reports
+`sonarr_unscoped_blocklist_limit_reached` and holds the action. A 4.x release
+with series filtering, such as
+[v4.0.20.3014](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs),
+reduces the volume of unrelated entries. Guard correlates torrent blocklist entries
 using protocol, a release-title digest, indexer, series, episode IDs and newly
 added record IDs. Failure history must also match the original hash.
 For replacement reporting, Guard combines episode coverage from different-hash

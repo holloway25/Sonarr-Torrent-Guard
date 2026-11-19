@@ -143,9 +143,9 @@ def validate_journal_identity(config):
     from production import binding_digest
     from safety import Journal
     path = CONFIG_DIR / JOURNAL_FILE
-    marker = CONFIG_DIR / JOURNAL_MARKER
     if not path.exists() and not path.is_symlink():
         scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
+        marker = CONFIG_DIR / JOURNAL_MARKER
         if marker.exists() or marker.is_symlink() or (CONFIG_DIR / "container-status.json").exists():
             raise SafetyError("container_journal_missing")
         if scope_path.exists() and read_container_scope(scope_path)["scope_digest"] is not None:
@@ -153,9 +153,7 @@ def validate_journal_identity(config):
         return
     journal = Journal(path, read_only=True)
     try:
-        expected_id = read_container_journal_id(CONFIG_DIR)
-        if expected_id is not None and journal.installation_id() != expected_id:
-            raise SafetyError("container_journal_identity_mismatch")
+        journal.check_installation_id(read_container_journal_id(CONFIG_DIR))
         keys = journal.db.execute("SELECT key FROM actions").fetchall()
         if journal.has_archive:
             keys += journal.db.execute("SELECT key FROM actions_archive").fetchall()
@@ -173,15 +171,17 @@ def validate_journal_identity(config):
 def initialize_journal():
     from safety import Journal
 
-    marker = CONFIG_DIR / JOURNAL_MARKER
-    if marker.exists():
+    if read_container_journal_id(CONFIG_DIR) is not None:
         return
     # Hold the same lock as standalone workers during a one-time adoption.
     with open_lock_file(CONFIG_DIR / "guard.lock") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if read_container_journal_id(CONFIG_DIR) is not None:
+            return
         journal = Journal(CONFIG_DIR / JOURNAL_FILE)
         try:
-            atomic_json(marker, {"journal_id": journal.installation_id(create=True)})
+            journal.check_installation_id(None)
+            atomic_json(CONFIG_DIR / JOURNAL_MARKER, {"journal_id": journal.installation_id(create=True)})
         finally:
             journal.close()
 
@@ -336,7 +336,7 @@ def main():
         reason = "another_container_worker_is_active"
     except SafetyError as error:
         allowed = {"container_live_scope_confirmation_required", "container_journal_missing",
-                   "container_journal_identity_mismatch", "invalid_worker_lock"}
+                   "container_journal_identity_mismatch", "container_journal_marker_missing", "invalid_worker_lock"}
         reason = str(error) if str(error) in allowed else "container_configuration_or_startup_unavailable"
     except Exception:
         # Environment/config/HTTP exceptions can contain credentials: never print them.
