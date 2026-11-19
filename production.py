@@ -682,7 +682,7 @@ def _send_queue_delete(api, queue_id, *, blocklist, alternate_hash_cleanup=False
     try:
         with hard_deadline(deadline):
             with opener.open(request, timeout=min(15, deadline - time.monotonic())) as response:
-                if not 200 <= response.status < 300 or len(response.read(4097)) > 4096:
+                if response.status != 200 or response.read(1) != b"":
                     raise SafetyError("delete_response_uncertain")
     except Exception:
         raise SafetyError("delete_request_outcome_uncertain") from None
@@ -846,7 +846,7 @@ def check_replacement_search_ready(config, qb, apis, c, not_before, observation,
         raise SafetyError("live_execution_disabled")
 
 
-def execute_live_metadata_retry(config, qb, apis, report, authority, lock_path):
+def execute_live_metadata_retry(config, qb, apis, report, authority, lock_path, *, on_removal_accepted=None):
     """Remove a verified stalled download and optionally search in this pass only."""
     if config.get("dry_run") is not False or ROUTINE_RELEASE_ENABLED is not True or not is_metadata_timeout(report):
         raise SafetyError("live_execution_disabled")
@@ -882,6 +882,8 @@ def execute_live_metadata_retry(config, qb, apis, report, authority, lock_path):
         if not event_boundary_reached(started):
             raise SafetyError("dispatch_clock_unavailable")
         _send_queue_delete(api, context["queue_id"], blocklist=False)
+        if on_removal_accepted is not None:
+            on_removal_accepted()
 
         try:
             observation = OutcomeVerifier(config, qb, apis, context, started).observe()

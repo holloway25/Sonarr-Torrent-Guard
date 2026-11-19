@@ -62,10 +62,12 @@ grab in an ordinary later pass.
 
 ## Logs and interruptions
 
-The private live log records the removal or search outcome. A lost removal
-response or missing removal evidence stops the follow-up search. A lost search
-response is logged as uncertain. An interruption can leave a removed torrent
-without a new search. Subsequent passes assess what is currently queued.
+The private live log records `retry_removal_accepted_search_pending` as soon as
+Sonarr accepts removal, before Guard checks whether to search. A lost or
+unexpected removal response or missing removal evidence stops the follow-up
+search. A lost search response is logged as uncertain. If interrupted after
+removal, Guard leaves the accepted removal in the log. Subsequent passes assess
+what is currently queued.
 
 Guard holds evidence for the two requests in memory during one pass. Later
 passes use current evidence from Sonarr and qBittorrent.

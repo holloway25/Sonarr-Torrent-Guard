@@ -724,6 +724,28 @@ class FileCleanupTests(unittest.TestCase):
 
                 send.assert_called_once()
 
+    def test_live_container_logs_unexpected_queue_response_as_uncertain(self):
+        import json
+
+        f = self.f
+        f.qb.routes["/api/v2/torrents/files"] = manifest(("episode.mkv", 1), ("payload.exe", 0))
+        for status, body in ((200, b"<html>Sign in</html>"), (200, b'{"error":"denied"}'), (202, b"")):
+            with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder)
+                response = Mock(status=status, read=Mock(side_effect=lambda size: body[:size]))
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                send = Mock(return_value=response)
+                result = self.container_cycle(path, send)
+                entry, = [json.loads(line) for line in (path / "routine.log").read_text().splitlines()]
+                action, = result["actions"]
+                for row in (entry, action):
+                    self.assertEqual(row["stage"], "uncertain")
+                    self.assertEqual(row["stop_reason"], "delete_request_outcome_uncertain")
+                self.assertEqual(len(f.qb.routes["/api/v2/torrents/info"]), 1)
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0].get_method(), "DELETE")
+
     def test_live_container_rejects_healthy_private_ambiguous_and_dry_run_candidates(self):
         f = self.f
         row = f.s.routes["/api/v3/queue"]["records"][0]
@@ -770,6 +792,32 @@ class FileCleanupTests(unittest.TestCase):
         torrent.update(state="metaDL", added_on=int(time.time()) - 2000, total_size=-1, progress=0)
         f.grab["date"] = datetime.datetime.fromtimestamp(torrent["added_on"], datetime.timezone.utc).isoformat()
         f.qb.routes["/api/v2/torrents/files"] = []
+
+    def test_metadata_removal_is_logged_before_interrupted_follow_up(self):
+        import json
+
+        f = self.f
+        self.make_metadata_timeout()
+
+        def transport(request, **kwargs):
+            self.assertEqual(request.get_method(), "DELETE")
+            f.qb.routes["/api/v2/torrents/info"] = []
+            response = Mock(status=200, read=Mock(return_value=b""))
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            return response
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+                production.OutcomeVerifier, "observe", side_effect=KeyboardInterrupt):
+            path = Path(folder)
+            send = Mock(side_effect=transport)
+            with self.assertRaises(KeyboardInterrupt):
+                self.container_cycle(path, send)
+            entry, = [json.loads(line) for line in (path / "routine.log").read_text().splitlines()]
+        self.assertEqual((entry["event"], entry["stage"], entry["hash"]),
+                         ("routine_action", "retry_removal_accepted_search_pending", f.hash))
+        self.assertEqual(f.qb.routes["/api/v2/torrents/info"], [])
+        send.assert_called_once()
 
     def test_metadata_timeout_removes_without_blocklisting_and_searches_once(self):
         import json
@@ -1108,14 +1156,14 @@ class FileCleanupTests(unittest.TestCase):
                             f.qb.routes["/api/v2/torrents/info"] = []
                         if case == "history_changed":
                             f.grab["sourceTitle"] = "Replacement Example Title"
+                        body, content_type = b"", None
                     else:
                         self.assertEqual(request.get_method(), "POST")
                         self.assertEqual(url.path, "/api/v3/history/failed/5")
                         self.assertEqual(f.qb.routes["/api/v2/torrents/info"], [])
                         if case == "history_outcome_uncertain":
                             raise TimeoutError()
-                    body, content_type = b"{}", "application/json"
-                    if request.get_method() == "POST":
+                        body, content_type = b"{}", "application/json"
                         if case == "sign_in_page":
                             body, content_type = b"<html>Sign in</html>", "text/html"
                         elif case == "error_document":

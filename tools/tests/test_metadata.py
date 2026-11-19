@@ -666,11 +666,15 @@ class MetadataTransportTests(unittest.TestCase):
         with patch("production.METADATA_RETRY_RELEASE_ENABLED", True), patch(
                 "production.ROUTINE_RELEASE_ENABLED", True), patch(
                 "urllib.request.build_opener", return_value=self.opener):
+            self.response.status = 200
+            self.response.read.return_value = b""
             production._send_queue_delete(self.api, 7, blocklist=False)
             request = self.opener.open.call_args.args[0]
             self.assertEqual(request.get_method(), "DELETE")
             for param in ("removeFromClient=true", "blocklist=false", "skipRedownload=true", "changeCategory=false"):
                 self.assertIn(param, request.full_url)
+            self.response.status = 201
+            self.response.read.return_value = b'{"id":41,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
             self.assertEqual(production._send_episode_search(self.api, [3]), 41)
         request = self.opener.open.call_args.args[0]
         self.assertEqual(request.get_method(), "POST")

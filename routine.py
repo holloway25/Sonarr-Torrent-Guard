@@ -86,12 +86,16 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
         action = {"instance": report["instance"], "hash": report["hash"],
                   "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier}
 
+        file_cleanup = file_policy_removal(report)
+
         def record_removal_accepted():
             if on_action is not None:
-                on_action(dict(action, stage="sonarr_remove_accepted_blocklist_pending", stop_reason=None))
+                stage = ("sonarr_remove_accepted_blocklist_pending" if file_cleanup
+                         else "retry_removal_accepted_search_pending")
+                on_action(dict(action, stage=stage, stop_reason=None))
 
         try:
-            if file_policy_removal(report):
+            if file_cleanup:
                 outcome = production.execute_native_file_removal(
                     runtime, qb, apis, report, authority, lock_path, on_removal_accepted=record_removal_accepted)
                 if outcome is None:
@@ -99,7 +103,8 @@ def cycle(config, qb, apis, authority, batch_state, proposal=None, on_action=Non
                 else:
                     action.update(outcome)
             else:
-                action.update(production.execute_live_metadata_retry(runtime, qb, apis, report, authority, lock_path))
+                action.update(production.execute_live_metadata_retry(
+                    runtime, qb, apis, report, authority, lock_path, on_removal_accepted=record_removal_accepted))
         except (GuardError, SafetyError) as error:
             if str(error) == "run_time_limit_reached":
                 raise
