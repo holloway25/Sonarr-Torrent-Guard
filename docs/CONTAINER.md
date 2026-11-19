@@ -98,55 +98,27 @@ stays `dry_run: true`. New appdata uses labels Sonarr-HD and Sonarr-UHD. When a
 config already exists, environment mode matches normalized Sonarr/downloader
 endpoints, category and pinned client ID and preserves its exact existing labels
 (including HD/UHD). Credential rotation does not rename owners. Changed or
-ambiguous bindings, extra/missing owners, or a journal without its connection
-config require an explicit identity migration; startup refuses to guess and does
-not replace the config. File mode preserves existing labels and settings.
-Journal-based metadata action and dry-run recovery validate active and archived
-journal owner identities and recorded bindings. The check can read an older journal with
-missing optional columns. The worker adds those columns when it opens the journal
-for normal use. On the first real start or scope approval, Guard records the
-expected journal identity in `container-journal-binding.json` and binds it to
-the database and its `container-live-journal.json` marker. A normal start can
-restore an interrupted marker write when the independent binding proves the
-journal's identity. If the first SQLite binding was also interrupted, Guard
-can finish binding the original, unchanged database file.
+ambiguous bindings or extra/missing owners require an explicit identity
+migration. Startup preserves the existing configuration on failure. File mode
+uses the supplied private configuration.
 
-After an interrupted SQLite write, normal startup takes the worker lock,
-checks the installed journal identity, lets SQLite roll back the interrupted
-transaction, then validates the recovered journal before scheduling a cycle.
-`--check-config` reports `container_journal_rollback_required` without
-changing the database or its rollback file. Leave both files together for
-normal startup to recover. [SQLite rollback recovery](https://www.sqlite.org/lockingv3.html#dealing_with_hot_journals)
-
-Journal-based operations require both records to agree with the database.
-If the journal cannot be used, an approved live worker can still perform
-file-policy cleanup from the current queue. It preserves the existing journal
-files and reports `container_metadata_waiting` at startup or
-`metadata_journal_waiting` in the cycle summary. `--check-config` validates
-the journal without writing it. Scope approval validates it and can initialize
-or bind it before saving the approval.
-Existing installs with a matching journal and marker acquire the independent
-binding automatically. An uninitialized legacy journal without prior live
-approval can still be adopted. A previously approved install lacking both
-identity records needs its matching journal and marker before metadata actions
-can resume.
-Keep the configuration, scope, journal, marker and binding together when
-backing up or restoring. Metadata removal and search verify that the opened
-journal is still in place before sending.
+Older appdata may contain an action journal, preview database or journal
+identity files. Current startup and scheduled checks leave those legacy files
+untouched. You can retain them for historical inspection or rollback.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.
 
-Persistent `/config` contains connection config, entire journal/archive, batch
-cursor, locks, approved live scope, private live log and container heartbeat.
-Do not replace this directory when updating an image or reset it to bypass holds.
+Persistent `/config` contains the connection config, batch cursors, locks,
+approved live scope, rotating `dry-run.log` and `routine.log`, and the
+container heartbeat. Preserve the appdata directory when updating the image.
 
 ## Scheduler and health
 
 The scheduler runs one cycle, then waits 600 seconds after completion.
 Cycles do not overlap or catch up in bursts. Dry-run uses Sonarr's non-saving
-connection diagnostic, reports proposed actions and can update journal observations
-from read-only recovery. Removal, blocklisting and searches require live mode.
+connection diagnostic and logs proposed removals or holds. Live mode records
+removal and search outcomes. The worker does not consult either log.
 Maintenance waits are retried on later cycles.
 `--once` runs one cycle. `--check-config` validates the candidate configuration
 and live scope without sending API requests or saving the configuration or scope.
@@ -168,29 +140,30 @@ stop is required. This is a bound on
 application waiting, not a guarantee against an uninterruptible kernel/storage
 stall or other containers delaying array shutdown. Do not change Unraid's array
 unmount/parity safety settings to compensate for an application shutdown fault.
-Appdata preserves journal-based metadata holds across restarts. File-policy
-cleanup starts each pass from the current queues and file manifests.
+Each pass uses the current queues and file manifests. If a previous request was
+interrupted, an item still present can qualify again on fresh evidence.
 
 Health means a recent scheduler heartbeat, NOT healthy API connectivity, valid
 permission or completed cleanup. Check sanitized cycle logs for waits/errors.
 Startup errors never print environment values/raw exceptions. Configure bounded
-Docker log rotation on the host too. No automatic journal archival is enabled.
+Docker log rotation on the host too.
 
 ## Live mode and cutover
 
 `STGUARD_MODE=live` allows the owning Sonarr's native Remove and Blocklist
 action for verified bad public files. Sonarr handles its own replacement.
 [Metadata retry](METADATA-RETRY.md) is available separately through the same live
-worker when journal checks pass. Unset the variable or set it to `dry-run`
+worker. Unset the variable or set it to `dry-run`
 for reporting only. Apply a mode change by recreating the
 container with the new environment. To stop new live requests immediately,
 stop the container. A request already sent can still complete.
 
 Fresh appdata records the configured cleanup scope on the first live start.
 Subsequent image updates reuse the approved record while the scope and rule
-match. Older installs without an accepted scope may report
-`container_live_scope_confirmation_required` even if their mode says `live`.
-Use the confirmation procedure below when the worker reports that hold.
+match. Upgrading from the v3 cleanup rule to v4 requires one scope confirmation
+because selected blocked file types now qualify for removal. A worker configured
+as live reports `container_live_scope_confirmation_required` until that confirmation
+is recorded. Use the procedure below to approve the reviewed scope.
 
 Changing scope, including removing a private indexer exception, holds live
 cleanup until you confirm the new settings. A missing, unreadable or changed
@@ -233,10 +206,9 @@ environment-based authorization. It requires `STGUARD_MODE=live` and works on
 any host that invokes it. A container runtime is not an authorization boundary.
 
 For a migration from another worker, stop and disable the old worker first.
-Preserve the complete journal, archive, cursor and identity evidence with the
-existing configuration. Never copy a database while a writer is active or use
-an old journal to bypass holds. Verify labels, bindings, source policy,
-permissions and clock, then run one worker and check its cycle logs.
+Preserve the existing configuration, logs, cursors and any historical files.
+Verify labels, bindings, source policy, permissions and clock, then run one
+worker and check its cycle logs.
 
 ## Prepared Unraid template
 
@@ -276,7 +248,7 @@ Before applying the template on Unraid:
    proposals and wait reasons. Confirm that known private and healthy torrents
    are skipped or kept. Stop/restart it while idle
    and active, check prompt exit rather than forced kill, and confirm config and
-   journal/cursor evidence survive. Do not disturb unrelated containers or array.
+   logs and cursors survive. Do not disturb unrelated containers or array.
 5. Keep the new appdata separate from the current worker's appdata until cutover.
    Continue using this permanent container name after validation. Live cutover still
    requires the stopped-worker consistent backup and full state transfer described

@@ -12,7 +12,7 @@ from guard import (GuardError, endpoint_key, load_config, METADATA_TIMEOUT_SECON
                    unique_config_keys)
 from safety import CONTAINER_JOURNAL_BINDING, CONTAINER_JOURNAL_MARKER, SafetyError, valid_digest
 
-RULE = "public-sonarr-cleanup-v3"
+RULE = "public-sonarr-cleanup-v4"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
 CONTAINER_SCOPE_FILE = "container-live-scope.json"
 SOURCE_FILES = ("guard.py", "production.py", "safety.py", "maintenance.py", "public.py",

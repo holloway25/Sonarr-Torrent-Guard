@@ -2,19 +2,19 @@
 
 import argparse
 import copy
+import datetime
 import fcntl
 import json
 import logging
 from pathlib import Path
-import sqlite3
 import time
 
-from authorization import ContainerAuthorization, RoutineAuthorization, read_container_journal_id
+from authorization import ContainerAuthorization, RoutineAuthorization
 from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config,
                    load_batch_state, save_batch_state)
 import production
 import public
-from safety import (ACTION_JOURNAL_FILE, DISPATCH_STOP_REASONS, Journal, SafetyError,
+from safety import (DISPATCH_STOP_REASONS, Journal, SafetyError,
                     metadata_journal_wait_reason, open_lock_file)
 from workflow import file_policy_removal
 
@@ -76,12 +76,14 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
             on_attempt(cursor)
         batch_state["dispatch_after"] = cursor
         action = {"instance": report["instance"], "hash": report["hash"],
-                  "routine_grant_digest": authority.identifier}
+                  "reasons": report.get("reasons", []), "routine_grant_digest": authority.identifier}
         try:
             if file_policy_removal(report):
                 path = lock_path if lock_path is not None else journal.path.parent / "guard.lock"
                 production.execute_native_file_removal(runtime, qb, apis, report, authority, path)
                 action.update(stage="sonarr_remove_blocklist_accepted", stop_reason=None)
+            elif journal is None:
+                action.update(production.execute_live_metadata_retry(runtime, qb, apis, report, authority, lock_path))
             else:
                 row = production.execute_routine_attempt(runtime, qb, apis, journal, report, authority)
                 action.update(key=row["key"], stage=row["stage"], confirmed=row["confirmed"],
@@ -95,8 +97,11 @@ def cycle(config, qb, apis, journal, authority, batch_state, proposal=None, on_a
             reason = str(error) if str(error) in HELD_REASONS else "maintenance_or_safety_check_unavailable"
             stage = "uncertain" if reason == "delete_request_outcome_uncertain" else "held"
             action.update(stage=stage, stop_reason=reason)
-        except sqlite3.Error:
-            action.update(stage="held", stop_reason="metadata_journal_unavailable")
+        except Exception as error:
+            reason = metadata_journal_wait_reason(error) if journal is not None else None
+            if reason is None:
+                raise
+            action.update(stage="held", stop_reason=reason)
         actions.append(action)
         if on_action is not None:
             on_action(actions[-1])
@@ -114,8 +119,6 @@ def main():
     permission.add_argument("--container-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--live", action="store_true", help="Enable live routine actions")
-    parser.add_argument("--container-journal", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--file-cleanup-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     result = {"mode": "routine", "live_authorized": False, "status": "waiting", "actions": [], "retry_after_seconds": 600}
     handler = None
@@ -134,45 +137,26 @@ def main():
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
         state_path = args.config.parent / "batch-state.json"
         lock_path = args.config.parent / "guard.lock"
-        journal = None
-        if args.file_cleanup_only and args.container_mode:
-            result["metadata_journal_waiting"] = "metadata_journal_unavailable"
-        else:
+        with open_lock_file(lock_path) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state = load_batch_state(state_path)
             try:
-                journal_authority = ContainerAuthorization(config, args.config) if args.container_mode else authority
-                journal_id = (journal_authority.journal_id if args.container_mode else
-                              read_container_journal_id(args.config.parent, required=args.container_journal))
-                journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, allow_public_attempt=True,
-                                  expected_installation_id=journal_id)
-                authority = journal_authority
-            except (SafetyError, sqlite3.Error) as error:
-                reason = metadata_journal_wait_reason(error)
-                if reason is None:
-                    raise
-                result["metadata_journal_waiting"] = reason
-        try:
-            # Assessment/recovery and each sender use the same lock. Release it
-            # before coordinator calls; they independently lock and recheck. A
-            # second process can at most cause a hold, never duplicate sending.
-            with open_lock_file(lock_path) as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                state = load_batch_state(state_path)
-                try:
-                    with hard_deadline(deadline):
-                        proposal = public.cycle(config, qb, apis, journal, state, reserve_dispatch=True)
-                finally:
-                    save_batch_state(state_path, state)
-            production.ROUTINE_RELEASE_ENABLED = True
-            # Reuse exactly the assessed snapshot, not another full pass.
-            def log_action(action):
-                text = json.dumps({"event": "routine_action", **action})
-                handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
-            with hard_deadline(deadline):
-                cycle(config, qb, apis, journal, authority, state, proposal, log_action, summary=result,
-                      on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor), lock_path=lock_path)
-        finally:
-            if journal is not None:
-                journal.close()
+                with hard_deadline(deadline):
+                    proposal = public.cycle(config, qb, apis, None, state, reserve_dispatch=True)
+            finally:
+                save_batch_state(state_path, state)
+        production.ROUTINE_RELEASE_ENABLED = True
+
+        def log_action(action):
+            stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            text = json.dumps({"event": "routine_action", "time": stamp, **action})
+            handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, text, (), None))
+
+        with hard_deadline(deadline):
+            cycle(config, qb, apis, None, authority, state, proposal, log_action, summary=result,
+                  on_attempt=lambda cursor: save_dispatch_cursor(state_path, cursor), lock_path=lock_path)
+    except BlockingIOError:
+        result["reason"] = "another_run_is_active"
     except (SafetyError, GuardError) as error:
         allowed = {"routine_authorization_invalid", "routine_authorization_unavailable",
             "routine_code_not_authorized", "routine_authorization_expired_or_scope_changed",
@@ -181,8 +165,7 @@ def main():
             "container_live_scope_confirmation_required",
             "routine_log_requires_private_config_directory", "run_time_limit_reached",
             "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused",
-            "another_run_is_active", "invalid_worker_lock", "container_journal_missing",
-            "container_journal_identity_mismatch", "container_journal_marker_missing"}
+            "another_run_is_active", "invalid_worker_lock"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.
@@ -191,7 +174,11 @@ def main():
         production.ROUTINE_RELEASE_ENABLED = False
     line = json.dumps(result)
     if handler is not None:
-        handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, line, (), None))
+        if result["status"] != "completed":
+            stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            entry = {"event": "routine_status", "time": stamp, "status": result["status"],
+                     "reason": result.get("reason")}
+            handler.emit(logging.LogRecord("routine", logging.INFO, "", 0, json.dumps(entry), (), None))
         handler.close()
     print(line)
     return 0

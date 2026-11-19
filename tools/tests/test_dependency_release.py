@@ -340,10 +340,12 @@ with patch('pathlib.Path', side_effect=fixture_path):
 
     def test_full_suite_runs_under_built_image_before_candidate_publication(self):
         text = (self.root / ".github/workflows/container.yml").read_text()
-        command = '--entrypoint python3 "$IMAGE" -m unittest discover -s tools/tests -t .'
+        command = 'unittest.defaultTestLoader.discover("/src/tools/tests", top_level_dir="/src")'
         self.assertIn(command, text)
         self.assertLess(text.index(command), text.index('docker push "$PAYLOAD"'))
         self.assertIn('source=$GITHUB_WORKSPACE,target=/src,readonly', text)
+        self.assertIn('assert path == Path("/app", name + ".py")', text)
+        self.assertIn('assert path.read_bytes() == Path("/src", path.name).read_bytes()', text)
 
 
 if __name__ == "__main__":

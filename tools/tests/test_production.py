@@ -1414,7 +1414,7 @@ class FileCleanupTests(unittest.TestCase):
         self.addCleanup(self.f.tearDown)
         self.f.journal.allow_public_attempt = True
 
-    def container_cycle(self, folder, send, *, mode="live", with_journal=False):
+    def container_cycle(self, folder, send, *, mode="live"):
         from contextlib import redirect_stdout
         from io import StringIO
         import json
@@ -1430,11 +1430,9 @@ class FileCleanupTests(unittest.TestCase):
         with patch.object(container_worker, "CONFIG_DIR", folder):
             if not path.exists():
                 container_worker.atomic_json(path, config)
-                if with_journal:
-                    container_worker.initialize_journal()
                 container_worker.atomic_json(folder / container_worker.CONTAINER_SCOPE_FILE,
                                              container_worker.container_scope_record(config))
-        args = ["routine.py", "--config", str(path), "--container-mode", "--container-journal",
+        args = ["routine.py", "--config", str(path), "--container-mode",
                 "--live", "--log-file", str(folder / "routine.log")]
         adapters = [f.qb, *f.apis.values()]
         with patch("sys.argv", args), patch.dict(os.environ, {"STGUARD_MODE": mode}), patch(
@@ -1480,7 +1478,6 @@ class FileCleanupTests(unittest.TestCase):
                 self.assertEqual(len(result["actions"]), 1)
                 action, = result["actions"]
                 self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
-                self.assertEqual(result["metadata_journal_waiting"], "container_journal_marker_missing")
                 self.assertFalse((Path(folder) / "action-journal.sqlite3").exists())
                 send.assert_called_once()
 
@@ -1511,55 +1508,111 @@ class FileCleanupTests(unittest.TestCase):
                 send.assert_not_called()
 
     def test_file_removal_leaves_existing_journal_untouched_and_does_not_read_sonarr_blocklist(self):
-        from contextlib import closing
-
         f = self.f
         f.s.routes["/api/v3/config/downloadclient"]["autoRedownloadFailed"] = False
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
-            self.container_cycle(folder, Mock(), mode="dry-run", with_journal=True)
             path = folder / "action-journal.sqlite3"
-            with closing(Journal(path, allow_single_test=True)) as journal:
-                old = journal.prepare(f.report, mode="single_test", context=f.context)
-                journal.transition(old["key"], "prepared", "dispatch_recorded")
-                old = journal.transition(old["key"], "dispatch_recorded", "manual_review")
+            path.write_bytes(b"leftover database contents")
             f.s.calls.clear()
             send = Mock(side_effect=self.sonarr_transport)
             result = self.container_cycle(folder, send)
-            with closing(Journal(path, read_only=True)) as journal:
-                self.assertEqual(journal.db.execute("SELECT COUNT(*) FROM actions").fetchone(), (1,))
-                self.assertEqual(journal.get(old["key"]), old)
+            self.assertEqual(path.read_bytes(), b"leftover database contents")
         action, = result["actions"]
         self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
         self.assertNotIn("/api/v3/blocklist", {route for route, _ in f.s.calls})
         self.assertNotIn("/api/v3/config/downloadclient", {route for route, _ in f.s.calls})
         send.assert_called_once()
 
-    def test_file_cleanup_without_a_journal_does_not_enable_metadata_dispatch(self):
+    def make_metadata_timeout(self):
         f = self.f
         torrent = f.qb.routes["/api/v2/torrents/info"][0]
         torrent.update(state="metaDL", added_on=int(time.time()) - 2000, total_size=-1, progress=0)
         f.grab["date"] = datetime.datetime.fromtimestamp(torrent["added_on"], datetime.timezone.utc).isoformat()
         f.qb.routes["/api/v2/torrents/files"] = []
-        with tempfile.TemporaryDirectory() as folder:
-            send = Mock()
-            result = self.container_cycle(Path(folder), send)
-        assessment, = result["assessment"]
-        self.assertEqual(assessment["reasons"], ["metadata_timeout"])
-        self.assertEqual(assessment["safeguards"]["reason"], "metadata_journal_unavailable")
-        self.assertEqual(result["actions"], [])
-        send.assert_not_called()
 
-    def test_metadata_recovery_database_error_does_not_stop_file_cleanup(self):
-        import sqlite3
+    def test_metadata_timeout_removes_without_blocklisting_and_searches_without_a_journal(self):
+        import json
+        from urllib.parse import parse_qs, urlsplit
+
+        f = self.f
+        self.make_metadata_timeout()
+        def transport(request, **kwargs):
+            url = urlsplit(request.full_url)
+            if request.get_method() == "DELETE":
+                self.assertEqual(url.path, "/api/v3/queue/7")
+                self.assertEqual(parse_qs(url.query), {"removeFromClient": ["true"], "blocklist": ["false"],
+                                                      "skipRedownload": ["true"], "changeCategory": ["false"]})
+                f.qb.routes["/api/v2/torrents/info"] = []
+                body = b""
+            else:
+                self.assertEqual(request.get_method(), "POST")
+                self.assertEqual(url.path, "/api/v3/command")
+                self.assertEqual(json.loads(request.data), {"name": "EpisodeSearch", "episodeIds": [3]})
+                body = b'{"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}'
+            response = Mock(status=200, read=Mock(return_value=body))
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            return response
 
         with tempfile.TemporaryDirectory() as folder, patch(
-                "public.recover_pending", side_effect=sqlite3.OperationalError):
-            send = Mock(side_effect=self.sonarr_transport)
-            result = self.container_cycle(Path(folder), send, with_journal=True)
-        self.assertEqual(result["recovery"], [{"stage": "held", "stop_reason": "metadata_journal_unavailable"}])
-        self.assertEqual(result["actions"][0]["stage"], "sonarr_remove_blocklist_accepted")
-        send.assert_called_once()
+                "routine.Journal", side_effect=AssertionError("scheduled work must not open a journal")):
+            folder = Path(folder)
+            send = Mock(side_effect=transport)
+            result = self.container_cycle(folder, send)
+            self.assertFalse((folder / "action-journal.sqlite3").exists())
+            self.assertEqual(self.container_cycle(folder, send)["actions"], [])
+        action, = result["actions"]
+        self.assertEqual((action["stage"], action["search_command_id"]), ("retry_requested", 42))
+        self.assertEqual([call.args[0].get_method() for call in send.call_args_list], ["DELETE", "POST"])
+
+    def test_new_stateless_metadata_pass_keeps_a_pre_removal_replacement_veto(self):
+        f = self.f
+        self.make_metadata_timeout()
+        stamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=5)
+        replacement = dict(f.grab, id=20, downloadId="b" * 40, date=stamp.isoformat())
+        f.s.routes["/api/v3/history/since"] = [f.grab, replacement]
+
+        def sent(api, queue_id, *, blocklist):
+            self.assertIs(blocklist, False)
+            f.qb.routes["/api/v2/torrents/info"] = []
+            f.s.routes["/api/v3/history/since"] = [f.grab]
+
+        with tempfile.TemporaryDirectory() as folder, patch("production._send_queue_delete", side_effect=sent) as remove, patch(
+                "production._send_episode_search") as search:
+            result = self.container_cycle(Path(folder), Mock())
+        action, = result["actions"]
+        self.assertIs(action["torrent_absent"], True)
+        self.assertEqual(action["stop_reason"], "replacement_already_grabbed")
+        remove.assert_called_once()
+        search.assert_not_called()
+
+    def test_public_dry_run_logs_would_remove_without_using_or_creating_a_database(self):
+        import json
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import public
+
+        f = self.f
+        f.qb.login = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            path = folder / "dry-run.log"
+            old = folder / "action-journal.sqlite3"
+            old.write_bytes(b"historical database")
+            args = ["public.py", "--config", str(folder / "connections.json"), "--log-file", str(path)]
+            with patch("sys.argv", args), patch("public.load_config", return_value=f.config), patch(
+                    "public.Api", side_effect=[f.qb, f.s]), patch("public.require_connectivity"), patch(
+                    "public.recover_pending", side_effect=AssertionError("dry run must not recover a journal")), patch(
+                    "urllib.request.build_opener") as transport, redirect_stdout(StringIO()):
+                self.assertEqual(public.main(), 0)
+            entry, = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual((entry["event"], entry["hash"]), ("would_remove", f.hash))
+            self.assertIn("contains_exe", entry["reasons"])
+            self.assertIn("time", entry)
+            self.assertEqual(old.read_bytes(), b"historical database")
+            self.assertFalse((folder / "preview-journal.sqlite3").exists())
+            transport.assert_not_called()
 
     def test_file_removal_with_lost_response_retries_on_next_pass_only_if_still_queued(self):
         f = self.f
@@ -1632,6 +1685,25 @@ class FileCleanupTests(unittest.TestCase):
         action, = result["actions"]
         self.assertEqual(action["stop_reason"], "sonarr_blocklist_scope_unverified")
         send.assert_not_called()
+
+    def test_pack_with_conflicting_titles_is_held_but_consistent_titles_still_allow_removal(self):
+        f = self.f
+        queue = f.s.routes["/api/v3/queue"]
+        queue["records"].append(dict(queue["records"][0], id=8, episodeId=4))
+        queue["totalRecords"] = 2
+        history = f.s.routes["/api/v3/history"]
+        second_grab = dict(f.grab, id=6, episodeId=4, sourceTitle="Conflicting Example Title")
+        history.update(totalRecords=2, records=[f.grab, second_grab])
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            send = Mock(side_effect=self.sonarr_transport)
+            action, = self.container_cycle(folder, send)["actions"]
+            self.assertEqual(action["stop_reason"], "ambiguous_release_title_evidence")
+            send.assert_not_called()
+            second_grab["sourceTitle"] = f.grab["sourceTitle"]
+            action, = self.container_cycle(folder, send)["actions"]
+            self.assertEqual(action["stage"], "sonarr_remove_blocklist_accepted")
+            send.assert_called_once()
 
     def test_native_cleanup_holds_if_the_file_scope_changes_during_recheck(self):
         import json

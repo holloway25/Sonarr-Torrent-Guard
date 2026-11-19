@@ -139,13 +139,11 @@ class RoutineTests(unittest.TestCase):
         other = dict(verified, hash="b" * 40)
         tried = []
 
-        def attempt(config, qb, apis, journal, report, authority):
+        def attempt(config, qb, apis, report, authority, lock_path):
             tried.append(report["hash"])
             self.assertEqual(load_batch_state(state_path)["dispatch_after"], ["HD", report["hash"]])
             if report["hash"] == f.hash:
                 raise production.GuardError("run_time_limit_reached")
-            return {"key": "key", "stage": "cleanup_resolved", "confirmed": {},
-                    "current_observation": {}, "stop_reason": None, "context": {}, "search_command_id": None}
 
         def assess(config, qb, apis, journal, state, **kwargs):
             state["after"] = ["HD", other["hash"]]
@@ -158,7 +156,8 @@ class RoutineTests(unittest.TestCase):
                     "routine.RoutineAuthorization.load", return_value=self.authority), patch(
                     "routine.Api", side_effect=[f.qb, f.s]), patch(
                     "routine.public.cycle", side_effect=assess), patch(
-                    "production.execute_routine_attempt", side_effect=attempt):
+                    "workflow.BLOCKLIST_SCOPE_VERIFIABLE", False), patch(
+                    "production.execute_native_file_removal", side_effect=attempt):
                 self.assertEqual(routine.main(), 0)
             result = json.loads(output.getvalue())
             self.assertEqual(result["status"], "interrupted")
@@ -254,12 +253,12 @@ class RoutineTests(unittest.TestCase):
         first = dict(f.report, safeguards={"status": "fresh_attempt_verified"})
         second = dict(first, hash="b" * 40)
         proposal = {"assessment": [first, second], "recovery": []}
-        execute = production.execute_routine_attempt
+        execute = production.execute_native_file_removal
 
-        def interrupt_after_first(config, qb, apis, journal, report, authority):
+        def interrupt_after_first(config, qb, apis, report, authority, lock_path):
             if report["hash"] == second["hash"]:
                 raise production.GuardError("run_time_limit_reached")
-            return execute(config, qb, apis, journal, report, authority)
+            return execute(config, qb, apis, report, authority, lock_path)
 
         with contextlib.ExitStack() as stack:
             output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -268,19 +267,24 @@ class RoutineTests(unittest.TestCase):
             stack.enter_context(patch("routine.RoutineAuthorization.load", return_value=self.authority))
             stack.enter_context(patch("routine.Api", side_effect=[f.qb, f.s]))
             stack.enter_context(patch("routine.public.cycle", return_value=proposal))
-            stack.enter_context(patch("production.execute_routine_attempt", side_effect=interrupt_after_first))
-            send = stack.enter_context(patch("production._send_queue_delete", side_effect=lambda *args: f.results()))
+            stack.enter_context(patch("workflow.BLOCKLIST_SCOPE_VERIFIABLE", False))
+            stack.enter_context(patch("production.execute_native_file_removal", side_effect=interrupt_after_first))
+            send = stack.enter_context(patch("production._send_queue_delete", side_effect=lambda *args, **kw: f.results()))
             self.assertEqual(routine.main(), 0)
 
-        send.assert_called_once_with(f.s, 7)
+        send.assert_called_once_with(f.s, 7, blocklist=True, native_file_cleanup=True)
         summary = json.loads(output.getvalue())
         self.assertEqual(summary["status"], "interrupted")
         self.assertIs(summary["live_authorized"], True)
         self.assertEqual(summary["reason"], "run_time_limit_reached")
         self.assertEqual([(action["hash"], action["stage"]) for action in summary["actions"]],
-                         [(f.hash, "cleanup_resolved")])
+                         [(f.hash, "sonarr_remove_blocklist_accepted")])
         lines = [json.loads(line) for line in log_path.read_text().splitlines()]
-        self.assertEqual(lines, [{"event": "routine_action", **summary["actions"][0]}, summary])
+        self.assertEqual(lines[0].pop("event"), "routine_action")
+        self.assertIn("time", lines[0])
+        self.assertEqual({key: value for key, value in lines[0].items() if key != "time"}, summary["actions"][0])
+        self.assertEqual(lines[1]["status"], "interrupted")
+        self.assertEqual(len(lines), 2)
 
     def test_routine_gate_is_not_enabled_by_test_permission(self):
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(

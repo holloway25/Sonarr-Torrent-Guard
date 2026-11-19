@@ -88,6 +88,8 @@ this change does not upgrade the container host's operating system.
   published candidates always pull the compatible base and disable layer reuse
   for the build, ensuring package upgrades execute. All source/privacy tests,
   built-image tests and startup/shutdown checks still run before publication.
+  The suite imports application modules from `/app` and checks them against the
+  reviewed source. Tests and fixtures are mounted separately at `/src`.
   Cache export failure is non-fatal and bounded to avoid wasting CI minutes.
 - The daily cadence check is lightweight; the full maintenance build runs every
   three days. This reduces future usage but cannot reset an exhausted GitHub
@@ -108,11 +110,10 @@ step; application/API credentials are never involved.
    publication.
 2. Run **Container** on `main` with `publish: true`. Record the source revision,
    publication run ID and exact candidate digest from the run.
-3. Review that published candidate. For startup, authorization or journal
+3. Review that published candidate. For startup, authorization or cleanup
    changes, rehearse an offline upgrade from the previous released image using
-   populated test appdata. Verify that the configured scope and journal
-   evidence survive and that native file cleanup works with an unavailable
-   journal.
+   populated test appdata. Check scope confirmation, log output and operation
+   with no database or a leftover legacy journal.
 4. Run **Promote reviewed image** on `main` with that digest, the publication run
    ID and `review_approved: true`. An independently managed host updater can then
    pull `latest`.

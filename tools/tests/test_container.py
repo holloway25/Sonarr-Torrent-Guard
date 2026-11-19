@@ -36,92 +36,6 @@ class ContainerTests(unittest.TestCase):
         patcher.start(); self.addCleanup(patcher.stop)
         self.env = example_environment()
 
-    def test_journal_fingerprint_and_first_setup_work_without_hashlib_file_digest(self):
-        import hashlib
-
-        fixture = self.path / "sample"
-        contents = b"abcdef" * 200000
-        fixture.write_bytes(contents)
-        info = fixture.stat()
-        checksum = hashlib.sha256(contents).hexdigest()
-        expected = hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{checksum}".encode()).hexdigest()
-        with patch.object(worker.hashlib, "file_digest", create=True, side_effect=AttributeError):
-            self.assertEqual(worker.journal_fingerprint(fixture), expected)
-            fixture.unlink()
-            result, cycle, _ = self.run_mode(self.env, "--once")
-        self.assertEqual(result, 0)
-        cycle.assert_called_once()
-
-    def test_interrupted_sqlite_rollback_is_read_only_in_check_and_recovers_on_startup(self):
-        import fcntl
-        from safety import Journal
-        from contextlib import closing
-
-        self.legacy_hold()
-        env = dict(self.env, STGUARD_MODE="live")
-        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
-        path = self.path / worker.JOURNAL_FILE
-        rollback = path.with_name(path.name + "-journal")
-        command = """
-import os
-import sqlite3
-import sys
-
-database = sqlite3.connect(sys.argv[1])
-database.execute("PRAGMA cache_size=2")
-database.execute("PRAGMA cache_spill=ON")
-database.execute("BEGIN IMMEDIATE")
-database.execute("UPDATE actions SET stage='cleanup_resolved'")
-database.execute("CREATE TABLE abandoned_write (value BLOB)")
-for _ in range(12):
-    database.execute("INSERT INTO abandoned_write VALUES (zeroblob(16384))")
-os._exit(0)
-"""
-        subprocess.run([sys.executable, "-c", command, str(path)], check=True, timeout=10)
-        before = path.read_bytes(), rollback.read_bytes()
-
-        result, cycle, error = self.run_mode(env, "--check-config")
-        self.assertEqual(result, 1)
-        self.assertIn("container_journal_rollback_required", error)
-        cycle.assert_not_called()
-        self.assertTrue(rollback.is_file())
-        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
-
-        # A repair must hold the worker lock and verify durable identity
-        # before SQLite is allowed to alter either file.
-        with (self.path / "guard.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result, cycle, _ = self.run_mode(env, "--once")
-            self.assertEqual(result, 1)
-            cycle.assert_not_called()
-        self.assertTrue(rollback.is_file())
-        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
-
-        marker = self.path / worker.JOURNAL_MARKER
-        binding = self.path / worker.JOURNAL_BINDING
-        original = json.loads(marker.read_text())
-        wrong = {"journal_id": "b" * 64}
-        for record in (marker, binding):
-            worker.atomic_json(record, wrong)
-        result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 0)
-        self.assertIn("container_journal_identity_mismatch", error)
-        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
-        self.assertTrue(rollback.is_file())
-        self.assertEqual((path.read_bytes(), rollback.read_bytes()), before)
-        for record in (marker, binding):
-            worker.atomic_json(record, original)
-
-        result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 0, error)
-        cycle.assert_called_once()
-        self.assertFalse(rollback.exists())
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
-            self.assertIsNone(journal.db.execute("SELECT name FROM sqlite_master "
-                                                 "WHERE name='abandoned_write'").fetchone())
-        self.assertEqual(self.run_mode(env, "--once")[0], 0)
-
     def test_environment_builds_both_owners_with_private_exclusions_only(self):
         config = worker.runtime_config(self.env)
         self.assertTrue(config["dry_run"])
@@ -195,97 +109,8 @@ os._exit(0)
         changed = json.loads(worker.configure(self.env).read_text())
         self.assertEqual(changed["sonarr"]["Sonarr-HD"]["indexers"]["mode"], "private_exclusions")
 
-    def legacy_hold(self):
-        import production
-        from safety import Journal
-        from tools.tests.test_production import ProductionTests
-        fixture = ProductionTests()
-        fixture.setUp()
-        def cleanup():
-            fixture.tearDown()
-            fixture.doCleanups()
-        self.addCleanup(cleanup)
-        config = worker.runtime_config(self.env)
-        config["sonarr"] = {quality: config["sonarr"]["Sonarr-" + quality] for quality in ("HD", "UHD")}
-        worker.atomic_json(self.path / "connections.json", config)
-        context = dict(fixture.context, binding_digest=production.binding_digest(config, "HD"))
-        journal = Journal(self.path / "action-journal.sqlite3", allow_single_test=True)
-        row = journal.prepare(fixture.report, mode="single_test", context=context)
-        journal.transition(row["key"], "prepared", "dispatch_recorded")
-        journal.transition(row["key"], "dispatch_recorded", "manual_review")
-        journal.close()
-        return config, fixture.report
-
-    def test_environment_preserves_legacy_labels_and_unresolved_hold_after_restart(self):
-        import production
-        from safety import Journal, SafetyError
-        config, report = self.legacy_hold()
-        journal_path = self.path / "action-journal.sqlite3"
-        before = journal_path.read_bytes()
-        for _ in range(2):
-            current = json.loads(worker.configure(dict(self.env, STGUARD_QBIT_PASSWORD="rotated-placeholder")).read_text())
-            self.assertEqual(set(current["sonarr"]), {"HD", "UHD"})
-            self.assertEqual(current["sonarr"], config["sonarr"])
-            journal = Journal(journal_path, read_only=True)
-            try:
-                with self.assertRaisesRegex(SafetyError, "previous_attempt_unresolved"):
-                    production.check_prior_attempts(journal, report, config=current)
-            finally:
-                journal.close()
-        self.assertEqual(journal_path.read_bytes(), before)
-
-    def test_older_populated_journal_passes_identity_check_before_writable_migration(self):
-        import sqlite3
-        from contextlib import closing
-
-        from safety import Journal
-
-        config, _ = self.legacy_hold()
-        path = self.path / "action-journal.sqlite3"
-        with closing(Journal(path, read_only=True)) as journal:
-            key, = journal.db.execute("SELECT key FROM actions").fetchone()
-            row = journal.get(key)
-        with closing(sqlite3.connect(path)) as db, db:
-            db.execute("ALTER TABLE actions DROP COLUMN search_command_id")
-            db.execute("DROP TABLE actions_archive")
-        before = path.read_bytes()
-
-        for env in ({"STGUARD_CONFIG_SOURCE": "file"}, self.env):
-            with self.subTest(source=env.get("STGUARD_CONFIG_SOURCE", "env")):
-                result, cycle, _ = self.run_mode(env, "--check-config")
-                self.assertEqual(result, 0)
-                cycle.assert_not_called()
-                self.assertEqual(path.read_bytes(), before)
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.get(key), row)
-
-        config_path = self.path / "connections.json"
-        original_config = json.loads(config_path.read_text())
-        config["sonarr"]["HD"]["category"] = "different-category"
-        worker.atomic_json(config_path, config)
-        result, cycle, _ = self.run_mode({"STGUARD_CONFIG_SOURCE": "file"}, "--check-config")
-        self.assertEqual(result, 1)
-        cycle.assert_not_called()
-        self.assertEqual(path.read_bytes(), before)
-        worker.atomic_json(config_path, original_config)
-
-        def start_dry_run(mode, config_path):
-            self.assertEqual(mode, "dry-run")
-            with closing(Journal(path)) as journal:
-                columns = {column[1] for column in journal.db.execute("PRAGMA table_info(actions)")}
-                self.assertIn("search_command_id", columns)
-                self.assertEqual(journal.get(key), row)
-            return 0
-
-        with patch.dict(os.environ, self.env, clear=True), patch(
-                "sys.argv", ["container_worker.py", "--once"]), patch("signal.signal"), patch.object(
-                worker, "run_cycle", side_effect=start_dry_run) as cycle, contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(worker.main(), 0)
-        cycle.assert_called_once()
-
-    def test_binding_changes_and_orphaned_appdata_require_explicit_migration(self):
-        self.legacy_hold()
-        path = self.path / "connections.json"
+    def test_binding_changes_require_explicit_migration(self):
+        path = worker.configure(self.env)
         before = path.read_bytes()
         for changes in ({"STGUARD_SONARR_HD_URL": "https://different.example.invalid"},
                         {"STGUARD_SONARR_HD_CLIENT_ID": "99"},
@@ -294,33 +119,6 @@ os._exit(0)
             with self.subTest(changes=list(changes)), self.assertRaisesRegex(Exception, "identity_migration_required"):
                 worker.configure(dict(self.env, **changes))
             self.assertEqual(path.read_bytes(), before)
-        path.unlink()
-        with self.assertRaisesRegex(Exception, "identity_migration_required"):
-            worker.configure(self.env)
-        self.assertFalse(path.exists())
-
-    def test_file_mode_cannot_hide_old_labels_or_change_recorded_binding(self):
-        self.legacy_hold()
-        path = self.path / "connections.json"
-        for candidate in (worker.runtime_config(self.env),
-                          dict(json.loads(path.read_text()), qbittorrent={"url": "https://different.example.invalid",
-                               "username": "REPLACE_ME", "password": "REPLACE_ME"})):
-            # Keep config structurally valid so the journal comparison is tested.
-            for item in candidate["sonarr"].values():
-                item["download_client_binding"]["endpoint"] = candidate["qbittorrent"]["url"]
-            worker.atomic_json(path, candidate)
-            with self.assertRaisesRegex(Exception, "identity_migration_required"):
-                worker.configure({"STGUARD_CONFIG_SOURCE": "file"})
-
-    def test_orphaned_journal_requires_original_config_even_when_empty(self):
-        from safety import Journal
-        journal = Journal(self.path / "action-journal.sqlite3")
-        journal.close()
-        before = (self.path / "action-journal.sqlite3").read_bytes()
-        with self.assertRaisesRegex(Exception, "identity_migration_required"):
-            worker.configure(self.env)
-        self.assertFalse((self.path / "connections.json").exists())
-        self.assertEqual((self.path / "action-journal.sqlite3").read_bytes(), before)
 
     def test_check_config_sends_no_requests_and_does_not_print_credentials(self):
         output = io.StringIO()
@@ -441,6 +239,36 @@ os._exit(0)
         cycle.assert_called_once_with("live", self.path / "connections.json")
         self.assertFalse((self.path / "routine-authorization.json").exists())
 
+    def test_new_cleanup_rule_requires_one_confirmation_and_ignores_old_database(self):
+        env = dict(self.env, STGUARD_MODE="live")
+        config = worker.runtime_config(env)
+        scope = worker.container_scope_record(config)
+        worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, dict(scope, rule="public-sonarr-cleanup-v3"))
+        journal = self.path / "action-journal.sqlite3"
+        journal.write_bytes(b"corrupt older journal")
+        for command in ("--check-config", "--once"):
+            result, cycle, error = self.run_mode(env, command)
+            self.assertEqual(result, 1)
+            cycle.assert_not_called()
+            self.assertIn("container_live_scope_confirmation_required", error)
+        result, cycle, _ = self.run_mode(env, "--approve-live-scope")
+        self.assertEqual(result, 0)
+        cycle.assert_not_called()
+        self.assertEqual(json.loads((self.path / worker.CONTAINER_SCOPE_FILE).read_text()), scope)
+        for mode in ("dry-run", "live"):
+            result, cycle, _ = self.run_mode(dict(env, STGUARD_MODE=mode), "--once")
+            self.assertEqual(result, 0)
+            cycle.assert_called_once_with(mode, self.path / "connections.json")
+        self.assertEqual(journal.read_bytes(), b"corrupt older journal")
+        self.assertFalse((self.path / "preview-journal.sqlite3").exists())
+
+    def test_environment_preserves_existing_owner_labels(self):
+        config = worker.runtime_config(self.env)
+        config["sonarr"] = {quality: config["sonarr"]["Sonarr-" + quality] for quality in ("HD", "UHD")}
+        worker.atomic_json(self.path / "connections.json", config)
+        current = json.loads(worker.configure(self.env).read_text())
+        self.assertEqual(current["sonarr"], config["sonarr"])
+
     def run_mode(self, env, command):
         with patch.dict(os.environ, env, clear=True), patch(
                 "sys.argv", ["container_worker.py", command]), patch("signal.signal"), patch.object(
@@ -468,245 +296,18 @@ os._exit(0)
         self.assertEqual(result, 0)
         cycle.assert_called_once()
 
-    def test_partial_restore_cannot_create_a_new_live_journal(self):
-        from contextlib import closing
-        from safety import Journal
-
-        self.legacy_hold()
-        env = dict(self.env, STGUARD_MODE="live")
-        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
-        result, cycle, _ = self.run_mode(env, "--once")
-        self.assertEqual(result, 0)
-        cycle.assert_called_once()
-        path = self.path / worker.JOURNAL_FILE
-        marker = self.path / worker.JOURNAL_MARKER
-        self.assertTrue(marker.exists())
-        saved = path.read_bytes()
-        path.unlink()
-        for command in ("--check-config", "--approve-live-scope"):
-            with self.subTest(command=command):
-                result, cycle, error = self.run_mode(env, command)
-                self.assertEqual(result, 1)
-                self.assertIn("container_journal_missing", error)
-                cycle.assert_not_called()
-                self.assertFalse(path.exists())
-        result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 0)
-        self.assertIn("container_journal_missing", error)
-        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
-        self.assertFalse(path.exists())
-        with closing(Journal(path)) as orphan:
-            orphan.installation_id(create=True)
-        result, cycle, error = self.run_mode(env, "--once")
-        self.assertEqual(result, 0)
-        self.assertIn("container_journal_identity_mismatch", error)
-        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
-        path.write_bytes(saved)
-        self.assertEqual(self.run_mode(env, "--once")[0], 0)
-
-    def test_initialized_and_legacy_substitutes_cannot_take_over_when_the_marker_is_missing(self):
-        from contextlib import closing
-        from safety import Journal
-
-        import public
-        import routine
-
-        self.legacy_hold()
-        env = dict(self.env, STGUARD_MODE="live")
-        self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
-        path = self.path / worker.JOURNAL_FILE
-        marker = self.path / worker.JOURNAL_MARKER
-        binding = self.path / worker.JOURNAL_BINDING
-        saved_marker = marker.read_bytes()
-        saved_binding = binding.read_bytes()
-        saved_db = path.with_suffix(".saved")
-        path.replace(saved_db)
-        marker.unlink()
-
-        for identified in (False, True):
-            with closing(Journal(path)) as other:
-                if identified:
-                    other.installation_id(create=True)
-            replacement = path.read_bytes()
-            for previous_release in (False, True):
-                if previous_release:
-                    binding.unlink()
-                reason = ("container_journal_marker_missing" if previous_release
-                          else "container_journal_identity_mismatch")
-                for command in ("--check-config", "--approve-live-scope"):
-                    with self.subTest(identified=identified, previous_release=previous_release, command=command):
-                        result, cycle, errors = self.run_mode(env, command)
-                        self.assertEqual(result, 1)
-                        self.assertIn(reason, errors)
-                        cycle.assert_not_called()
-                        self.assertFalse(marker.exists())
-                        self.assertEqual(path.read_bytes(), replacement)
-                result, cycle, errors = self.run_mode(env, "--once")
-                self.assertEqual(result, 0)
-                self.assertIn(reason, errors)
-                cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
-                self.assertEqual(path.read_bytes(), replacement)
-                args = ["routine.py", "--live", "--container-mode", "--config", str(self.path / "connections.json"),
-                        "--log-file", str(self.path / "routine.log")]
-                with patch.dict(os.environ, {"STGUARD_MODE": "live"}, clear=True), patch(
-                        "sys.argv", args), patch.object(public, "cycle", return_value={
-                            "assessment": [], "recovery": []}) as direct, contextlib.redirect_stdout(
-                        io.StringIO()) as output:
-                    self.assertEqual(routine.main(), 0)
-                direct.assert_called_once()
-                self.assertIsNone(direct.call_args.args[3])
-                self.assertEqual(json.loads(output.getvalue())["metadata_journal_waiting"],
-                                 "container_journal_marker_missing")
-                if previous_release:
-                    binding.write_bytes(saved_binding)
-                    binding.chmod(0o600)
-            path.unlink()
-
-        saved_db.replace(path)
-        result, cycle, _ = self.run_mode(env, "--once")
-        self.assertEqual(result, 0)
-        cycle.assert_called_once()
-        self.assertEqual(marker.read_bytes(), saved_marker)
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
-        # A valid legacy marker and journal can migrate without another approval.
-        binding.unlink()
-        self.assertEqual(self.run_mode(env, "--once")[0], 0)
-        self.assertEqual(binding.read_bytes(), saved_binding)
-
-    def test_interrupted_first_marker_write_recovers_only_the_original_bound_journal(self):
-        from contextlib import closing
-        from safety import Journal
-
-        self.legacy_hold()
-        env = dict(self.env, STGUARD_MODE="live")
-        path = self.path / worker.JOURNAL_FILE
-        marker = self.path / worker.JOURNAL_MARKER
-        binding = self.path / worker.JOURNAL_BINDING
-        original = worker.atomic_json
-
-        def fail_marker(destination, data):
-            if destination == marker:
-                raise OSError()
-            return original(destination, data)
-
-        with patch.object(worker, "atomic_json", side_effect=fail_marker):
-            result, cycle, _ = self.run_mode(env, "--approve-live-scope")
-        self.assertEqual(result, 1)
-        cycle.assert_not_called()
-        self.assertFalse(marker.exists())
-        expected = json.loads(binding.read_text())["journal_id"]
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.installation_id(), expected)
-
-        saved = path.with_suffix(".saved")
-        path.replace(saved)
-        with closing(Journal(path)):
-            pass
-        result, cycle, error = self.run_mode(env, "--approve-live-scope")
-        self.assertEqual(result, 1)
-        self.assertIn("container_journal_identity_mismatch", error)
-        cycle.assert_not_called()
-        self.assertFalse(marker.exists())
-
-        saved.replace(path)
-        result, cycle, _ = self.run_mode(env, "--approve-live-scope")
-        self.assertEqual(result, 0)
-        cycle.assert_not_called()
-        self.assertEqual(json.loads(marker.read_text()), {"journal_id": expected})
-        self.assertEqual(json.loads(binding.read_text()), {"journal_id": expected})
-        self.assertEqual(self.run_mode(env, "--once")[0], 0)
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
-
-    def test_interrupted_first_database_bind_resumes_only_on_the_same_file(self):
-        from contextlib import closing
-        from safety import Journal
-
-        self.legacy_hold()
-        path = self.path / worker.JOURNAL_FILE
-        marker = self.path / worker.JOURNAL_MARKER
-        installation_id = Journal.installation_id
-
-        def fail_write(journal, *, create=False, identifier=None):
-            if create:
-                raise OSError()
-            return installation_id(journal)
-
-        with patch.object(Journal, "installation_id", new=fail_write):
-            self.assertEqual(self.run_mode(self.env, "--once")[0], 1)
-        self.assertFalse(marker.exists())
-        saved = path.with_suffix(".saved")
-        path.replace(saved)
-        path.write_bytes(saved.read_bytes())
-        path.chmod(0o600)
-        result, cycle, errors = self.run_mode(self.env, "--once")
-        self.assertEqual(result, 1)
-        self.assertIn("container_journal_identity_mismatch", errors)
-        cycle.assert_not_called()
-
-        saved.replace(path)
-        result, cycle, _ = self.run_mode(self.env, "--once")
-        self.assertEqual(result, 0)
-        cycle.assert_called_once()
-        self.assertTrue(marker.exists())
-        with closing(Journal(path, read_only=True)) as journal:
-            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
-
-    def test_scheduled_children_preserve_a_missing_or_substituted_journal(self):
-        from contextlib import closing
-
-        import public
-        import routine
-        from safety import Journal
-
-        env = dict(self.env, STGUARD_MODE="live")
-        self.assertEqual(self.run_mode(env, "--once")[0], 0)
-        path = self.path / worker.JOURNAL_FILE
-        path.unlink()
-        command = ["--config", str(self.path / "connections.json"), "--container-journal"]
-        for replacement in (False, True):
-            if replacement:
-                with closing(Journal(path)) as other:
-                    other.installation_id(create=True)
-            expected = "container_journal_identity_mismatch" if replacement else "container_journal_missing"
-            saved = path.read_bytes() if replacement else None
-            for module, extra, mode in ((public, [], "dry-run"), (routine, [
-                    "--container-mode", "--live", "--log-file", str(self.path / "routine.log")], "live")):
-                with (
-                    self.subTest(replacement=replacement, mode=mode),
-                    patch("sys.argv", [module.__file__, *command, *extra]),
-                    patch.dict(os.environ, {"STGUARD_MODE": mode}, clear=True),
-                    patch.object(public, "cycle", return_value={"assessment": [], "recovery": []}) as cycle,
-                    contextlib.redirect_stdout(io.StringIO()) as output,
-                ):
-                    self.assertEqual(module.main(), 0)
-                result = json.loads(output.getvalue())
-                if mode == "live":
-                    cycle.assert_called_once()
-                    self.assertIsNone(cycle.call_args.args[3])
-                    self.assertEqual(result["metadata_journal_waiting"], expected)
-                else:
-                    cycle.assert_not_called()
-                    self.assertEqual(result["reason"], expected)
-                if replacement:
-                    self.assertEqual(path.read_bytes(), saved)
-                else:
-                    self.assertFalse(path.exists())
-
     @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX named pipes")
     def test_state_paths_refuse_named_pipes_without_blocking(self):
         paths = {name: self.path / name for name in (
-            "connections.json", "batch-state.json", "guard.lock", worker.JOURNAL_FILE, "container-status.json")}
+            "connections.json", "batch-state.json", "guard.lock", "container-status.json")}
         for path in paths.values():
             os.mkfifo(path, 0o600)
         result = subprocess.run([sys.executable, "-c", """
 import sys
 from pathlib import Path
-from contextlib import closing
 import container_worker
 from guard import GuardError, load_batch_state, load_config
-from safety import Journal, SafetyError, open_lock_file
+from safety import SafetyError, open_lock_file
 from unittest import TestCase
 
 root = Path(sys.argv[1])
@@ -717,24 +318,10 @@ with test.assertRaisesRegex(GuardError, "^invalid_batch_state$"):
     load_batch_state(root / "batch-state.json")
 with test.assertRaisesRegex(SafetyError, "^invalid_worker_lock$"), open_lock_file(root / "guard.lock"):
     pass
-with test.assertRaisesRegex(SafetyError, "^journal_requires_private_directory$"):
-    with closing(Journal(root / container_worker.JOURNAL_FILE)):
-        pass
 container_worker.CONFIG_DIR = root
 test.assertEqual(container_worker.healthcheck(), 1)
 """, str(self.path)], capture_output=True, text=True, timeout=4)
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_legacy_approved_scope_without_journal_runs_only_file_cleanup(self):
-        from authorization import container_scope_record
-        config = worker.runtime_config(self.env)
-        worker.atomic_json(self.path / "connections.json", config)
-        worker.atomic_json(self.path / worker.CONTAINER_SCOPE_FILE, container_scope_record(config))
-        result, cycle, error = self.run_mode(dict(self.env, STGUARD_MODE="live"), "--once")
-        self.assertEqual(result, 0)
-        self.assertIn("container_journal_missing", error)
-        cycle.assert_called_once_with("live", self.path / "connections.json", file_cleanup_only=True)
-        self.assertFalse((self.path / worker.JOURNAL_FILE).exists())
 
     def test_scope_change_requires_confirmation_even_after_restart(self):
         env = dict(self.env, STGUARD_MODE="live")
@@ -773,7 +360,7 @@ test.assertEqual(container_worker.healthcheck(), 1)
         self.assertTrue(args[1].endswith("routine.py"))
         self.assertIn("--live", args)
         self.assertIn("--container-mode", args)
-        self.assertIn("--container-journal", args)
+        self.assertEqual(args[args.index("--log-file") + 1], str(self.path / "routine.log"))
         self.assertNotIn("--authorization", args)
         env = popen.call_args.kwargs["env"]
         self.assertEqual(env["STGUARD_MODE"], "live")
@@ -794,7 +381,7 @@ test.assertEqual(container_worker.healthcheck(), 1)
                 "subprocess.Popen", return_value=process) as popen:
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 0)
         self.assertIn("public.py", popen.call_args.args[0][1])
-        self.assertIn("--container-journal", popen.call_args.args[0])
+        self.assertEqual(popen.call_args.args[0][-1], str(self.path / "dry-run.log"))
         self.assertNotIn("private-marker", str(popen.call_args))
         process.wait.assert_called_once_with(timeout=0.25)
 
@@ -975,9 +562,12 @@ test.assertEqual(container_worker.healthcheck(), 1)
         self.assertEqual(list(root.glob("test_*.py")), [])
         self.assertGreaterEqual(len(list((root / "tools/tests").glob("test_*.py"))), 9)
         self.assertTrue((root / "tools/tests/__init__.py").is_file())
-        for name in ("checks.yml", "container.yml"):
-            workflow = (root / ".github/workflows" / name).read_text()
-            self.assertIn("-m unittest discover -s tools/tests -t .", workflow)
+        workflows = root / ".github/workflows"
+        self.assertIn("-m unittest discover -s tools/tests -t .", (workflows / "checks.yml").read_text())
+        container = (workflows / "container.yml").read_text()
+        self.assertIn("discover(\"/src/tools/tests\"", container)
+        self.assertIn("PYTHONPATH=/app:/src", container)
+        self.assertIn('assert path == Path("/app", name + ".py")', container)
 
     def test_unraid_template_defaults_match_supported_environment(self):
         import xml.etree.ElementTree as ET

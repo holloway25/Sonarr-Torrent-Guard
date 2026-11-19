@@ -324,6 +324,8 @@ def check_visible_native_grabs(api, instance, report, max_pages):
                 raise ValueError()
         if not approved <= {row["id"] for row in rows}:
             raise ValueError()
+        if len({row["sourceTitle"] for row in rows if row["id"] in approved}) != 1:
+            raise SafetyError("ambiguous_release_title_evidence")
     except (GuardError, TypeError, ValueError) as error:
         if str(error) == "run_time_limit_reached":
             raise
@@ -364,7 +366,7 @@ def execute_native_file_removal(config, qb, apis, report, authority, lock_path):
         _send_queue_delete(api, min(current["queue_ids"]), blocklist=True, native_file_cleanup=True)
 
 
-def capture_context(config, api, report, approval_digest, now=None, *, dispatch=None):
+def capture_context(config, api, report, approval_digest, now=None, *, dispatch=None, check_recent_grabs=False):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
     if report.get("decision") != "would_fail" or report.get("public_source_confirmed") is not True:
@@ -458,6 +460,12 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 check_replacement_grabs(baseline_history, previous, dispatch["dispatched_at"])
             except (GuardError, SafetyError) as error:
                 # Preserve an observed veto even if the later read no longer contains the row.
+                reason = str(error)
+                context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
+        elif check_recent_grabs:
+            try:
+                check_replacement_grabs(baseline_history, context, start)
+            except (GuardError, SafetyError) as error:
                 reason = str(error)
                 context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
     if "hash_aliases" in report:
@@ -829,6 +837,64 @@ def check_metadata_blocklist(rows, context, not_before):
         raise SafetyError("replacement_blocklisted" if blocklisted else "replacement_blocklist_uncertain")
 
 
+def check_replacement_search_ready(config, qb, apis, c, not_before, observation, validate):
+    if "metadata_search_hold" in c:
+        raise SafetyError(c["metadata_search_hold"])
+    if observation.get("replacement_grab_ambiguous") is True:
+        raise SafetyError("replacement_history_ambiguous")
+    # Only a complete observation can rule out a replacement at this point.
+    if observation.get("replacement_grab_observed") is not False:
+        raise SafetyError("replacement_history_unavailable")
+    require_connectivity(config, apis[c["instance"]], c["instance"])
+    # The first absence observation is insufficient if another actor has
+    # re-added the hash or queued a replacement while intent was committed.
+    torrent, _ = observed_torrent(qb, c)
+    if torrent is not None:
+        raise SafetyError("target_reappeared")
+    queue = records(apis[c["instance"]], "/api/v3/queue",
+                    {"includeUnknownSeriesItems": "true"}, config.get("max_pages", 20))
+    original_rows = {tuple(row) for row in c.get("queue_rows", ())}
+    for queued in queue:
+        if not integer(queued.get("seriesId")) or queued["seriesId"] <= 0:
+            raise SafetyError("replacement_queue_identity_invalid")
+        # Sonarr permits unmapped episode IDs. A known different series is
+        # already unrelated; only potentially affected rows need episode IDs.
+        if queued["seriesId"] != c["series_id"]:
+            continue
+        if not integer(queued.get("episodeId")) or queued["episodeId"] <= 0:
+            raise SafetyError("replacement_queue_identity_invalid")
+        if queued["episodeId"] not in c["episode_ids"]:
+            continue
+        try:
+            queued_hash = torrent_hash(queued.get("downloadId"))
+        except GuardError:
+            raise SafetyError("replacement_already_queued") from None
+        if (queued["id"], queued["episodeId"], queued_hash) not in original_rows:
+            raise SafetyError("replacement_already_queued")
+    # Queue visibility can lag a successful grab. Refresh history AFTER the
+    # search-intent commit too; any affected episode already grabbed makes
+    # searching the whole set redundant. This is request evidence only,
+    # not proof of original removal, successful download or import.
+    events = history_since(apis[c["instance"]], c["window_start"])
+    client = bound_client(config, apis[c["instance"]], c["instance"])
+    if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
+        raise SafetyError("identity_or_manifest_changed")
+    check_replacement_grabs(events, c, not_before)
+    require_sonarr_v4(apis[c["instance"]])
+    if (binding_digest(config, c["instance"]) != c["binding_digest"] or
+            endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
+        raise SafetyError("identity_or_manifest_changed")
+    blocks = blocklist_records(apis[c["instance"]], c["series_id"], not_before,
+                              config.get("max_pages", 20))
+    check_metadata_blocklist(blocks, c, not_before)
+    readiness = read_readiness({c["instance"]: apis[c["instance"]]})[c["instance"]]
+    if any(readiness[field] is not True for field in ("automatic_retry", "interactive_retry")):
+        raise SafetyError("retry_settings_not_ready")
+    validate()
+    if METADATA_RETRY_RELEASE_ENABLED is not True:
+        raise SafetyError("live_execution_disabled")
+
+
 def finish_replacement_search(config, qb, apis, journal, row, validate):
     """Only the original removal coordinator can request a replacement search."""
     if row["stage"] != "retry_removed" or "metadata_retry" not in row["context"]:
@@ -838,61 +904,10 @@ def finish_replacement_search(config, qb, apis, journal, row, validate):
     row = journal.transition(row["key"], "retry_removed", "retry_search_recorded")
     c = row["context"]
     try:
-        if "metadata_search_hold" in c:
-            raise SafetyError(c["metadata_search_hold"])
+        observation = dict(row["current_observation"])
         if row["confirmed"].get("replacement_grab_ambiguous") is True:
-            raise SafetyError("replacement_history_ambiguous")
-        # Only a complete observation can rule out a replacement at this point.
-        if row["current_observation"].get("replacement_grab_observed") is not False:
-            raise SafetyError("replacement_history_unavailable")
-        require_connectivity(config, apis[c["instance"]], c["instance"])
-        # The first absence observation is insufficient if another actor has
-        # re-added the hash or queued a replacement while intent was committed.
-        torrent, _ = observed_torrent(qb, c)
-        if torrent is not None:
-            raise SafetyError("target_reappeared")
-        queue = records(apis[c["instance"]], "/api/v3/queue",
-                        {"includeUnknownSeriesItems": "true"}, config.get("max_pages", 20))
-        original_rows = {tuple(row) for row in c.get("queue_rows", ())}
-        for queued in queue:
-            if not integer(queued.get("seriesId")) or queued["seriesId"] <= 0:
-                raise SafetyError("replacement_queue_identity_invalid")
-            # Sonarr permits unmapped episode IDs. A known different series is
-            # already unrelated; only potentially affected rows need episode IDs.
-            if queued["seriesId"] != c["series_id"]:
-                continue
-            if not integer(queued.get("episodeId")) or queued["episodeId"] <= 0:
-                raise SafetyError("replacement_queue_identity_invalid")
-            if queued["episodeId"] not in c["episode_ids"]:
-                continue
-            try:
-                queued_hash = torrent_hash(queued.get("downloadId"))
-            except GuardError:
-                raise SafetyError("replacement_already_queued") from None
-            if (queued["id"], queued["episodeId"], queued_hash) not in original_rows:
-                raise SafetyError("replacement_already_queued")
-        # Queue visibility can lag a successful grab. Refresh history AFTER the
-        # search-intent commit too; any affected episode already grabbed makes
-        # searching the whole set redundant. This is request evidence only,
-        # not proof of original removal, successful download or import.
-        events = history_since(apis[c["instance"]], c["window_start"])
-        client = bound_client(config, apis[c["instance"]], c["instance"])
-        if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
-            raise SafetyError("identity_or_manifest_changed")
-        check_replacement_grabs(events, c, row["dispatched_at"])
-        require_sonarr_v4(apis[c["instance"]])
-        if (binding_digest(config, c["instance"]) != c["binding_digest"] or
-                endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
-            raise SafetyError("identity_or_manifest_changed")
-        blocks = blocklist_records(apis[c["instance"]], c["series_id"], row["dispatched_at"],
-                                  config.get("max_pages", 20))
-        check_metadata_blocklist(blocks, c, row["dispatched_at"])
-        readiness = read_readiness({c["instance"]: apis[c["instance"]]})[c["instance"]]
-        if any(readiness[field] is not True for field in ("automatic_retry", "interactive_retry")):
-            raise SafetyError("retry_settings_not_ready")
-        validate()
-        if METADATA_RETRY_RELEASE_ENABLED is not True:
-            raise SafetyError("live_execution_disabled")
+            observation["replacement_grab_ambiguous"] = True
+        check_replacement_search_ready(config, qb, apis, c, row["dispatched_at"], observation, validate)
     except Exception as error:
         reason = str(error) if isinstance(error, (SafetyError, GuardError)) else "dispatch_validation_failed"
         if reason not in DISPATCH_STOP_REASONS:
@@ -903,6 +918,73 @@ def finish_replacement_search(config, qb, apis, journal, row, validate):
         return journal.record_search_accepted(row["key"], command_id)
     except Exception:
         return journal.transition(row["key"], "retry_search_recorded", "retry_search_uncertain")
+
+
+def execute_live_metadata_retry(config, qb, apis, report, authority, lock_path):
+    """Remove a verified stalled download and optionally search in this pass only."""
+    from authorization import RoutineAuthorization
+
+    if config.get("dry_run") is not False or ROUTINE_RELEASE_ENABLED is not True or metadata_policy(report) is None:
+        raise SafetyError("live_execution_disabled")
+    if not isinstance(authority, (ContainerAuthorization, RoutineAuthorization)):
+        raise SafetyError("routine_authorization_invalid")
+    grant_check = authority.validate_scope if isinstance(authority, ContainerAuthorization) else authority.validate
+    label = report["instance"]
+    api = apis[label]
+    instance = config["sonarr"][label]
+
+    def validate():
+        grant_check(config, report)
+
+    with open_lock_file(lock_path) as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SafetyError("another_run_is_active") from None
+        validate()
+        if endpoint_key(api.config["url"]) != endpoint_key(instance["url"]):
+            raise SafetyError("identity_or_manifest_changed")
+        require_connectivity(config, api, label)
+        started = time.time()
+        wait_for_event_boundary(started)
+        snapshot = recheck_candidate(report, config, qb, apis)
+        check_fresh(report, snapshot)
+        current = snapshot["assessment"]
+        if metadata_policy(current) is None:
+            raise SafetyError("metadata_timeout_no_longer_confirmed")
+        context = capture_context(config, api, current, authority.identifier, check_recent_grabs=True)
+        require_current_metadata_timeout(qb, context, instance["category"])
+        validate()
+        check_fresh(report, snapshot)
+        if not event_boundary_reached(started):
+            raise SafetyError("dispatch_clock_unavailable")
+        _send_queue_delete(api, context["queue_id"], blocklist=False)
+
+        try:
+            observation = OutcomeVerifier(config, qb, apis, context, started).observe()
+        except (GuardError, SafetyError):
+            return {"stage": "retry_removal_unverified", "stop_reason": "removal_observation_unavailable"}
+        if observation.get("torrent_absent") is not True:
+            return {"stage": "retry_removal_unverified", "stop_reason": "removal_observation_unavailable"}
+        result = {"stage": "retry_removed", "stop_reason": None, "torrent_absent": True}
+        if observation.get("blocklisted") is not False:
+            reason = "replacement_blocklisted" if observation.get("blocklisted") else "replacement_blocklist_uncertain"
+            return dict(result, stage="retry_search_blocked", stop_reason=reason)
+        if any(observation.get(key) is True for key in (
+                "replacement_grab_observed", "any_replacement_observed", "replacement_observed")):
+            return dict(result, stage="retry_superseded")
+        try:
+            check_replacement_search_ready(config, qb, apis, context, started, observation, validate)
+        except (SafetyError, GuardError) as error:
+            reason = str(error)
+            if reason not in DISPATCH_STOP_REASONS:
+                reason = "dispatch_validation_failed"
+            return dict(result, stage="retry_search_blocked", stop_reason=reason)
+        try:
+            command_id = _send_episode_search(api, context["episode_ids"])
+        except SafetyError:
+            return dict(result, stage="retry_search_uncertain", stop_reason="episode_search_outcome_uncertain")
+        return dict(result, stage="retry_requested", search_command_id=command_id)
 
 
 def execute_single_test(config, qb, apis, journal, report, approval):

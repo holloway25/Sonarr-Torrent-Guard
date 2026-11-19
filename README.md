@@ -26,8 +26,9 @@ Guard checks the next grab on a later scheduled pass.
    current queue on the next pass. Each replacement or re-grab is assessed
    from its current evidence, including a grab from another public indexer.
 
-File cleanup needs no SQLite action journal, repeat counter or separate search.
-The worker does save private batch cursors so large queues get a fair turn.
+Dry-run and live operation work without SQLite. The logs record proposals or
+actions for inspection. Guard saves private batch cursors so large queues get
+a fair turn.
 See the [public workflow](docs/PUBLIC-WORKFLOW.md#live-file-policy-cleanup) for the
 exact request, Sonarr's history limits and how to read the result.
 
@@ -54,8 +55,8 @@ A separate rule applies to a verified public download still in `metaDL` or
 unknown size and a successfully read empty file list. This branch asks Sonarr
 to remove the download without blocklisting. After confirming removal and
 checking for an existing replacement, Guard can request one affected-episode
-search. This workflow and its read-only recovery use the private SQLite journal.
-If the journal is unavailable, approved live file cleanup can still run.
+search during the same pass. Guard holds the search if removal or replacement
+evidence is uncertain. Later runs check the current queue afresh.
 See [metadata retry](docs/METADATA-RETRY.md).
 
 ## Install and run
@@ -69,8 +70,9 @@ directory. A media library or download mount is unnecessary.
 
 Start with the default `STGUARD_MODE=dry-run`. Review the proposed actions
 and private-indexer settings for each Sonarr owner. Set `STGUARD_MODE=live`
-when the reviewed configuration is ready. Existing installs may require a
-one-time scope confirmation. Changes to that scope require confirmation again.
+when the reviewed configuration is ready. Existing live installs must confirm
+the v4 cleanup policy once because selected blocked file types now qualify for
+removal. Confirm again only when the approved configuration or rule changes.
 
 Use the [reviewed release process](docs/DEPENDENCY-MAINTENANCE.md) to approve a
 candidate before it becomes `latest`. A source commit, a published candidate and
@@ -94,15 +96,15 @@ python3 public.py --config /path/outside/checkout/connections.json
 ```
 
 Both commands are dry-run. `guard.py` reports file-policy and metadata
-assessments. `public.py` also checks Sonarr-side connectivity and observes pending
-journal entries. Its Sonarr diagnostic does not save configuration or change
+assessments. `public.py` also checks Sonarr-side connectivity. Its Sonarr
+diagnostic does not save configuration or change
 the torrent queue, but Sonarr may update its own connection-health status.
 
 Use `--format json` with `guard.py` for JSON-line reporting.
 `--show-titles` displays escaped titles only in the text output.
 `--log-file PATH` writes rotating JSON logs to a private location.
-`--check-safeguards` adds a targeted dry-run recheck and stores eligible preview
-evidence in a separate `preview-journal.sqlite3` beside the configuration.
+`--check-safeguards` adds a targeted dry-run recheck and includes its result in
+the report without creating a preview database.
 
 The optional dry-run and live service templates are in `deploy/`. Standalone
 live operation requires `routine.py --live` and a private scope-bound grant.
@@ -117,8 +119,13 @@ See [standalone authorization](docs/UNATTENDED-TRIAL.md).
 - `held` means validation stopped the action. Inspect the reported reason.
   `uncertain` means the request may have reached Sonarr. Check Sonarr and the
   current queue to see what happened.
-- A missing or unusable action journal produces a separate metadata hold. The
-  live worker can still check current files and process eligible file failures.
+- `retry_requested` means Sonarr accepted the search for an eligible metadata
+  timeout. `retry_search_blocked` includes the reason the search was held.
+
+Docker and the supplied service templates write `dry-run.log` for would-remove
+proposals and `routine.log` for live actions. Both logs rotate. Logs are never
+read back to decide what to remove. Older SQLite files in appdata can be kept as
+historical records.
 
 [Production preflight](docs/PUBLIC-WORKFLOW.md#production-verification-and-sender-gates)
 can check one candidate without sending a removal or search:
@@ -129,8 +136,8 @@ python3 production.py --config /path/outside/checkout/connections.json --preflig
 
 Keep connection settings, grants, logs, journals and backups outside Git.
 Runtime logs omit credentials, raw endpoints, release titles, filenames and
-download paths. See [journal retention](docs/JOURNAL-RETENTION.md) for the
-read-only retention preview and limits.
+download paths. [Legacy journal tools](docs/JOURNAL-RETENTION.md) are available
+for inspecting records from older releases.
 
 ## Verify changes
 

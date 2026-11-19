@@ -21,7 +21,7 @@ import urllib.request
 
 from reports import human_report, json_events
 from workflow import file_policy_removal, manual_handling_reason, preview_failure, read_readiness
-from safety import Journal, SafetyError, open_lock_file, record_preview
+from safety import SafetyError, check_fresh, open_lock_file
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
 METADATA_STATES = ("metaDL", "forcedMetaDL")
@@ -992,7 +992,7 @@ def main():
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--show-titles", action="store_true", help="Show escaped release titles in text stdout only")
     parser.add_argument("--check-safeguards", action="store_true",
-                        help="Read-only fresh rechecks recorded in an external preview journal")
+                        help="Perform a second read-only check for each eligible candidate")
     args = parser.parse_args()
     if args.show_titles and args.format != "text":
         parser.error("--show-titles requires --format text")
@@ -1022,22 +1022,18 @@ def main():
                     readiness = read_readiness(apis)
                     reports = run(config, qb, apis, batch_state=batch_state, include_titles=args.show_titles)
                     if args.check_safeguards:
-                        journal = Journal(args.config.parent / "preview-journal.sqlite3")
-                        try:
-                            for report in reports:
-                                if report["decision"] != "would_fail":
-                                    continue
-                                reason = manual_handling_reason(report)
-                                if reason is not None:
-                                    report["safeguards"] = {"status": "manual_review", "reason": reason, "live_enabled": False}
-                                    continue
-                                try:
-                                    row = record_preview(journal, report, lambda: recheck_candidate(report, config, qb, apis))
-                                    report["safeguards"] = {"status": row["stage"], "live_enabled": False}
-                                except (SafetyError, GuardError) as e:
-                                    report["safeguards"] = {"status": "blocked", "reason": str(e), "live_enabled": False}
-                        finally:
-                            journal.close()
+                        for report in reports:
+                            if report["decision"] != "would_fail":
+                                continue
+                            reason = manual_handling_reason(report)
+                            if reason is not None:
+                                report["safeguards"] = {"status": "manual_review", "reason": reason, "live_enabled": False}
+                                continue
+                            try:
+                                check_fresh(report, recheck_candidate(report, config, qb, apis))
+                                report["safeguards"] = {"status": "preview_verified", "live_enabled": False}
+                            except (SafetyError, GuardError) as error:
+                                report["safeguards"] = {"status": "blocked", "reason": str(error), "live_enabled": False}
             finally:
                 # Preserve completed assessments even if a later request aborts.
                 save_batch_state(batch_path, batch_state)

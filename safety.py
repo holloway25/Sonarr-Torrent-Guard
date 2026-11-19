@@ -6,7 +6,6 @@ import json
 import math
 import os
 from pathlib import Path
-import sqlite3
 import stat
 import time
 import secrets
@@ -73,6 +72,8 @@ class SafetyError(Exception):
 
 
 def metadata_journal_wait_reason(error):
+    import sqlite3
+
     if isinstance(error, sqlite3.Error):
         return "metadata_journal_unavailable"
     if isinstance(error, SafetyError) and str(error) in {
@@ -159,6 +160,8 @@ def validate_journal_sidecars(path, *, harden=False):
 
 
 def recover_bound_journal_rollback(path, expected_id):
+    import sqlite3
+
     """Recover one existing journal under the shared worker lock."""
     if not valid_digest(expected_id):
         raise SafetyError("container_journal_identity_mismatch")
@@ -198,6 +201,8 @@ class Journal:
     """
     def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False,
                  allow_archive=False, read_only=False, expected_installation_id=None, existing_only=False):
+        import sqlite3
+
         self.path = Path(path)
         self.read_only = read_only is True
         self._action_projection = ",".join(ACTION_FIELDS)

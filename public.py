@@ -2,18 +2,18 @@
 
 import argparse
 from contextlib import contextmanager
+import datetime
 import fcntl
 import json
+import logging
 from pathlib import Path
-import sqlite3
 import time
 
-from authorization import read_bound_container_journal_id, read_container_journal_id
-from guard import (Api, GuardError, hard_deadline, load_config, run, recheck_candidate,
+from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config, run, recheck_candidate,
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
 from production import OutcomeVerifier, check_prior_attempts
-from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, check_fresh,
+from safety import (SafetyError, check_fresh,
                     metadata_journal_wait_reason, open_lock_file, reconcile)
 from workflow import file_policy_removal, manual_handling_reason
 
@@ -92,11 +92,12 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
     budget = deadline - started
     assessment_end = started + budget / 2
     if reserve_dispatch:
-        verification_end = started + budget * 2 / 3
+        verification_end = started + budget * (2 / 3 if journal is not None else 3 / 4)
         recovery_end = started + budget * 3 / 4
     else:
         recovery_end = deadline
-        verification_end = deadline - min(RECOVERY_SECONDS + PERSIST_SECONDS, budget / 4)
+        verification_end = deadline - (min(RECOVERY_SECONDS + PERSIST_SECONDS, budget / 4)
+                                       if journal is not None else PERSIST_SECONDS)
     # Validate both owners before contacting the downloader. The shorter scan
     # deadline reserves time even when a large queue exhausts assessment.
     with limit_adapter_deadlines(adapters, assessment_end):
@@ -128,21 +129,21 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
                 with hard_deadline(verification_end):
                     fresh = recheck_candidate(report, config, qb, apis)
                     check_fresh(report, fresh)
-                    if not file_policy_removal(report):
-                        if journal is None:
-                            raise SafetyError("metadata_journal_unavailable")
+                    if journal is not None and not file_policy_removal(report):
                         check_prior_attempts(journal, report, config=config)
                 report["safeguards"] = {"status": "fresh_attempt_verified", "live_enabled": False}
             except (SafetyError, GuardError) as error:
                 report["safeguards"] = {"status": "held", "reason": str(error), "live_enabled": False}
-            except sqlite3.Error:
-                report["safeguards"] = {"status": "held", "reason": "metadata_journal_unavailable",
-                                        "live_enabled": False}
+            except Exception as error:
+                reason = metadata_journal_wait_reason(error) if journal is not None else None
+                if reason is None:
+                    raise
+                report["safeguards"] = {"status": "held", "reason": reason, "live_enabled": False}
     recovered = []
     if journal is not None:
         try:
             recovered = recover_pending(config, qb, apis, journal, batch_state, recovery_end)
-        except (SafetyError, sqlite3.Error) as error:
+        except Exception as error:
             reason = metadata_journal_wait_reason(error)
             if not reserve_dispatch or reason is None:
                 raise
@@ -154,10 +155,13 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
 def main():
     parser = argparse.ArgumentParser(description="One public dry-run cycle; never removes torrents")
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--container-journal", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--log-file", type=Path, help="Write would-remove proposals to a private rotating log")
     args = parser.parse_args()
+    handler = None
     try:
         config = load_config(args.config)
+        if args.log_file is not None:
+            handler = PrivateRotatingFileHandler(args.log_file, config_path=args.config)
         with open_lock_file(args.config.parent / "guard.lock") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -168,24 +172,35 @@ def main():
             apis = {label: Api(c, deadline=deadline) for label, c in config["sonarr"].items()}
             batch_path = args.config.parent / "batch-state.json"
             batch_state = load_batch_state(batch_path)
-            journal_id = (read_bound_container_journal_id(args.config.parent) if args.container_journal
-                          else read_container_journal_id(args.config.parent))
-            journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, expected_installation_id=journal_id)
             try:
                 with hard_deadline(deadline):
-                    result = cycle(config, qb, apis, journal, batch_state)
+                    result = cycle(config, qb, apis, None, batch_state)
             finally:
-                journal.close()
                 save_batch_state(batch_path, batch_state)
     except (SafetyError, GuardError) as error:
-        allowed = {"container_journal_missing", "container_journal_identity_mismatch",
-                   "container_journal_marker_missing", "invalid_worker_lock"}
+        allowed = {"invalid_worker_lock", "another_run_is_active", "log_destination_reserved",
+                   "log_destination_not_private_file", "log_symlink_refused"}
         reason = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
         result = {"dry_run": True, "status": "waiting", "reason": reason,
                   "live_sender_enabled": False, "retry_after_seconds": RETRY_AFTER_SECONDS}
     except Exception:
         result = {"dry_run": True, "status": "waiting", "reason": "cycle_unavailable",
                   "live_sender_enabled": False, "retry_after_seconds": RETRY_AFTER_SECONDS}
+    if handler is not None:
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            for report in result.get("assessment", ()):
+                if report["decision"] == "would_fail":
+                    status = report.get("safeguards", {}).get("status")
+                    entry = {"event": "would_remove" if status == "fresh_attempt_verified" else "held",
+                             "time": stamp, "instance": report["instance"], "hash": report["hash"],
+                             "reasons": report["reasons"], "safeguards": report.get("safeguards")}
+                    handler.emit(logging.LogRecord("public", logging.INFO, "", 0, json.dumps(entry), (), None))
+            if result["status"] == "waiting":
+                entry = {"event": "waiting", "time": stamp, "reason": result["reason"]}
+                handler.emit(logging.LogRecord("public", logging.INFO, "", 0, json.dumps(entry), (), None))
+        finally:
+            handler.close()
     print(json.dumps(result))
     return 0
 

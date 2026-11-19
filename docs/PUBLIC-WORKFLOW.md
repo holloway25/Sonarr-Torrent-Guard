@@ -31,9 +31,9 @@ Sonarr may update its own connection-health status during the test.
 
 Docker and the provided timers wait ten minutes after a cycle finishes.
 The cycle uses a shared three-minute deadline, bounded requests and pagination,
-and a worker lock. Assessment, verification, recovery and dispatch each have
-time reserved. Private cursors rotate through large queues and pending recovery,
-including after a timeout or restart.
+and a worker lock. Assessment, verification and live dispatch each have
+time reserved. Private cursors rotate through large queues, including after a
+timeout or restart.
 
 ## Ownership and source checks
 
@@ -120,12 +120,10 @@ affected-episode search. Protected, kept or unidentified downloads have no
 request preview. A preview sends no cleanup or search request.
 
 With `guard.py --check-safeguards`, eligible dry-run assessments receive a fresh
-recheck and may be saved to the separate `preview-journal.sqlite3`. The recheck
+recheck and include its result in the report and optional log. The recheck
 compares ownership and manifest fingerprints and requires a snapshot no more
 than ten seconds old. Manifest fingerprints use names, sizes, indices and
-priorities. Download progress is intentionally excluded, and filenames are
-never stored in the journal. Metadata timeouts also require the retry settings
-to be verified.
+priorities. Metadata timeouts also require the retry settings to be verified.
 
 ## Production verification and sender gates
 
@@ -142,29 +140,17 @@ The single-test and separately gated per-attempt sender interfaces are
 disabled in the repository code. They do not configure or authorize the
 scheduled live worker.
 
-### Journal-based metadata and recovery
+### Metadata and logs
 
-[Metadata retry](METADATA-RETRY.md) owns the journal-based flow. It records
-intent before removing a stalled metadata download without blocklisting. A
-separate affected-episode search requires current removal evidence, a fresh
-authorization check, and checks that no replacement is already queued or
-grabbed. Recovery can update observations after a timeout or restart and sends
-no request. If the journal cannot be read or verified, metadata actions wait.
-Approved native file-policy cleanup can continue.
+[Metadata retry](METADATA-RETRY.md) uses fresh checks and keeps evidence in
+memory for the current pass. It removes the stalled torrent without blocklisting
+and may request an affected-episode search if removal is confirmed and no
+replacement is already queued or grabbed. A later pass never resumes an earlier
+search request. Dry-run logs proposals, and live mode logs action outcomes.
+Both use private rotating files. The logs are not inputs to Guard's decisions.
 
-The journal also preserves legacy action records. It keeps historical positive
-confirmations, merged last-known observations and the current observation
-separately. Missing or partial observations do not erase earlier evidence.
-Historical positives alone do not prove a current outcome. Existing unresolved
-records and archive entries retain their evidence. A later known-valid metadata
-attempt can be evaluated with a new torrent addition and grab evidence. See
-[unattended authorization](UNATTENDED-TRIAL.md) and [journal retention](JOURNAL-RETENTION.md).
-
-For journal verification, new outcomes must be tied to the recorded dispatch
-and the affected episodes. Incomplete history leaves evidence unknown. Some
-older Sonarr 4.x builds return a global blocklist despite a series filter.
-An oversized response can hold metadata with
-`sonarr_unscoped_blocklist_limit_reached`. [Older blocklist controller](https://github.com/Sonarr/Sonarr/blob/v4.0.0.748/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs) · [Series-filtered controller](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/Sonarr.Api.V3/Blocklist/BlocklistController.cs)
+Existing database files can remain in appdata for historical reference.
+[Legacy journal tools](JOURNAL-RETENTION.md) are separate from scheduled operation.
 
 ## Verification before enabling live operation
 
@@ -173,7 +159,7 @@ An oversized response can hold metadata with
   torrents.
 - Use mocked services to test the exact Sonarr request, changed manifests and
   scopes, a fresh pass after a failed request or re-grab, and continued file
-  cleanup with no usable journal. Test metadata no-replay separately.
+  cleanup without SQLite. Test that an interrupted metadata pass cannot replay a search.
 - A controlled live check can confirm Sonarr's failure history, blocklist and
   replacement, and the torrent/data removal in the downloader. Approval for a
   live check is separate from a passing source or container test.

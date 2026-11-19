@@ -61,7 +61,7 @@ def human_report(reports, readiness, timestamp):
             message = safety["status"].replace("_", " ")
             if "reason" in safety:
                 message += ": " + safety["reason"].replace("_", " ")
-            lines.append("  Fresh recheck/journal: " + message + " (live execution disabled)")
+            lines.append("  Fresh recheck: " + message + " (live execution disabled)")
         if report["decision"] == "would_fail":
             reason = report.get("manual_handling_reason") or manual_handling_reason(report)
             if reason is not None:

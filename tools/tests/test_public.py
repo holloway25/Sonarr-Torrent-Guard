@@ -531,7 +531,7 @@ class PublicTests(unittest.TestCase):
             self.assertIsNone(row["current_observation"][field])
             self.assertNotIn(field, row["confirmed"])
 
-    def test_guard_preview_uses_separate_capacity_from_production(self):
+    def test_guard_preview_checks_safeguards_without_creating_a_journal(self):
         import contextlib
         import io
         import guard
@@ -541,15 +541,12 @@ class PublicTests(unittest.TestCase):
         production_path = directory / "action-journal.sqlite3"
         preview_path = directory / "preview-journal.sqlite3"
         args = ["guard.py", "--config", str(directory / "connections.json"), "--check-safeguards"]
-        with contextlib.redirect_stdout(io.StringIO()), patch("sys.argv", args), patch(
+        with contextlib.redirect_stdout(io.StringIO()) as output, patch("sys.argv", args), patch(
                 "guard.load_config", return_value=f.config), patch("guard.Api", side_effect=[f.qb, f.s]):
             self.assertEqual(guard.main(), 0)
         self.assertFalse(production_path.exists())
-        with contextlib.closing(Journal(preview_path, read_only=True)) as journal:
-            self.assertEqual(journal.db.execute("SELECT mode,stage FROM actions").fetchall(),
-                             [("preview", "preview_verified")])
-        with contextlib.closing(Journal(production_path, limit=1, allow_public_attempt=True)) as journal:
-            self.assertEqual(journal.prepare(f.report, mode="public_attempt", context=f.context)["stage"], "prepared")
+        self.assertFalse(preview_path.exists())
+        self.assertIn("preview verified", output.getvalue())
 
     def test_old_negative_does_not_end_recovery_when_current_failure_is_unknown(self):
         f = self.f
