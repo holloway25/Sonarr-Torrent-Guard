@@ -1121,6 +1121,22 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(production.reconcile(self.journal, row["key"], observe), row)
         observe.assert_not_called()
 
+    def test_final_dispatch_rechecks_the_bound_journal_after_refreshing_baselines(self):
+        refresh = self.journal.refresh_baselines
+
+        def refresh_then_replace(*args):
+            row = refresh(*args)
+            check.side_effect = SafetyError("container_journal_identity_mismatch")
+            return row
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "refresh_baselines", side_effect=refresh_then_replace), patch.object(
+                self.journal, "check_current_file") as check, patch("production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "container_journal_identity_mismatch")
+        sender.assert_not_called()
+
     def test_snapshot_expiring_during_commit_blocks_send(self):
         snapshots = []
         original = production.recheck_candidate

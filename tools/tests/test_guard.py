@@ -622,6 +622,19 @@ class ReportingWorkflowTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_ambiguous_queue_json_is_rejected_before_source_classification(self):
+        from unittest.mock import Mock
+
+        api = Api({"url": "https://sonarr.example.invalid"})
+        api.opener = Mock()
+        response = api.opener.open.return_value
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = (
+            b'{"totalRecords":1,"records":[{"id":7,"indexer":"Private Source","indexer":"Public Source"}]}')
+        with self.assertRaisesRegex(GuardError, "^duplicate_api_response_key$"):
+            api.call("/api/v3/queue")
+
     @unittest.skipUnless(__import__("os").name == "posix", "Linux hard deadline")
     def test_deadline_interrupts_slow_stream_before_complete_body(self):
         import http.server, threading, time

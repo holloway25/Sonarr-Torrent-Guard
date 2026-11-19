@@ -1,11 +1,13 @@
 """Fresh assessment and private journals; live single tests require a separate gate."""
 
+import contextlib
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import time
 import secrets
 
@@ -19,12 +21,15 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "replacement_already_grabbed", "replacement_history_ambiguous", "replacement_client_unknown",
                          "replacement_history_identity_invalid", "replacement_history_event_invalid",
                          "replacement_queue_identity_invalid", "replacement_blocklisted",
-                         "replacement_blocklist_uncertain", "run_time_limit_reached"}
+                         "replacement_blocklist_uncertain", "run_time_limit_reached",
+                         "container_journal_missing", "container_journal_identity_mismatch"}
 CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
 RELATED_RECORD_LIMIT = 1000
 ARCHIVE_MINIMUM_AGE = 30 * 24 * 60 * 60
+CONTAINER_JOURNAL_MARKER = "container-live-journal.json"
+ACTION_JOURNAL_FILE = "action-journal.sqlite3"
 ACTION_FIELDS = ("mode", "stage", "evidence", "observation", "confirmed", "current_observation",
                  "observation_available", "context", "dispatched_at", "stop_reason", "search_command_id")
 ACTION_ADDITIONS = {
@@ -58,6 +63,15 @@ def clean_observation(observation):
 
 class SafetyError(Exception):
     pass
+
+
+@contextlib.contextmanager
+def open_lock_file(path):
+    flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags, 0o600)) as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise SafetyError("invalid_worker_lock")
+        yield lock
 
 
 def valid_digest(value):
@@ -107,15 +121,18 @@ class Journal:
     synchronization. Preview and simulation rows cannot authorize production work.
     """
     def __init__(self, path, limit=1000, allow_single_test=False, allow_public_attempt=False,
-                 allow_archive=False, read_only=False):
+                 allow_archive=False, read_only=False, expected_installation_id=None):
         self.path = Path(path)
         self.read_only = read_only is True
         self._action_projection = ",".join(ACTION_FIELDS)
         self._legacy_confirmed = False
+        self._bound_inode = None
         if self.path.is_symlink() or self.path.parent.stat().st_mode & 0o077:
             raise SafetyError("journal_requires_private_directory")
         if self.read_only:
-            if (self.path.stat().st_mode & 0o077 or allow_single_test or allow_public_attempt or allow_archive):
+            mode = self.path.stat().st_mode
+            if (not stat.S_ISREG(mode) or mode & 0o077
+                    or allow_single_test or allow_public_attempt or allow_archive):
                 raise SafetyError("journal_requires_private_directory")
             self.limit = limit
             self.allow_single_test = self.allow_public_attempt = self.allow_archive = False
@@ -134,9 +151,27 @@ class Journal:
                 self.db.close()
                 raise
             return
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.fchmod(fd, 0o600)
-        os.close(fd)
+        flags = os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        if expected_installation_id is None:
+            flags |= os.O_CREAT
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except FileNotFoundError:
+            if expected_installation_id is not None:
+                raise SafetyError("container_journal_missing") from None
+            raise
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise SafetyError("journal_requires_private_directory")
+            if expected_installation_id is not None:
+                if opened.st_mode & 0o077:
+                    raise SafetyError("journal_requires_private_directory")
+                self._bound_inode = (opened.st_dev, opened.st_ino)
+            else:
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         for suffix in ("-journal", "-wal", "-shm"):
             sidecar = Path(str(self.path) + suffix)
             if sidecar.is_symlink():
@@ -147,13 +182,31 @@ class Journal:
         self.allow_single_test = allow_single_test is True
         self.allow_public_attempt = allow_public_attempt is True
         self.allow_archive = allow_archive is True
-        self.db = sqlite3.connect(self.path, timeout=5)
         try:
+            self.db = sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True, timeout=5)
+        except sqlite3.OperationalError:
+            if expected_installation_id is not None and not self.path.exists():
+                raise SafetyError("container_journal_missing") from None
+            raise
+        try:
+            self.check_current_file()
+            if expected_installation_id is not None and self.installation_id() != expected_installation_id:
+                raise SafetyError("container_journal_identity_mismatch")
             self._initialize()
             self.has_archive = True
         except BaseException:
             self.db.close()
             raise
+
+    def check_current_file(self):
+        if self._bound_inode is None:
+            return
+        try:
+            current = self.path.lstat()
+        except FileNotFoundError:
+            raise SafetyError("container_journal_missing") from None
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != self._bound_inode:
+            raise SafetyError("container_journal_identity_mismatch")
 
     def _initialize(self):
         self.db.execute("PRAGMA journal_mode=DELETE")
@@ -318,7 +371,7 @@ class Journal:
             current = dict(row["current_observation"]) if retained else (
                 {} if observation is None else clean_observation(observation))
             if stage == "retry_removed" and (current.get("torrent_absent") is not True
-                    or current.get("blocklisted") is True):
+                    or current.get("blocklisted") is not False):
                 raise SafetyError("cleanup_not_verified")
             if stage == "retry_superseded" and not replacement_already_observed(row):
                 raise SafetyError("replacement_not_observed")
@@ -511,7 +564,7 @@ def reconcile(journal, key, observe):
     if row["context"].get("metadata_retry", {}).get("blocklist") is False:
         if observation.get("blocklisted") is True:
             stage = "manual_review"
-        elif observation.get("torrent_absent") is True:
+        elif observation.get("torrent_absent") is True and observation.get("blocklisted") is False:
             stage = "retry_removed"
         else:
             stage = "uncertain"

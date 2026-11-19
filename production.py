@@ -19,10 +19,10 @@ import urllib.request
 from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
                    records, recheck_candidate, run, select_latest_grabs, torrent_hash,
-                   torrent_hash_ownership, torrents_by_hash, unique_client_name, verified_hashes,
+                   torrent_hash_ownership, torrents_by_hash, unique_client_name, unique_response_keys, verified_hashes,
                    verify_client_binding)
 from safety import (Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
-                    check_fresh, evidence, reconcile, replacement_already_observed, valid_digest)
+                    check_fresh, evidence, open_lock_file, reconcile, replacement_already_observed, valid_digest)
 from maintenance import require_connectivity
 
 
@@ -573,7 +573,7 @@ def _send_episode_search(api, episode_ids):
                 raw = response.read(65537)
                 if not 200 <= response.status < 300 or len(raw) > 65536:
                     raise ValueError()
-                result = json.loads(raw)
+                result = json.loads(raw, object_pairs_hook=unique_response_keys)
                 if (not isinstance(result, dict) or not integer(result.get("id")) or result["id"] <= 0
                         or result.get("name") != "EpisodeSearch"):
                     raise ValueError()
@@ -788,13 +788,14 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
     if not _enabled(config, journal, mode, authority):
         raise SafetyError("live_execution_disabled")
     def validate():
+        journal.check_current_file()
         if not _enabled(config, journal, mode, authority):
             raise SafetyError("live_execution_disabled")
         if authority is not None:
             authority.validate(config, report)
         validate_approval(approval, report)
     validate()
-    with open(journal.path.parent / "guard.lock", "a") as lock:
+    with open_lock_file(journal.path.parent / "guard.lock") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -901,7 +902,7 @@ def main():
         if target[0] not in apis:
             raise SafetyError("unknown_sonarr_instance")
         if args.observe:
-            with (args.config.parent / "guard.lock").open("a") as lock:
+            with open_lock_file(args.config.parent / "guard.lock") as lock:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:

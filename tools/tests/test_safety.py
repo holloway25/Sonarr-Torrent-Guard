@@ -323,6 +323,19 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(SafetyError, "journal_capacity_reached"):
             self.journal.prepare(dict(self.original, hash="d" * 40))
 
+    def test_open_bound_journal_rejects_a_replaced_file_at_the_same_path(self):
+        from contextlib import closing
+
+        installation_id = self.journal.installation_id(create=True)
+        with closing(Journal(self.path, expected_installation_id=installation_id)) as bound:
+            bound.check_current_file()
+            replacement = self.path.with_suffix(".replacement")
+            replacement.write_bytes(self.path.read_bytes())
+            replacement.chmod(0o600)
+            replacement.replace(self.path)
+            with self.assertRaisesRegex(SafetyError, "^container_journal_identity_mismatch$"):
+                bound.check_current_file()
+
     def test_corrupt_journal_is_not_replaced(self):
         self.journal.close()
         original = b"invalid database; preserve evidence"

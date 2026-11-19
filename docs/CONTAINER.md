@@ -105,10 +105,12 @@ Both modes check active and archived journal owner identities and recorded live
 bindings read-only before scheduling. The check can read an older journal with
 missing optional columns. The worker adds those columns when it opens the journal
 for normal use. On the first real start or scope approval, Guard binds the
-installation to that database through `container-live-journal.json`. An
-established installation with a missing journal or a different journal identity
-waits for the matching appdata to be restored. Keep the config, journal and
-binding marker together when backing up or restoring.
+installation to that database through `container-live-journal.json`. Every
+scheduled cycle checks that binding again. If the journal is missing or has a
+different identity, the cycle waits for the matching appdata to be restored.
+Live removal and search also check that the opened journal is still in place
+before sending. Keep the config, journal and binding marker together when
+backing up or restoring.
 Invalid input does not overwrite a valid config. The generated private runtime file contains credentials: do not
 print/export/commit it. Children receive that file, not secret environment values
 or credential command-line arguments.

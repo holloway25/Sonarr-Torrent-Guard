@@ -8,12 +8,12 @@ import logging
 from pathlib import Path
 import time
 
-from authorization import ContainerAuthorization, RoutineAuthorization
+from authorization import ContainerAuthorization, RoutineAuthorization, read_container_journal_id
 from guard import (Api, GuardError, PrivateRotatingFileHandler, hard_deadline, load_config,
                    load_batch_state, save_batch_state)
 import production
 import public
-from safety import DISPATCH_STOP_REASONS, Journal, SafetyError
+from safety import ACTION_JOURNAL_FILE, DISPATCH_STOP_REASONS, Journal, SafetyError, open_lock_file
 
 
 HELD_REASONS = DISPATCH_STOP_REASONS | {
@@ -29,7 +29,7 @@ HELD_REASONS = DISPATCH_STOP_REASONS | {
 
 def save_dispatch_cursor(state_path, cursor):
     """Merge into current state under the same lock as assessment and recovery."""
-    with (state_path.parent / "guard.lock").open("a") as lock:
+    with open_lock_file(state_path.parent / "guard.lock") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -99,6 +99,7 @@ def main():
     permission.add_argument("--container-mode", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--log-file", type=Path, required=True)
     parser.add_argument("--live", action="store_true", help="Enable live routine actions")
+    parser.add_argument("--container-journal", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     result = {"mode": "routine", "live_authorized": False, "status": "waiting", "actions": [], "retry_after_seconds": 600}
     handler = None
@@ -116,12 +117,14 @@ def main():
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
         state_path = args.config.parent / "batch-state.json"
-        journal = Journal(args.config.parent / "action-journal.sqlite3", allow_public_attempt=True)
+        journal_id = read_container_journal_id(args.config.parent, required=args.container_journal)
+        journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, allow_public_attempt=True,
+                          expected_installation_id=journal_id)
         try:
             # Assessment/recovery and each sender use the same lock. Release it
             # before coordinator calls; they independently lock and recheck. A
             # second process can at most cause a hold, never duplicate sending.
-            with open(args.config.parent / "guard.lock", "a") as lock:
+            with open_lock_file(args.config.parent / "guard.lock") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 state = load_batch_state(state_path)
                 try:
@@ -147,7 +150,8 @@ def main():
             "container_live_scope_confirmation_required",
             "routine_log_requires_private_config_directory", "run_time_limit_reached",
             "log_destination_reserved", "log_destination_not_private_file", "log_symlink_refused",
-            "another_run_is_active"}
+            "another_run_is_active", "invalid_worker_lock", "container_journal_missing",
+            "container_journal_identity_mismatch"}
         result["reason"] = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
     except Exception:
         # Operational exceptions can contain secrets. Never include raw text.

@@ -5,7 +5,7 @@ import fcntl
 import json
 from pathlib import Path
 
-from safety import Journal, SafetyError
+from safety import Journal, SafetyError, open_lock_file
 
 
 # Review candidate: no scheduler and no automatic archive activation.
@@ -30,7 +30,7 @@ def main():
                 journal.close()
         else:
             # Same worker lock, nonblocking; no work races an in-flight sender.
-            with open(args.journal.parent / "guard.lock", "a") as lock:
+            with open_lock_file(args.journal.parent / "guard.lock") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 journal = Journal(args.journal, allow_archive=True)
                 try:

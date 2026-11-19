@@ -198,7 +198,7 @@ the migration.
 Guard accepts numeric Sonarr 4.x versions reported by `/api/v3/system/status`.
 Sonarr 5.x, other major versions and missing or malformed versions hold production
 verification and actions. API response validation still applies to each 4.x
-operation.
+operation. Responses with duplicate JSON keys are treated as unavailable evidence.
 
 `production.py --preflight INSTANCE HASH` rereads an exact candidate, confirms
 retry settings and reviewed-version/client binding, and captures baseline IDs.

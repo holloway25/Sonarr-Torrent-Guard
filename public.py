@@ -7,11 +7,12 @@ import json
 from pathlib import Path
 import time
 
+from authorization import read_container_journal_id
 from guard import (Api, GuardError, hard_deadline, load_config, run, recheck_candidate,
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
 from production import OutcomeVerifier, check_prior_attempts
-from safety import Journal, SafetyError, check_fresh, reconcile
+from safety import ACTION_JOURNAL_FILE, Journal, SafetyError, check_fresh, open_lock_file, reconcile
 
 RECOVERY_LIMIT = 5
 RECOVERY_SECONDS = 30
@@ -127,10 +128,11 @@ def cycle(config, qb, apis, journal, batch_state=None, *, reserve_dispatch=False
 def main():
     parser = argparse.ArgumentParser(description="One public dry-run cycle; never removes torrents")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--container-journal", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         config = load_config(args.config)
-        with open(args.config.parent / "guard.lock", "a") as lock:
+        with open_lock_file(args.config.parent / "guard.lock") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -140,15 +142,18 @@ def main():
             apis = {label: Api(c, deadline=deadline) for label, c in config["sonarr"].items()}
             batch_path = args.config.parent / "batch-state.json"
             batch_state = load_batch_state(batch_path)
-            journal = Journal(args.config.parent / "action-journal.sqlite3")
+            journal_id = read_container_journal_id(args.config.parent, required=args.container_journal)
+            journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, expected_installation_id=journal_id)
             try:
                 with hard_deadline(deadline):
                     result = cycle(config, qb, apis, journal, batch_state)
             finally:
                 journal.close()
                 save_batch_state(batch_path, batch_state)
-    except (SafetyError, GuardError):
-        result = {"dry_run": True, "status": "waiting", "reason": "maintenance_or_safety_check_unavailable",
+    except (SafetyError, GuardError) as error:
+        allowed = {"container_journal_missing", "container_journal_identity_mismatch", "invalid_worker_lock"}
+        reason = str(error) if str(error) in allowed else "maintenance_or_safety_check_unavailable"
+        result = {"dry_run": True, "status": "waiting", "reason": reason,
                   "live_sender_enabled": False, "retry_after_seconds": RETRY_AFTER_SECONDS}
     except Exception:
         result = {"dry_run": True, "status": "waiting", "reason": "cycle_unavailable",

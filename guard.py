@@ -21,7 +21,7 @@ import urllib.request
 
 from reports import human_report, json_events
 from workflow import preview_failure, read_readiness
-from safety import Journal, SafetyError, record_preview
+from safety import Journal, SafetyError, open_lock_file, record_preview
 
 METADATA_TIMEOUT_SECONDS = 30 * 60
 
@@ -163,11 +163,22 @@ IDENTITY_CACHE_LIMIT = 10000
 IDENTITY_CACHE_SECONDS = 3600
 
 
+@contextlib.contextmanager
+def open_regular_file(path, *, nofollow=False):
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if nofollow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags), encoding="utf-8") as file:
+        mode = os.fstat(file.fileno()).st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError("regular_file_required")
+        yield file, mode
+
+
 def load_batch_state(path):
     try:
-        if not path.exists():
-            return {}
-        state = json.loads(path.read_text())
+        with open_regular_file(path, nofollow=True) as (file, mode):
+            state = json.load(file)
         if not isinstance(state, dict) or set(state) - {
                 "after", "timed_out", "verification_after", "dispatch_after", "recovery_after", "identity_cache"}:
             raise ValueError()
@@ -180,8 +191,7 @@ def load_batch_state(path):
                 raise ValueError()
             torrent_hash(cursor[1])
         if "identity_cache" in state:
-            mode = path.stat().st_mode
-            if path.is_symlink() or not stat.S_ISREG(mode) or (os.name != "nt" and mode & 0o077):
+            if os.name != "nt" and mode & 0o077:
                 raise GuardError("invalid_batch_state")
             validate_identity_cache(state["identity_cache"])
         if "recovery_after" in state:
@@ -189,6 +199,8 @@ def load_batch_state(path):
             if not valid_digest(state["recovery_after"]):
                 raise ValueError()
         return state
+    except FileNotFoundError:
+        return {}
     except (ValueError, TypeError, AttributeError, OSError, GuardError):
         raise GuardError("invalid_batch_state") from None
 
@@ -320,7 +332,7 @@ class Api:
                 if not version or any(c not in "0123456789." for c in version):
                     raise GuardError("authentication_not_verified")
                 return version
-            return json.loads(raw)
+            return json.loads(raw, object_pairs_hook=unique_response_keys)
         except GuardError:
             raise
         except Exception:
@@ -844,20 +856,29 @@ def recheck_candidate(original, config, qb, apis):
     return {"assessment": reports[0], "readiness": readiness}
 
 
-def unique_config_keys(pairs):
+def unique_keys(pairs, reason):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise GuardError("duplicate_configuration_key")
+            raise GuardError(reason)
         result[key] = value
     return result
 
 
+def unique_config_keys(pairs):
+    return unique_keys(pairs, "duplicate_configuration_key")
+
+
+def unique_response_keys(pairs):
+    return unique_keys(pairs, "duplicate_api_response_key")
+
+
 def load_config(path):
     try:
-        if os.name != "nt" and path.stat().st_mode & 0o077:
-            raise GuardError("config_permissions_must_be_private")
-        config = json.loads(path.read_text(), object_pairs_hook=unique_config_keys)
+        with open_regular_file(path) as (file, mode):
+            if os.name != "nt" and mode & 0o077:
+                raise GuardError("config_permissions_must_be_private")
+            config = json.load(file, object_pairs_hook=unique_config_keys)
         if config.get("dry_run") is not True:
             raise GuardError("only_dry_run_supported")
         if not isinstance(config.get("sonarr"), dict) or not config["sonarr"]:
@@ -911,7 +932,7 @@ def main():
         config = load_config(args.config)
         # Lock lives beside the external config, never in the repository.
         import fcntl
-        with open(args.config.parent / "guard.lock", "a") as lock:
+        with open_lock_file(args.config.parent / "guard.lock") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

@@ -48,10 +48,10 @@ changeCategory=false
 In the reviewed Sonarr v4 source, `blocklist=false` means this request does not
 mark the download failed or invoke native failed-download retry. Thus failure and
 blocklist observations may correctly be false; never invent positive evidence.
-`retry_removed` requires a CURRENT positive original-incarnation absence
-observation, not queue disappearance, HTTP success or historical confirmation.
-A newly matched blocklist record for any affected episode requires manual
-review. Ordinary file cleanup still requires a match for every affected episode
+`retry_removed` requires current confirmation that the original torrent is gone
+and no new matching blocklist entry was found. If the post-removal blocklist
+result is uncertain, the retry stays on hold for read-only recovery.
+A newly matched blocklist record for any affected episode requires manual review. Ordinary file cleanup still requires a match for every affected episode
 to confirm blocklisting. Data deletion stays unknown and remains Sonarr's
 responsibility.
 

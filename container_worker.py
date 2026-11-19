@@ -14,13 +14,13 @@ import threading
 import time
 
 from authorization import (CONTAINER_SCOPE_FILE, RULE, ContainerAuthorization,
-                           container_scope_record, read_container_scope)
-from guard import GuardError, load_config, source_policy_key
-from safety import SafetyError
+                           container_scope_record, read_container_journal_id, read_container_scope)
+from guard import GuardError, load_config, open_regular_file, source_policy_key
+from safety import ACTION_JOURNAL_FILE as JOURNAL_FILE
+from safety import CONTAINER_JOURNAL_MARKER as JOURNAL_MARKER
+from safety import SafetyError, open_lock_file
 
 CONFIG_DIR = Path("/config")
-JOURNAL_FILE = "action-journal.sqlite3"
-JOURNAL_MARKER = "container-live-journal.json"
 APP_DIR = Path(__file__).resolve().parent
 INTERVAL_SECONDS = 600
 CYCLE_TIMEOUT = 210
@@ -121,7 +121,7 @@ def configure(env, *, check_only=False, validate=None):
                 if len(preserved) != len(candidate["sonarr"]):
                     raise GuardError("container_identity_migration_required")
                 candidate["sonarr"] = {label: candidate["sonarr"][name] for label, name in preserved.items()}
-            elif (CONFIG_DIR / "action-journal.sqlite3").exists():
+            elif (CONFIG_DIR / JOURNAL_FILE).exists():
                 # Do not guess the identities of orphaned migrated appdata.
                 raise GuardError("container_identity_migration_required")
         finally:
@@ -153,14 +153,9 @@ def validate_journal_identity(config):
         return
     journal = Journal(path, read_only=True)
     try:
-        if marker.exists() or marker.is_symlink():
-            from authorization import read_grant
-            try:
-                identity = journal.installation_id()
-                if identity is None or read_grant(marker) != {"journal_id": identity}:
-                    raise SafetyError("container_journal_identity_mismatch")
-            except SafetyError:
-                raise SafetyError("container_journal_identity_mismatch") from None
+        expected_id = read_container_journal_id(CONFIG_DIR)
+        if expected_id is not None and journal.installation_id() != expected_id:
+            raise SafetyError("container_journal_identity_mismatch")
         keys = journal.db.execute("SELECT key FROM actions").fetchall()
         if journal.has_archive:
             keys += journal.db.execute("SELECT key FROM actions_archive").fetchall()
@@ -182,7 +177,7 @@ def initialize_journal():
     if marker.exists():
         return
     # Hold the same lock as standalone workers during a one-time adoption.
-    with (CONFIG_DIR / "guard.lock").open("a") as lock:
+    with open_lock_file(CONFIG_DIR / "guard.lock") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         journal = Journal(CONFIG_DIR / JOURNAL_FILE)
         try:
@@ -193,7 +188,8 @@ def initialize_journal():
 
 def healthcheck():
     try:
-        status = json.loads((CONFIG_DIR / "container-status.json").read_text())
+        with open_regular_file(CONFIG_DIR / "container-status.json", nofollow=True) as (file, _):
+            status = json.load(file)
         stamp = status["updated_at"]
         return 0 if (not isinstance(stamp, bool) and isinstance(stamp, (int, float)) and math.isfinite(stamp)
                      and 0 <= time.time() - stamp <= INTERVAL_SECONDS + CYCLE_TIMEOUT + 90) else 1
@@ -228,7 +224,7 @@ def terminate_child(child):
 def run_cycle(mode, path):
     global CHILD
     command = [sys.executable, str(APP_DIR / ("routine.py" if mode == "live" else "public.py")),
-               "--config", str(path)]
+               "--config", str(path), "--container-journal"]
     if mode == "live":
         command.extend(["--live", "--container-mode",
                         "--log-file", str(CONFIG_DIR / "routine.log")])
@@ -281,7 +277,7 @@ def main():
         lock_path = CONFIG_DIR / "container-worker.lock"
         if lock_path.is_symlink():
             raise GuardError("container_private_appdata_required")
-        with open(lock_path, "a") as lock:
+        with open_lock_file(lock_path) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fresh = all(entry.name == lock_path.name for entry in CONFIG_DIR.iterdir())
             scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
@@ -340,7 +336,7 @@ def main():
         reason = "another_container_worker_is_active"
     except SafetyError as error:
         allowed = {"container_live_scope_confirmation_required", "container_journal_missing",
-                   "container_journal_identity_mismatch"}
+                   "container_journal_identity_mismatch", "invalid_worker_lock"}
         reason = str(error) if str(error) in allowed else "container_configuration_or_startup_unavailable"
     except Exception:
         # Environment/config/HTTP exceptions can contain credentials: never print them.

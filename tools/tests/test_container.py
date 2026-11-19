@@ -385,6 +385,69 @@ class ContainerTests(unittest.TestCase):
         path.write_bytes(saved)
         self.assertEqual(self.run_mode(env, "--once")[0], 0)
 
+    def test_scheduled_children_refuse_a_missing_or_substituted_journal(self):
+        from contextlib import closing
+
+        import public
+        import routine
+        from safety import Journal
+
+        env = dict(self.env, STGUARD_MODE="live")
+        self.assertEqual(self.run_mode(env, "--once")[0], 0)
+        path = self.path / worker.JOURNAL_FILE
+        path.unlink()
+        command = ["--config", str(self.path / "connections.json"), "--container-journal"]
+        for replacement in (False, True):
+            if replacement:
+                with closing(Journal(path)) as other:
+                    other.installation_id(create=True)
+            expected = "container_journal_identity_mismatch" if replacement else "container_journal_missing"
+            saved = path.read_bytes() if replacement else None
+            for module, extra, mode in ((public, [], "dry-run"), (routine, [
+                    "--container-mode", "--live", "--log-file", str(self.path / "routine.log")], "live")):
+                with self.subTest(replacement=replacement, mode=mode), patch(
+                        "sys.argv", [module.__file__, *command, *extra]), patch.dict(
+                        os.environ, {"STGUARD_MODE": mode}, clear=True), patch.object(
+                        public, "cycle") as cycle, contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(module.main(), 0)
+                cycle.assert_not_called()
+                self.assertEqual(json.loads(output.getvalue())["reason"], expected)
+                if replacement:
+                    self.assertEqual(path.read_bytes(), saved)
+                else:
+                    self.assertFalse(path.exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX named pipes")
+    def test_state_paths_refuse_named_pipes_without_blocking(self):
+        paths = {name: self.path / name for name in (
+            "connections.json", "batch-state.json", "guard.lock", worker.JOURNAL_FILE, "container-status.json")}
+        for path in paths.values():
+            os.mkfifo(path, 0o600)
+        result = subprocess.run([sys.executable, "-c", """
+import sys
+from pathlib import Path
+from contextlib import closing
+import container_worker
+from guard import GuardError, load_batch_state, load_config
+from safety import Journal, SafetyError, open_lock_file
+from unittest import TestCase
+
+root = Path(sys.argv[1])
+test = TestCase()
+with test.assertRaisesRegex(GuardError, "^invalid_or_missing_configuration$"):
+    load_config(root / "connections.json")
+with test.assertRaisesRegex(GuardError, "^invalid_batch_state$"):
+    load_batch_state(root / "batch-state.json")
+with test.assertRaisesRegex(SafetyError, "^invalid_worker_lock$"), open_lock_file(root / "guard.lock"):
+    pass
+with test.assertRaisesRegex(SafetyError, "^journal_requires_private_directory$"):
+    with closing(Journal(root / container_worker.JOURNAL_FILE)):
+        pass
+container_worker.CONFIG_DIR = root
+test.assertEqual(container_worker.healthcheck(), 1)
+""", str(self.path)], capture_output=True, text=True, timeout=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_legacy_approved_scope_without_journal_refuses_live_start(self):
         from authorization import container_scope_record
         config = worker.runtime_config(self.env)
@@ -433,6 +496,7 @@ class ContainerTests(unittest.TestCase):
         self.assertTrue(args[1].endswith("routine.py"))
         self.assertIn("--live", args)
         self.assertIn("--container-mode", args)
+        self.assertIn("--container-journal", args)
         self.assertNotIn("--authorization", args)
         env = popen.call_args.kwargs["env"]
         self.assertEqual(env["STGUARD_MODE"], "live")
@@ -453,6 +517,7 @@ class ContainerTests(unittest.TestCase):
                 "subprocess.Popen", return_value=process) as popen:
             self.assertEqual(worker.run_cycle("dry-run", self.path / "connections.json"), 0)
         self.assertIn("public.py", popen.call_args.args[0][1])
+        self.assertIn("--container-journal", popen.call_args.args[0])
         self.assertNotIn("private-marker", str(popen.call_args))
         process.wait.assert_called_once_with(timeout=0.25)
 

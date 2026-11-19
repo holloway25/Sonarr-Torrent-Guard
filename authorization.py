@@ -10,7 +10,7 @@ import time
 
 from guard import (GuardError, endpoint_key, load_config, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
                    unique_config_keys)
-from safety import SafetyError, valid_digest
+from safety import CONTAINER_JOURNAL_MARKER, SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v3"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
@@ -58,6 +58,20 @@ def read_grant(path):
         return json.loads(data, object_pairs_hook=unique_config_keys)
     except Exception:
         raise SafetyError("routine_authorization_unavailable") from None
+
+
+def read_container_journal_id(directory, *, required=False):
+    path = directory / CONTAINER_JOURNAL_MARKER
+    if not required and not path.exists() and not path.is_symlink():
+        return None
+    reason = "container_journal_identity_mismatch"
+    try:
+        record = read_grant(path)
+    except SafetyError:
+        raise SafetyError(reason) from None
+    if not isinstance(record, dict) or set(record) != {"journal_id"} or not valid_digest(record["journal_id"]):
+        raise SafetyError(reason)
+    return record["journal_id"]
 
 
 def read_config_scope(path, reason):

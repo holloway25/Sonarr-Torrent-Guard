@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 
-from guard import hard_deadline
+from guard import hard_deadline, unique_response_keys
 from safety import SafetyError
 
 RETRY_AFTER_SECONDS = 600
@@ -48,7 +48,7 @@ def sonarr_probe(api, payload):
                 status, raw = response.code, response.read(8193)
             if len(raw) > 8192:
                 raise ValueError()
-            return status, json.loads(raw)
+            return status, json.loads(raw, object_pairs_hook=unique_response_keys)
     except Exception:
         raise SafetyError("sonarr_connectivity_unavailable") from None
 

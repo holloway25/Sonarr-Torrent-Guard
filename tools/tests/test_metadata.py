@@ -1005,12 +1005,37 @@ class MetadataSenderTests(unittest.TestCase):
                     row = production.execute_public_attempt(f.config, f.qb, f.apis, journal, f.report, f.approval)
                 if held:
                     self.assertIsNone(row["current_observation"]["blocklisted"])
-                    self.assertEqual(row["stop_reason"], "replacement_blocklist_uncertain")
+                    self.assertEqual(row["stage"], "uncertain")
                     search.assert_not_called()
                 else:
                     self.assertIs(row["current_observation"]["blocklisted"], False)
                     self.assertEqual(row["stage"], "retry_requested")
                     search.assert_called_once_with(f.s, [3, 4])
+
+    def test_unknown_blocklist_evidence_cannot_be_cleared_by_a_later_read_to_send_search(self):
+        self.assess_season_pack()
+        route = "/api/v3/blocklist"
+
+        def remove(*args, **kwargs):
+            self.removed()
+            self.blocklist_one_episode()
+            self.f.s.routes[route]["records"][0].pop("episodeIds")
+
+        def transition(key, expected, stage, *args, **kwargs):
+            if stage == "retry_search_recorded":
+                self.f.s.routes[route] = {"totalRecords": 0, "records": []}
+            return original_transition(key, expected, stage, *args, **kwargs)
+
+        original_transition = self.f.journal.transition
+        with patch.object(self.f.journal, "transition", side_effect=transition), patch(
+                "production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=remove), patch(
+                "production._send_episode_search") as search:
+            row = self.execute()
+        self.assertEqual(row["stage"], "uncertain")
+        self.assertIs(row["current_observation"]["torrent_absent"], True)
+        self.assertIsNone(row["current_observation"]["blocklisted"])
+        search.assert_not_called()
 
     def test_metadata_partial_pack_blocklist_stops_retry(self):
         self.assess_season_pack()
@@ -1219,6 +1244,7 @@ class MetadataTransportTests(unittest.TestCase):
         for payload in (b'{"id":true,"name":"EpisodeSearch"}', b'{"id":0,"name":"EpisodeSearch"}',
                         b'{"id":41,"name":"SeriesSearch"}', b'{"id":41,"name":"EpisodeSearch"}',
                         b'{"id":41,"name":"EpisodeSearch","body":{"episodeIds":[4]}}',
+                        b'{"id":41,"id":42,"name":"EpisodeSearch","body":{"episodeIds":[3]}}',
                         b'private-response', b'x' * 65537):
             self.response.read.return_value = payload
             self.opener.reset_mock()
