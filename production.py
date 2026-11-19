@@ -32,7 +32,7 @@ PUBLIC_ATTEMPT_RELEASE_ENABLED = False
 ROUTINE_RELEASE_ENABLED = False
 # Reviewed metadata policy; sender gates and explicit grants still required.
 METADATA_RETRY_RELEASE_ENABLED = True
-SUPPORTED_SONARR_VERSION = "4.0.20.3014"
+SONARR_V4_VERSION = re.compile(r"4(?:\.[0-9]+){1,3}")
 EVENT_CLOCK_SKEW_SECONDS = 120
 CONTEXT_FIELDS = {"instance", "hash", "series_id", "episode_ids", "queue_id", "client_id",
                   "indexer", "binding_digest", "client_name_digest", "release_title_digest",
@@ -117,6 +117,13 @@ def validate_context(value):
     except (ValueError, TypeError, GuardError):
         raise SafetyError("invalid_operation_context") from None
     return json.loads(json.dumps(value))
+
+
+def require_sonarr_v4(api):
+    status = api.call("/api/v3/system/status")
+    version = status.get("version") if isinstance(status, dict) else None
+    if not isinstance(version, str) or SONARR_V4_VERSION.fullmatch(version) is None:
+        raise SafetyError("unreviewed_sonarr_version")
 
 
 def binding_digest(config, label):
@@ -248,9 +255,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
     if (not isinstance(episodes, list) or not episodes
             or any(not integer(i) or i <= 0 for i in episodes)):
         raise SafetyError("invalid_operation_context")
-    status = api.call("/api/v3/system/status")
-    if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
-        raise SafetyError("unreviewed_sonarr_version")
+    require_sonarr_v4(api)
     client = bound_client(config, api, report["instance"])
     if digest(client["name"]) != report.get("download_client_name_digest"):
         raise SafetyError("identity_or_manifest_changed")
@@ -392,9 +397,7 @@ class OutcomeVerifier:
         if binding_digest(self.config, label) != c["binding_digest"]:
             raise SafetyError("observation_binding_changed")
         client = bound_client(self.config, api, label)
-        status = api.call("/api/v3/system/status")
-        if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
-            raise SafetyError("unreviewed_sonarr_version")
+        require_sonarr_v4(api)
         if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
             raise SafetyError("observation_client_changed")
         # APIs cannot prove download-side file deletion. Never infer this from absence.
@@ -680,9 +683,7 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         if client["id"] != c["client_id"] or digest(client["name"]) != c["client_name_digest"]:
             raise SafetyError("identity_or_manifest_changed")
         check_replacement_grabs(events, c, row["dispatched_at"])
-        status = apis[c["instance"]].call("/api/v3/system/status")
-        if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
-            raise SafetyError("unreviewed_sonarr_version")
+        require_sonarr_v4(apis[c["instance"]])
         if (binding_digest(config, c["instance"]) != c["binding_digest"] or
                 endpoint_key(apis[c["instance"]].config["url"]) != endpoint_key(config["sonarr"][c["instance"]]["url"])):
             raise SafetyError("identity_or_manifest_changed")
@@ -855,9 +856,7 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             row = journal.refresh_baselines(row["key"], refreshed_context)
             context = row["context"]
             require_connectivity(config, apis[report["instance"]], report["instance"])
-            status = apis[report["instance"]].call("/api/v3/system/status")
-            if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
-                raise SafetyError("unreviewed_sonarr_version")
+            require_sonarr_v4(apis[report["instance"]])
             if not _enabled(config, journal, mode, authority):
                 raise SafetyError("live_execution_disabled")
             if (binding_digest(config, report["instance"]) != context["binding_digest"] or

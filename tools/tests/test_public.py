@@ -607,6 +607,18 @@ class MaintenanceTests(unittest.TestCase):
             with self.subTest(response=response), self.assertRaises(SafetyError):
                 self.probe(response)
 
+    def test_connectivity_accepts_v4_versions_and_rejects_other_or_malformed_versions(self):
+        status_route = "/api/v3/system/status"
+        for version in ("4.0.1", "4.0.20.3014", "4.0.21.3090", "4.5.2", "4.10"):
+            with self.subTest(version=version):
+                self.f.s.routes[status_route] = {"version": version}
+                self.assertEqual(self.probe((200, {}))["status"], "verified")
+        for version in ("3.0.10.1567", "5.0.1", "5.1", "40.0.1", "4", "4.bad",
+                        "4.0.1\n", "4.1.2.3.4", 4.1, None):
+            with self.subTest(version=version), self.assertRaisesRegex(SafetyError, "unreviewed_sonarr_version"):
+                self.f.s.routes[status_route] = {"version": version}
+                self.probe((200, {}))
+
     def test_outage_and_version_change_fail_closed(self):
         self.f.s.routes["/api/v3/system/status"] = TimeoutError()
         with self.assertRaises(SafetyError):

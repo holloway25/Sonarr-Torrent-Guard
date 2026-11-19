@@ -191,7 +191,7 @@ python3 production.py --config /path/outside/checkout/connections.json --preflig
 ```
 
 Preflight rereads the candidate and retry settings, captures old history/blocklist
-IDs, checks the reviewed Sonarr version, and exercises independent read-only
+IDs, checks that Sonarr reports a 4.x version, and exercises independent read-only
 outcome checks. It does not prepare a dispatch journal entry or generate approval.
 The verifier matches failure history by original hash and episode identity. New
 replacement grabs must have different valid hashes for the affected episodes and
@@ -327,7 +327,7 @@ maintenance, expiry, reporting and capacity boundaries.
 ## Remaining milestones
 
 - Validate controlled dry-run candidates.
-- Add explicit Sonarr v5 compatibility tests. This milestone uses Sonarr v4's v3 API.
+- Review Sonarr v5 before extending support. Guard uses Sonarr 4.x's v3 API.
 - Review the disabled sender and production verifier, then explicitly approve a
   controlled single-torrent integration test separately. Define independent data
   deletion confirmation. Guard/public commands remain dry-run. The standalone routine worker

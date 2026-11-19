@@ -54,11 +54,9 @@ def sonarr_probe(api, payload):
 
 
 def require_connectivity(config, api, label, probe=None):
-    from production import SUPPORTED_SONARR_VERSION, bound_client
+    from production import bound_client, require_sonarr_v4
     try:
-        status = api.call("/api/v3/system/status")
-        if not isinstance(status, dict) or status.get("version") != SUPPORTED_SONARR_VERSION:
-            raise SafetyError("unreviewed_sonarr_version")
+        require_sonarr_v4(api)
         client = bound_client(config, api, label)
         status, result = (probe or sonarr_probe)(api, probe_payload(client))
         # Empty-category warning is expected. Any other warning/error, malformed

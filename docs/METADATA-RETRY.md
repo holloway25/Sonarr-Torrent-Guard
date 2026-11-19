@@ -65,7 +65,7 @@ replacement download under that hash. Guard persists this separately as
 reading a later episode leaves pack-wide coverage unknown and keeps the
 earlier search veto. If neither kind of observation vetoes the search,
 record `retry_search_recorded` durably before the second request. After this commit, repeat
-Sonarr-side connectivity, reviewed version and endpoint checks; reject a
+Sonarr-side connectivity, Sonarr 4.x compatibility and endpoint checks; reject a
 reappearing original hash or newly queued affected episode. After qBittorrent
 confirms absence, Guard ignores each stale original row whose queue ID, episode
 ID and normalized download hash match the saved pre-removal evidence. Just

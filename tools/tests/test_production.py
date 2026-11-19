@@ -1152,9 +1152,19 @@ class ProductionTests(unittest.TestCase):
             self.assertEqual(row["stop_reason"], "unreviewed_sonarr_version")
             sender.assert_not_called()
 
+    def test_v4_update_during_commit_preserves_dispatch_and_observation(self):
+        def change():
+            self.s.routes["/api/v3/system/status"] = {"version": "4.1.2.3456"}
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
+                "production._send_queue_delete", side_effect=lambda *args: self.results()) as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+        sender.assert_called_once_with(self.s, 7)
+        self.assertTrue(row["current_observation"]["torrent_absent"])
+
     def test_version_change_during_commit_blocks_send(self):
         def change():
-            self.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
+            self.s.routes["/api/v3/system/status"] = {"version": "5.0.1"}
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
                 self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
                 "production._send_queue_delete") as sender:

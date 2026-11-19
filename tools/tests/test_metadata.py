@@ -133,6 +133,7 @@ class MetadataSenderTests(unittest.TestCase):
 
     def test_metadata_removal_does_not_require_failure_or_blocklist_and_searches_once(self):
         f = self.f
+        f.s.routes["/api/v3/system/status"] = {"version": "4.1.2.3456"}
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=self.removed) as send, patch(
                 "production._send_episode_search", return_value=41) as search:
@@ -272,7 +273,7 @@ class MetadataSenderTests(unittest.TestCase):
         def transition(*args, **kwargs):
             row = original(*args, **kwargs)
             if args[2] == "retry_search_recorded":
-                self.f.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
+                self.f.s.routes["/api/v3/system/status"] = {"version": "5.0.1"}
             return row
         with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
                 "production._send_queue_delete", side_effect=removed), patch.object(
