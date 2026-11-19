@@ -173,12 +173,16 @@ class ProductionTests(unittest.TestCase):
                 finally:
                     journal.close()
 
-    def hybrid_report(self):
+    def hybrid_report(self, *, blocklist_evidence=False):
         v1 = "b" * 40
         v2 = self.hash + "c" * 24
         self.qb.routes["/api/v2/torrents/properties"] = {
             "hash": self.hash, "infohash_v1": v1, "infohash_v2": v2}
         self.grab["downloadId"] = v1.upper()
+        if blocklist_evidence:
+            date = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=1)
+            canonical = dict(self.grab, id=6, date=date.isoformat(), downloadId=self.hash.upper())
+            self.s.routes["/api/v3/history"] = {"records": [canonical, self.grab], "totalRecords": 2}
         report = run(self.config, self.qb, self.apis)[0]
         self.assertEqual(report["decision"], "would_fail")
         return report
@@ -221,7 +225,7 @@ class ProductionTests(unittest.TestCase):
                 send.assert_not_called()
 
     def test_hybrid_hashes_bind_history_and_send_only_through_sonarr(self):
-        report = self.hybrid_report()
+        report = self.hybrid_report(blocklist_evidence=True)
         approval = {**self.approval, **{key: report[key] for key in (
             "hash", "ownership_fingerprint", "manifest_fingerprint")}}
         self.assertEqual(report["hash"], self.hash)
@@ -347,6 +351,31 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(calls, 3)
         self.assertEqual(row["stage"], "dispatch_blocked")
 
+    def test_explicit_queue_source_conflicts_hold_even_when_history_is_public(self):
+        queue = self.s.routes["/api/v3/queue"]["records"][0]
+        for mode in ("public_allowlist", "private_exclusions"):
+            self.config["sonarr"]["HD"]["indexers"]["mode"] = mode
+            for source, expected in ((None, "would_fail"), ("", "would_fail"),
+                                     ("Public Source", "would_fail"), ("Other Source", "skip"),
+                                     (False, "skip")):
+                with self.subTest(mode=mode, source=source):
+                    queue["indexer"] = source
+                    report = run(self.config, self.qb, self.apis)[0]
+                    self.assertEqual(report["decision"], expected)
+                    if expected == "skip":
+                        self.assertEqual(report["reason"], "conflicting_queue_source_protected")
+
+    def test_unlisted_queue_indexer_appearing_at_final_recheck_blocks_removal(self):
+        def change():
+            self.s.routes["/api/v3/queue"]["records"][0]["indexer"] = "Unlisted Source"
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.journal, "transition", side_effect=self.after_dispatch_commit(change)), patch(
+                "production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        sender.assert_not_called()
+
     def test_hash_only_torrent_properties_cannot_verify_identity(self):
         self.qb.routes["/api/v2/torrents/properties"] = {"hash": self.hash}
         self.qb.calls.clear()
@@ -391,7 +420,7 @@ class ProductionTests(unittest.TestCase):
         self.assertFalse(any(route.endswith("/files") for route, _ in self.qb.calls))
 
     def test_hybrid_recovery_uses_bulk_info_and_holds_on_incomplete_evidence(self):
-        report = self.hybrid_report()
+        report = self.hybrid_report(blocklist_evidence=True)
         self.context = production.capture_context(self.config, self.s, report,
                                                   production.digest(self.approval["nonce"]))
         self.results()
@@ -424,7 +453,7 @@ class ProductionTests(unittest.TestCase):
                     sender.assert_not_called()
 
     def test_hybrid_outcome_uses_alias_for_failure_not_replacement(self):
-        report = self.hybrid_report()
+        report = self.hybrid_report(blocklist_evidence=True)
         self.context = production.capture_context(self.config, self.s, report,
                                                   production.digest(self.approval["nonce"]))
         self.results()
@@ -495,10 +524,11 @@ class ProductionTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_hybrid_context_final_baseline_checks_all_verified_hashes(self):
-        report = self.hybrid_report()
+        report = self.hybrid_report(blocklist_evidence=True)
         approval = {**self.approval, **{key: report[key] for key in (
             "hash", "ownership_fingerprint", "manifest_fingerprint")}}
-        private = dict(self.grab, id=6, downloadId=self.hash,
+        date = datetime.datetime.fromisoformat(self.grab["date"]) + datetime.timedelta(seconds=2)
+        private = dict(self.grab, id=7, date=date.isoformat(), downloadId=self.hash,
                        data={**self.grab["data"], "indexer": "Private Source"})
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(
                 "production.history_since", side_effect=[[self.grab], [self.grab, private]]), patch(
@@ -987,6 +1017,31 @@ class ProductionTests(unittest.TestCase):
         observe_cli("container_journal_missing")
         self.assertFalse(path.exists())
 
+    def test_observe_cli_finds_original_journal_entry_after_owner_rename(self):
+        import contextlib
+        import io
+        import json
+
+        from safety import ACTION_JOURNAL_FILE
+
+        directory = Path(self.folder.name)
+        path = directory / ACTION_JOURNAL_FILE
+        with closing(Journal(path, allow_single_test=True)) as journal:
+            row = journal.prepare(self.report, mode="single_test", context=self.context)
+            journal.transition(row["key"], "prepared", "dispatch_recorded")
+        self.results()
+        self.qb.login = Mock()
+        self.config["sonarr"]["Renamed"] = self.config["sonarr"].pop("HD")
+        args = ["production.py", "--config", str(directory / "connections.json"), "--observe", "HD", self.hash]
+        with contextlib.redirect_stdout(io.StringIO()) as output, patch(
+                "sys.argv", args), patch("production.load_config", return_value=self.config), patch(
+                "production.Api", side_effect=[self.qb, self.s]):
+            self.assertEqual(production.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["instance"], "HD")
+        self.assertIs(result["current_observation"]["failed"], True)
+        self.assertIs(result["current_observation"]["blocklisted"], True)
+
     def test_observe_cli_cannot_reconcile_while_sender_holds_worker_lock(self):
         import contextlib
         import fcntl
@@ -1011,8 +1066,70 @@ class ProductionTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             production.validate_context(dict(self.context, password="not allowed"))
 
+    def test_final_blocklist_scope_uses_all_grabs_for_the_exact_queue_download_id(self):
+        original = self.s.call
+        queries = []
+        other = dict(self.grab, id=6, episodeId=4, date=(datetime.datetime.fromisoformat(
+            self.grab["date"]) + datetime.timedelta(seconds=1)).isoformat(),
+            data={**self.grab["data"], "indexer": "Private Source"})
+
+        def call(route, params=None):
+            if route == "/api/v3/history" and params and "downloadId" in params:
+                queries.append(params)
+                if len(queries) == 2:
+                    return {"records": [other, self.grab], "totalRecords": 2}
+            return original(route, params)
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "sonarr_blocklist_scope_unverified")
+        self.assertEqual(len(queries), 2)
+        for query in queries:
+            self.assertEqual(query["downloadId"], self.grab["downloadId"])
+            self.assertEqual(query["eventType"], 1)
+            self.assertNotIn("episodeId", query)
+            self.assertNotIn("seriesIds", query)
+        sender.assert_not_called()
+
+    def test_blocklist_scope_holds_extra_episode_seen_only_in_recent_history(self):
+        original = self.s.call
+        other = dict(self.grab, id=6, episodeId=4)
+        recent_reads = 0
+
+        def call(route, params=None):
+            nonlocal recent_reads
+            if route == "/api/v3/history/since":
+                recent_reads += 1
+                if recent_reads == 2:
+                    return [self.grab, other]
+            return original(route, params)
+
+        with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch.object(
+                self.s, "call", side_effect=call), patch("production._send_queue_delete") as sender:
+            row = production.execute_single_test(self.config, self.qb, self.apis, self.journal, self.report, self.approval)
+        self.assertEqual(row["stage"], "dispatch_blocked")
+        self.assertEqual(row["stop_reason"], "sonarr_blocklist_scope_unverified")
+        sender.assert_not_called()
+
+    def test_blocklist_scope_holds_missing_or_changed_release_evidence(self):
+        original = self.s.call
+        for records in ([], [dict(self.grab, sourceTitle="A different release")],
+                        [dict(self.grab, data={**self.grab["data"], "indexer": "Other Source"})]):
+            with self.subTest(records=len(records)):
+                def call(route, params=None):
+                    if route == "/api/v3/history" and params and "downloadId" in params:
+                        return {"records": records, "totalRecords": len(records)}
+                    return original(route, params)
+
+                with patch.object(self.s, "call", side_effect=call), self.assertRaisesRegex(
+                        SafetyError, "^sonarr_blocklist_scope_unverified$"):
+                    production.capture_context(self.config, self.s, self.report, self.context["approval_digest"])
+
     def test_context_title_comes_from_current_grab_not_older_same_hash(self):
-        old = dict(self.grab, id=4, sourceTitle="An older display title")
+        date = datetime.datetime.fromisoformat(self.grab["date"]) - datetime.timedelta(seconds=1)
+        old = dict(self.grab, id=4, date=date.isoformat(), sourceTitle="An older display title")
         self.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [old, self.grab]}
         context = production.capture_context(self.config, self.s, self.report, production.digest("approval"))
         self.assertEqual(context["release_title_digest"], production.digest(self.grab["sourceTitle"]))
@@ -1199,8 +1316,8 @@ class ProductionTests(unittest.TestCase):
 
     def test_version_change_after_context_capture_blocks_final_send(self):
         original = production.capture_context
-        def capture(*args):
-            result = original(*args)
+        def capture(*args, **kwargs):
+            result = original(*args, **kwargs)
             self.s.routes["/api/v3/system/status"] = {"version": "unreviewed"}
             return result
         with patch("production.SINGLE_TEST_RELEASE_ENABLED", True), patch(

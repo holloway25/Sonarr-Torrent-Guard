@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import time
 
-from authorization import read_container_journal_id
+from authorization import read_bound_container_journal_id, read_container_journal_id
 from guard import (Api, GuardError, hard_deadline, load_config, run, recheck_candidate,
                    load_batch_state, save_batch_state)
 from maintenance import RETRY_AFTER_SECONDS, require_connectivity
@@ -142,7 +142,8 @@ def main():
             apis = {label: Api(c, deadline=deadline) for label, c in config["sonarr"].items()}
             batch_path = args.config.parent / "batch-state.json"
             batch_state = load_batch_state(batch_path)
-            journal_id = read_container_journal_id(args.config.parent, required=args.container_journal)
+            journal_id = (read_bound_container_journal_id(args.config.parent) if args.container_journal
+                          else read_container_journal_id(args.config.parent))
             journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, expected_installation_id=journal_id)
             try:
                 with hard_deadline(deadline):

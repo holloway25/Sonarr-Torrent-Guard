@@ -16,6 +16,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from authorization import (ContainerAuthorization, read_bound_container_journal_id,
+                           read_container_journal_binding, read_container_journal_id)
 from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
                    hard_deadline, history_event_type, integer, latest_history_grabs, load_config,
                    records, recheck_candidate, run, select_latest_grabs, torrent_hash,
@@ -24,6 +26,7 @@ from guard import (Api, GuardError, endpoint_key, grab_indexer, grab_timestamp,
 from safety import (ACTION_JOURNAL_FILE, Journal, SafetyError, DISPATCH_STOP_REASONS, CANCELLATION_STOP_REASONS,
                     check_fresh, evidence, open_lock_file, reconcile, replacement_already_observed, valid_digest)
 from maintenance import require_connectivity
+from workflow import read_readiness
 
 
 # Deliberately false until code review and explicit human approval for one test.
@@ -255,6 +258,38 @@ def wait_for_event_boundary(dispatched_at):
     return boundary
 
 
+def check_blocklist_scope(api, download_id, context, max_pages):
+    """Sonarr uses all grabs for the exact queue download ID, sorted by date."""
+    try:
+        rows = records(api, "/api/v3/history", {
+            "downloadId": download_id, "eventType": 1, "sortKey": "date", "sortDirection": "descending",
+        }, max_pages)
+        if not rows or any(
+                row["id"] <= 0 or row.get("downloadId") != download_id
+                or history_event_type(row) != "grabbed" or not integer(row.get("seriesId"))
+                or row["seriesId"] != context["series_id"] or not integer(row.get("episodeId"))
+                for row in rows):
+            raise ValueError()
+        if {row["episodeId"] for row in rows} != set(context["episode_ids"]):
+            raise ValueError()
+        dated = [(grab_timestamp(row), row) for row in rows]
+        latest = max(stamp for stamp, _ in dated)
+        for stamp, row in dated:
+            if stamp != latest:
+                continue
+            data = row.get("data")
+            name = data.get("downloadClientName") if isinstance(data, dict) else None
+            if (row["id"] not in context["grab_ids"] or not isinstance(name, str) or not name.strip()
+                    or digest(name) != context["client_name_digest"]
+                    or grab_indexer(row, name) != context["indexer"]
+                    or digest(row.get("sourceTitle")) != context["release_title_digest"]):
+                raise ValueError()
+    except (GuardError, ValueError) as error:
+        if str(error) == "run_time_limit_reached":
+            raise
+        raise SafetyError("sonarr_blocklist_scope_unverified") from None
+
+
 def capture_context(config, api, report, approval_digest, now=None, *, dispatch=None):
     """Capture bounded pre-dispatch baselines from the fresh, validated target."""
     evidence(report)
@@ -287,6 +322,7 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
     titles = {g.get("sourceTitle") for g in grabs}
     if len(titles) != 1 or not all(isinstance(t, str) and t for t in titles):
         raise SafetyError("ambiguous_release_title_evidence")
+    policy = metadata_policy(report)
     start = (time.time() if now is None else now) - 300
     baseline_history = history_since(api, start)
     approved_by_id = {grab["id"]: grab for grab in grabs}
@@ -315,6 +351,18 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 raise SafetyError("identity_or_manifest_changed")
     except GuardError:
         raise SafetyError("identity_or_manifest_changed") from None
+    if policy is None:
+        try:
+            latest = max(grab_timestamp(grab) for grab in grabs)
+            for row in baseline_history:
+                if row.get("downloadId") != report["download_id_spelling"] or history_event_type(row) != "grabbed":
+                    continue
+                identity = (row.get("seriesId"), row.get("episodeId"))
+                if (not all(integer(i) for i in identity) or identity not in identities
+                        or (row["id"] not in approved_by_id and grab_timestamp(row) >= latest)):
+                    raise SafetyError("sonarr_blocklist_scope_unverified")
+        except GuardError:
+            raise SafetyError("sonarr_blocklist_scope_unverified") from None
     blocklist = blocklist_records(api, series[0], start, config.get("max_pages", 20))
     context = {
         "instance": report["instance"], "hash": report["hash"], "series_id": series[0],
@@ -326,7 +374,6 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
         "baseline_blocklist_ids": [r["id"] for r in blocklist], "approval_digest": approval_digest,
     }
     context.update({k: report[k] for k in ATTEMPT_CONTEXT_FIELDS})
-    policy = metadata_policy(report)
     if policy is not None:
         context["queue_rows"] = report["queue_rows"]
         if dispatch is not None:
@@ -341,6 +388,8 @@ def capture_context(config, api, report, approval_digest, now=None, *, dispatch=
                 context["metadata_search_hold"] = reason if reason in METADATA_SEARCH_HOLDS else "dispatch_validation_failed"
     if "hash_aliases" in report:
         context["hash_aliases"] = aliases
+    if policy is None and dispatch is None:
+        check_blocklist_scope(api, report["download_id_spelling"], context, config.get("max_pages", 20))
     return validate_context(context)
 
 
@@ -406,8 +455,16 @@ class OutcomeVerifier:
     def observe(self):
         c = self.context
         label = c["instance"]
+        if label not in self.config["sonarr"]:
+            matches = [name for name in self.config["sonarr"]
+                       if binding_digest(self.config, name) == c["binding_digest"]]
+            if len(matches) != 1:
+                raise SafetyError("observation_binding_changed")
+            label = matches[0]
+        if label not in self.apis or binding_digest(self.config, label) != c["binding_digest"]:
+            raise SafetyError("observation_binding_changed")
         api = self.apis[label]
-        if binding_digest(self.config, label) != c["binding_digest"]:
+        if endpoint_key(api.config["url"]) != endpoint_key(self.config["sonarr"][label]["url"]):
             raise SafetyError("observation_binding_changed")
         client = bound_client(self.config, api, label)
         require_sonarr_v4(api)
@@ -419,6 +476,7 @@ class OutcomeVerifier:
         if metadata_retry:
             result["any_replacement_observed"] = None
             result["replacement_grab_observed"] = None
+            result["replacement_grab_ambiguous"] = None
         current_torrent = None
         current_aliases = ()
         identity_available = False
@@ -439,16 +497,23 @@ class OutcomeVerifier:
                 if event["id"] in baseline_ids:
                     continue
                 try:
-                    if history_event_type(event) != "grabbed" or event_after(event, self.not_before) is not True:
+                    if history_event_type(event) != "grabbed":
+                        continue
+                    after = event_after(event, self.not_before)
+                    if after is False:
                         continue
                     data = event.get("data")
-                    if not isinstance(data, dict) or digest(data.get("downloadClientName")) != c["client_name_digest"]:
+                    name = data.get("downloadClientName") if isinstance(data, dict) else None
+                    client_known = isinstance(name, str) and bool(name.strip())
+                    if client_known and digest(name) != c["client_name_digest"]:
                         continue
                     torrent_hash(event.get("downloadId"))
+                    if after is True and client_known:
+                        result["replacement_grab_observed"] = True
+                        continue
                 except (GuardError, SafetyError):
-                    continue
-                result["replacement_grab_observed"] = True
-                return
+                    pass
+                result["replacement_grab_ambiguous"] = True
 
         try:
             # Preserve a known grab even if a later history page fails to load.
@@ -461,7 +526,6 @@ class OutcomeVerifier:
             aliases = set(c.get("hash_aliases", [c["hash"]]))
             aliases.update(current_aliases)
             latest_grab_id = max(c.get("grab_ids", ()), default=None)
-            uncertain_grab = False
             for r in new:
                 kind = history_event_type(r)
                 after = event_after(r, self.not_before)
@@ -477,11 +541,6 @@ class OutcomeVerifier:
                 except GuardError:
                     h = None
                 confirmed = client_known and after is True
-                if metadata_retry and kind == "grabbed":
-                    # A verified Sonarr grab can veto a search before qBittorrent
-                    # can confirm that it is downloading a replacement.
-                    if not confirmed or h is None:
-                        uncertain_grab = True
                 if kind == "downloadFailed":
                     title = r.get("sourceTitle")
                     title_known = isinstance(title, str) and bool(title.strip())
@@ -510,8 +569,10 @@ class OutcomeVerifier:
             if metadata_retry:
                 result["any_replacement_observed"] = True if covered else (
                     None if ambiguous_replacement else False)
-                if result["replacement_grab_observed"] is not True and not uncertain_grab:
-                    result["replacement_grab_observed"] = False
+                if result["replacement_grab_ambiguous"] is not True:
+                    result["replacement_grab_ambiguous"] = False
+                    if result["replacement_grab_observed"] is not True:
+                        result["replacement_grab_observed"] = False
             if regrab == required:
                 result["torrent_absent"] = True  # Original incarnation, not all copies of this hash.
         except Exception:
@@ -620,8 +681,12 @@ def metadata_history_type(event):
 def check_replacement_grabs(events, context, not_before):
     for event in events:
         series = event.get("seriesId")
-        if integer(series) and series > 0 and series != context["series_id"]:
-            continue
+        if integer(series) and series > 0:
+            if series != context["series_id"]:
+                continue
+            episode = event.get("episodeId")
+            if integer(episode) and episode > 0 and episode not in context["episode_ids"]:
+                continue
         if metadata_history_type(event) != "grabbed":
             continue
         # A late grab can belong to the refreshed outcome baseline. Its
@@ -630,8 +695,6 @@ def check_replacement_grabs(events, context, not_before):
             continue
         if any(not integer(event.get(field)) or event[field] <= 0 for field in ("seriesId", "episodeId")):
             raise SafetyError("replacement_history_identity_invalid")
-        if event["episodeId"] not in context["episode_ids"]:
-            continue
         after = event_after(event, not_before)
         if after is None:
             raise SafetyError("replacement_history_ambiguous")
@@ -664,6 +727,8 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
     try:
         if "metadata_search_hold" in c:
             raise SafetyError(c["metadata_search_hold"])
+        if row["confirmed"].get("replacement_grab_ambiguous") is True:
+            raise SafetyError("replacement_history_ambiguous")
         require_connectivity(config, apis[c["instance"]], c["instance"])
         # The first absence observation is insufficient if another actor has
         # re-added the hash or queued a replacement while intent was committed.
@@ -706,6 +771,9 @@ def finish_metadata_retry(config, qb, apis, journal, row, validate):
         blocks = blocklist_records(apis[c["instance"]], c["series_id"], row["dispatched_at"],
                                   config.get("max_pages", 20))
         check_metadata_blocklist(blocks, c, row["dispatched_at"])
+        readiness = read_readiness({c["instance"]: apis[c["instance"]]})[c["instance"]]
+        if any(readiness[field] is not True for field in ("automatic_retry", "interactive_retry")):
+            raise SafetyError("retry_settings_not_ready")
         validate()
         if METADATA_RETRY_RELEASE_ENABLED is not True:
             raise SafetyError("live_execution_disabled")
@@ -736,7 +804,7 @@ def execute_public_attempt(config, qb, apis, journal, report, approval):
 
 def execute_routine_attempt(config, qb, apis, journal, report, authority):
     """Explicit delegated permission still produces an expiring per-action token."""
-    from authorization import ContainerAuthorization, RoutineAuthorization
+    from authorization import RoutineAuthorization
     import secrets
     if not isinstance(authority, (ContainerAuthorization, RoutineAuthorization)):
         raise SafetyError("routine_authorization_invalid")
@@ -787,17 +855,11 @@ def check_prior_attempts(journal, report, approval_digest=None, config=None):
             if approval_digest is not None and previous["context"].get("approval_digest") == approval_digest:
                 raise SafetyError("approval_already_consumed")
             continue
-        if previous["stage"] not in ("cleanup_resolved", "complete", "retry_requested", "retry_superseded"):
-            if confirmed_successor(previous, report, config):
-                continue
-            raise SafetyError("previous_attempt_unresolved")
-        prior = previous["context"]
-        if ("download_added_on" not in prior or
-                report["download_added_on"] <= prior["download_added_on"] or
-                (previous["dispatched_at"] is not None and
-                 report["download_added_on"] <= previous["dispatched_at"]) or
-                min(report["grab_ids"]) <= max(prior["grab_ids"])):
+        if confirmed_successor(previous, report, config):
+            continue
+        if previous["stage"] in ("cleanup_resolved", "complete", "retry_requested", "retry_superseded"):
             raise SafetyError("new_attempt_not_confirmed")
+        raise SafetyError("previous_attempt_unresolved")
 
 
 def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
@@ -809,6 +871,8 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             raise SafetyError("live_execution_disabled")
         if authority is not None:
             authority.validate(config, report)
+            if isinstance(authority, ContainerAuthorization):
+                journal.check_installation_id(authority.journal_id)
         validate_approval(approval, report)
     validate()
     with open_lock_file(journal.path.parent / "guard.lock") as lock:
@@ -867,7 +931,7 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
             validate()
             refreshed_context = capture_context(config, apis[report["instance"]],
                 final_snapshot["assessment"], digest(approval["nonce"]),
-                **({"dispatch": row} if policy is not None else {}))
+                dispatch=row)
             if authority is not None:
                 refreshed_context["routine_grant_digest"] = authority.identifier
             row = journal.refresh_baselines(row["key"], refreshed_context)
@@ -880,6 +944,10 @@ def _execute(config, qb, apis, journal, report, approval, mode, authority=None):
                     endpoint_key(apis[report["instance"]].config["url"]) !=
                     endpoint_key(config["sonarr"][report["instance"]]["url"])):
                 raise SafetyError("identity_or_manifest_changed")
+            if policy is None:
+                check_blocklist_scope(apis[report["instance"]],
+                                      final_snapshot["assessment"]["download_id_spelling"], context,
+                                      config.get("max_pages", 20))
             validate()
             check_fresh(report, final_snapshot)
             if not event_boundary_reached(row["dispatched_at"]):
@@ -915,7 +983,7 @@ def main():
         apis = {k: Api(v, deadline=deadline) for k, v in config["sonarr"].items()}
         selection = args.preflight or args.observe
         target = (selection[0], torrent_hash(selection[1]))
-        if target[0] not in apis:
+        if args.preflight and target[0] not in apis:
             raise SafetyError("unknown_sonarr_instance")
         if args.observe:
             with open_lock_file(args.config.parent / "guard.lock") as lock:
@@ -923,8 +991,10 @@ def main():
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise SafetyError("another_run_is_active") from None
-                from authorization import read_container_journal_id
-                journal_id = read_container_journal_id(args.config.parent)
+                directory = args.config.parent
+                journal_id = (read_bound_container_journal_id(directory)
+                              if read_container_journal_binding(directory) is not None
+                              else read_container_journal_id(directory))
                 try:
                     journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, existing_only=True,
                                       expected_installation_id=journal_id)

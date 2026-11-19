@@ -435,6 +435,48 @@ class PublicTests(unittest.TestCase):
             self.assertEqual(send.call_count, 2)
             self.assertEqual(f.journal.get(first["key"]), first)
 
+    def test_grab_before_previous_removal_cannot_authorize_a_second_removal(self):
+        f = self.f
+        with patch("production.PUBLIC_ATTEMPT_RELEASE_ENABLED", True), patch(
+                "production._send_queue_delete", side_effect=lambda *a: self.result()) as send:
+            first = self.execute()
+            self.assertEqual(first["stage"], "cleanup_resolved")
+            dispatch = first["dispatched_at"]
+            added = int(dispatch) + 2
+            grab = dict(f.grab, id=20, date=datetime.datetime.fromtimestamp(
+                dispatch - 1, datetime.timezone.utc).isoformat())
+            f.s.routes["/api/v3/history"] = {"totalRecords": 2, "records": [f.grab, grab]}
+            f.s.routes["/api/v3/history/since"] = [grab]
+            f.qb.routes["/api/v2/torrents/info"] = [{"hash": f.hash, "category": "tv-hd",
+                "state": "stoppedUP", "added_on": added}]
+            with patch("time.time", return_value=dispatch + 600):
+                f.report = run(f.config, f.qb, f.apis)[0]
+                self.assertEqual(f.report["decision"], "would_fail")
+                f.approval = dict(f.approval, ownership_fingerprint=f.report["ownership_fingerprint"],
+                                 expires_at=dispatch + 720, nonce="e" * 64)
+                with self.assertRaisesRegex(SafetyError, "^new_attempt_not_confirmed$"):
+                    self.execute()
+        send.assert_called_once()
+        self.assertEqual(f.journal.get(first["key"]), first)
+
+    def test_renamed_standalone_owner_can_recover_using_the_durable_binding(self):
+        f = self.f
+        row = f.journal.prepare(f.report, mode="public_attempt", context=f.context)
+        f.journal.transition(row["key"], "prepared", "dispatch_recorded")
+        self.result()
+        owner = f.config["sonarr"].pop("HD")
+        f.config["sonarr"] = {"Renamed": owner, "Duplicate": copy.deepcopy(owner)}
+        apis = {"Renamed": f.s, "Duplicate": f.s}
+        with patch("production._send_queue_delete") as send:
+            ambiguous = public.recover_pending(f.config, f.qb, apis, f.journal, {}, time.monotonic() + 10)
+            self.assertEqual(ambiguous[0]["stage"], "uncertain")
+            f.config["sonarr"].pop("Duplicate")
+            apis.pop("Duplicate")
+            resolved = public.recover_pending(f.config, f.qb, apis, f.journal, {}, time.monotonic() + 10)
+            self.assertEqual(resolved[0]["stage"], "cleanup_resolved")
+        self.assertEqual(f.journal.get(row["key"])["context"]["instance"], "HD")
+        send.assert_not_called()
+
     def test_matching_failure_with_missing_downloader_remains_recoverable(self):
         f = self.f
 

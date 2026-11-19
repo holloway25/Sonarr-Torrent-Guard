@@ -25,3 +25,4 @@ local/
 routine-authorization.json
 container-live-scope.json
 container-live-journal.json
+container-journal-binding.json

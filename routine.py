@@ -117,7 +117,8 @@ def main():
         qb = Api(config["qbittorrent"], deadline=deadline)
         apis = {label: Api(item, deadline=deadline) for label, item in config["sonarr"].items()}
         state_path = args.config.parent / "batch-state.json"
-        journal_id = read_container_journal_id(args.config.parent, required=args.container_journal)
+        journal_id = (authority.journal_id if args.container_mode else
+                      read_container_journal_id(args.config.parent, required=args.container_journal))
         journal = Journal(args.config.parent / ACTION_JOURNAL_FILE, allow_public_attempt=True,
                           expected_installation_id=journal_id)
         try:

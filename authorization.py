@@ -10,7 +10,7 @@ import time
 
 from guard import (GuardError, endpoint_key, load_config, METADATA_TIMEOUT_SECONDS, source_policy_key, classify_source,
                    unique_config_keys)
-from safety import CONTAINER_JOURNAL_MARKER, SafetyError, valid_digest
+from safety import CONTAINER_JOURNAL_BINDING, CONTAINER_JOURNAL_MARKER, SafetyError, valid_digest
 
 RULE = "public-sonarr-cleanup-v3"
 MAX_TRIAL_SECONDS = 7 * 24 * 60 * 60
@@ -74,6 +74,29 @@ def read_container_journal_id(directory, *, required=False):
     if not isinstance(record, dict) or set(record) != {"journal_id"} or not valid_digest(record["journal_id"]):
         raise SafetyError(reason)
     return record["journal_id"]
+
+
+def read_container_journal_binding(directory):
+    path = directory / CONTAINER_JOURNAL_BINDING
+    if not path.exists() and not path.is_symlink():
+        return None
+    reason = "container_journal_identity_mismatch"
+    try:
+        record = read_grant(path)
+    except SafetyError:
+        raise SafetyError(reason) from None
+    if (not isinstance(record, dict) or set(record) not in ({"journal_id"}, {"journal_id", "unbound_digest"})
+            or not all(valid_digest(value) for value in record.values())):
+        raise SafetyError(reason)
+    return record
+
+
+def read_bound_container_journal_id(directory):
+    marker = read_container_journal_id(directory, required=True)
+    binding = read_container_journal_binding(directory)
+    if binding != {"journal_id": marker}:
+        raise SafetyError("container_journal_identity_mismatch")
+    return marker
 
 
 def read_config_scope(path, reason):
@@ -192,6 +215,9 @@ class ContainerAuthorization:
         self._config_path = config_path.absolute()
         self._path = self._config_path.parent / CONTAINER_SCOPE_FILE
         self._scope = container_scope_record(config)
+        self.journal_id = None
+        if os.environ.get("STGUARD_MODE") == "live":
+            self.journal_id = read_bound_container_journal_id(self._path.parent)
         self.identifier = digest({"mode": self.mode, **self._scope})
         self.validate(config)
 
@@ -205,6 +231,8 @@ class ContainerAuthorization:
         reason = "container_live_scope_confirmation_required"
         if read_config_scope(self._config_path, reason) != self._scope["scope_digest"]:
             raise SafetyError(reason)
+        if read_bound_container_journal_id(self._path.parent) != self.journal_id:
+            raise SafetyError("container_journal_identity_mismatch")
         validate_candidate(config, report)
 
     def execution_expiry(self):

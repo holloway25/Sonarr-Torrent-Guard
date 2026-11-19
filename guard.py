@@ -123,6 +123,7 @@ class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         if config_path is not None:
             state_files = ("connections.json", ".connections-validation.json", "guard.lock", "batch-state.json",
                            "routine-authorization.json", "container-live-scope.json", "container-status.json",
+                           "container-journal-binding.json",
                            "container-live-journal.json", "preview-journal.sqlite3", "preview-journal.sqlite3-journal",
                            "preview-journal.sqlite3-wal", "preview-journal.sqlite3-shm",
                            "container-worker.lock", "action-journal.sqlite3", "action-journal.sqlite3-journal",
@@ -785,6 +786,13 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                 raise GuardError("private_source_protected")
             if classification != "public":
                 raise GuardError("unclassified_source_protected")
+            for row in rows:
+                queue_source = row.get("indexer")
+                if queue_source is None or (isinstance(queue_source, str) and not queue_source.strip()):
+                    continue
+                if (classify_source(policy, queue_source) != "public"
+                        or private_source_key(queue_source) != private_source_key(source)):
+                    raise GuardError("conflicting_queue_source_protected")
             state = t.get("state", "")
             safe_states = {"downloading", "stalledDL", "queuedDL", "pausedDL", "stoppedDL",
                            "uploading", "stalledUP", "queuedUP", "pausedUP", "stoppedUP",
@@ -808,7 +816,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
             report.update(decision="would_fail" if reasons else "keep", reasons=reasons)
             report.update(public_source_confirmed=True, indexer=source,
                           queue_ids=sorted({r["id"] for r in rows}),
-                          download_id_spelling=rows[0]["downloadId"],
+                          download_id_spelling=min(rows, key=lambda row: row["id"])["downloadId"],
                           series_ids=sorted({r["seriesId"] for r in rows}),
                           episode_ids=sorted({r["episodeId"] for r in rows}),
                           download_client_id=instance["download_client_binding"]["id"],
@@ -829,6 +837,7 @@ def run(config, qb, sonarr_apis, now=None, batch_state=None, include_titles=Fals
                          "endpoint": endpoint_key(config["qbittorrent"]["url"]),
                          "attempt": report["attempt_fingerprint"],
                          "grab_time_floor": grab_time_floor,
+                         "download_id_spelling": report["download_id_spelling"],
                          "identity": sorted((r["id"], r["seriesId"], r["episodeId"]) for r in rows)}
             if "hash_aliases" in report:
                 ownership["hash_aliases"] = aliases

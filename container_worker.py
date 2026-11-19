@@ -1,11 +1,14 @@
 """Non-root container scheduler, dry-run by default."""
 
 import argparse
+from contextlib import closing
 import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import secrets
 import signal
 import subprocess
 import sys
@@ -14,11 +17,13 @@ import threading
 import time
 
 from authorization import (CONTAINER_SCOPE_FILE, RULE, ContainerAuthorization,
-                           container_scope_record, read_container_journal_id, read_container_scope)
+                           container_scope_record, read_container_journal_binding, read_container_journal_id,
+                           read_container_scope)
 from guard import GuardError, load_config, open_regular_file, source_policy_key
 from safety import ACTION_JOURNAL_FILE as JOURNAL_FILE
+from safety import CONTAINER_JOURNAL_BINDING as JOURNAL_BINDING
 from safety import CONTAINER_JOURNAL_MARKER as JOURNAL_MARKER
-from safety import SafetyError, open_lock_file
+from safety import Journal, SafetyError, open_lock_file
 
 CONFIG_DIR = Path("/config")
 APP_DIR = Path(__file__).resolve().parent
@@ -85,6 +90,13 @@ def atomic_json(path, value):
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
+        if path.name in (JOURNAL_BINDING, JOURNAL_MARKER):
+            # Make the binding durable before the corresponding SQLite commit.
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
@@ -139,21 +151,52 @@ def configure(env, *, check_only=False, validate=None):
     return path
 
 
+def approved_legacy_scope():
+    path = CONFIG_DIR / CONTAINER_SCOPE_FILE
+    return (path.exists() or path.is_symlink()) and read_container_scope(path)["scope_digest"] is not None
+
+
+def require_journal_if_previously_bound(marker, binding):
+    if marker is not None or binding is not None or (CONFIG_DIR / "container-status.json").exists() or approved_legacy_scope():
+        raise SafetyError("container_journal_missing")
+
+
+def journal_fingerprint(path):
+    with open_regular_file(path, nofollow=True) as (file, _):
+        info = os.fstat(file.fileno())
+        contents = hashlib.file_digest(file.buffer, "sha256").hexdigest()
+        return hashlib.sha256(f"{info.st_dev}:{info.st_ino}:{contents}".encode()).hexdigest()
+
+
+def check_journal_binding(journal, marker, binding):
+    actual = journal.installation_id()
+    if binding is None:
+        if marker is None and (actual is not None or approved_legacy_scope()):
+            raise SafetyError("container_journal_marker_missing")
+        journal.check_installation_id(marker)
+        return actual
+    expected = binding["journal_id"]
+    if marker is not None and marker != expected:
+        raise SafetyError("container_journal_identity_mismatch")
+    if actual == expected:
+        return actual
+    if (marker is None and actual is None and "unbound_digest" in binding
+            and journal_fingerprint(journal.path) == binding["unbound_digest"]):
+        return None
+    raise SafetyError("container_journal_identity_mismatch")
+
+
 def validate_journal_identity(config):
     from production import binding_digest
-    from safety import Journal
+
     path = CONFIG_DIR / JOURNAL_FILE
+    marker = read_container_journal_id(CONFIG_DIR)
+    binding = read_container_journal_binding(CONFIG_DIR)
     if not path.exists() and not path.is_symlink():
-        scope_path = CONFIG_DIR / CONTAINER_SCOPE_FILE
-        marker = CONFIG_DIR / JOURNAL_MARKER
-        if marker.exists() or marker.is_symlink() or (CONFIG_DIR / "container-status.json").exists():
-            raise SafetyError("container_journal_missing")
-        if scope_path.exists() and read_container_scope(scope_path)["scope_digest"] is not None:
-            raise SafetyError("container_journal_missing")
+        require_journal_if_previously_bound(marker, binding)
         return
-    journal = Journal(path, read_only=True)
-    try:
-        journal.check_installation_id(read_container_journal_id(CONFIG_DIR))
+    with closing(Journal(path, read_only=True)) as journal:
+        check_journal_binding(journal, marker, binding)
         keys = journal.db.execute("SELECT key FROM actions").fetchall()
         if journal.has_archive:
             keys += journal.db.execute("SELECT key FROM actions_archive").fetchall()
@@ -164,26 +207,36 @@ def validate_journal_identity(config):
             if label not in config["sonarr"] or (row["mode"] in ("single_test", "public_attempt") and (
                     context.get("instance") != label or context.get("binding_digest") != binding_digest(config, label))):
                 raise GuardError("container_identity_migration_required")
-    finally:
-        journal.close()
 
 
 def initialize_journal():
-    from safety import Journal
-
-    if read_container_journal_id(CONFIG_DIR) is not None:
-        return
-    # Hold the same lock as standalone workers during a one-time adoption.
+    path = CONFIG_DIR / JOURNAL_FILE
+    # Hold the same lock as standalone workers throughout binding.
     with open_lock_file(CONFIG_DIR / "guard.lock") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if read_container_journal_id(CONFIG_DIR) is not None:
-            return
-        journal = Journal(CONFIG_DIR / JOURNAL_FILE)
-        try:
-            journal.check_installation_id(None)
-            atomic_json(CONFIG_DIR / JOURNAL_MARKER, {"journal_id": journal.installation_id(create=True)})
-        finally:
-            journal.close()
+        marker = read_container_journal_id(CONFIG_DIR)
+        binding = read_container_journal_binding(CONFIG_DIR)
+        exists = path.exists() or path.is_symlink()
+        if exists:
+            with closing(Journal(path, read_only=True)) as journal:
+                actual = check_journal_binding(journal, marker, binding)
+        else:
+            require_journal_if_previously_bound(marker, binding)
+            actual = None
+        if actual is None:
+            with closing(Journal(path, existing_only=exists)) as journal:
+                if binding is None:
+                    binding = {"journal_id": secrets.token_hex(32), "unbound_digest": journal_fingerprint(path)}
+                    atomic_json(CONFIG_DIR / JOURNAL_BINDING, binding)
+                else:
+                    check_journal_binding(journal, marker, binding)
+                actual = journal.installation_id(create=True, identifier=binding["journal_id"])
+                journal.check_installation_id(binding["journal_id"])
+        record = {"journal_id": actual}
+        if marker is None:
+            atomic_json(CONFIG_DIR / JOURNAL_MARKER, record)
+        if binding != record:
+            atomic_json(CONFIG_DIR / JOURNAL_BINDING, record)
 
 
 def healthcheck():

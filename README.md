@@ -202,8 +202,11 @@ records never count as new results. After dispatch, event dates must also be at
 or after the durably recorded dispatch time; unsynchronized clocks can prevent
 confirmation and require review.
 
-`production.py` pins the reviewed Sonarr source version and fails closed on
-version/client/endpoint drift. API failures leave affected observations unknown.
+`production.py` accepts Sonarr 4.x and holds live actions if the major version,
+client, or endpoint is unexpected. Older 4.x builds can return a global
+blocklist even when Guard requests one series. An oversized global response
+can hold an action. See the [blocklist compatibility notes](docs/PUBLIC-WORKFLOW.md).
+API failures leave affected observations unknown.
 The API cannot prove download-side data deletion; `data_deleted` stays unknown,
 so API-only reconciliation cannot mark an operation completely verified. No
 download or library share is mounted/scanned for this purpose.

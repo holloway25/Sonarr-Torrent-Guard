@@ -98,7 +98,7 @@ class RetentionTests(unittest.TestCase):
 
     def test_hybrid_attempt_is_related_through_aliases_before_and_after_archive(self):
         f = self.f
-        report = f.hybrid_report()
+        report = f.hybrid_report(blocklist_evidence=True)
         context = production.capture_context(f.config, f.s, report, production.digest(f.approval["nonce"]))
         row = self.journal.prepare(report, mode="public_attempt", context=context)
         self.journal.transition(row["key"], "prepared", "dispatch_recorded")
@@ -135,7 +135,7 @@ class RetentionTests(unittest.TestCase):
         self.journal.archive_resolved(now=self.later, preview=False)
         added = int(row["dispatched_at"]) + 3
         grabs = [max(context["grab_ids"]) + 1]
-        newer = dict(report, download_added_on=added, grab_ids=grabs,
+        newer = dict(report, download_added_on=added, grab_ids=grabs, grab_time_floor=added,
                      attempt_fingerprint=production.digest(["HD", report["hash"], added, grabs]))
         production.check_prior_attempts(self.journal, newer, config=self.f.config)
 

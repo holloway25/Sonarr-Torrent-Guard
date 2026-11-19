@@ -90,12 +90,15 @@ nonblank different client name may be excluded. Before applying that exclusion,
 Guard checks the current bound client ID and name against the removal context.
 A renamed or changed downloader blocks the search. Pre-intent grabs remain
 excluded before checking their client identity.
-Before classifying any new grab as unrelated, require positive integer
-`seriesId` and `episodeId` (not booleans, strings or floats). Missing or invalid
-content identity blocks with `replacement_history_identity_invalid`; only valid
-unrelated identities may be ignored. Baseline records and non-grab events are
-excluded first. New malformed grabs fail closed even if their missing identity
-prevents determining which content they concern.
+A positive integer `seriesId` for a different show rules out an event before
+its type is checked. For the target series, a positive integer `episodeId`
+outside the affected episodes also rules out the event. An unknown event type
+that could concern the target blocks the search. A potentially relevant grab
+without valid content IDs blocks with `replacement_history_identity_invalid`.
+When post-removal observation finds an ambiguous grab, Guard records the hold
+even if a later read omits it. Immediately before sending the separate search,
+Guard rereads both Sonarr retry switches. A disabled or unreadable switch blocks
+the search with `retry_settings_not_ready` and preserves the removal result.
 Validate history event types before any exclusion: accept only supported v4
 numeric types1–7 or their exact API names; missing, malformed, unsupported and
 `Unknown` (0/`unknown`) values block with `replacement_history_event_invalid`.

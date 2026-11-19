@@ -223,6 +223,17 @@ with series filtering, such as
 reduces the volume of unrelated entries. Guard correlates torrent blocklist entries
 using protocol, a release-title digest, indexer, series, episode IDs and newly
 added record IDs. Failure history must also match the original hash.
+Guard reads all Sonarr grabs for the exact queue download ID when preparing a
+blocklisting deletion and repeats the read immediately before sending. Their episode set must match
+the approved target, and the newest grab must match the approved release,
+indexer and downloader. Sonarr uses these grabs to select the failed episodes
+and release metadata. [Sonarr failed-download implementation](https://github.com/Sonarr/Sonarr/blob/v4.0.20.3014/src/NzbDrone.Core/Download/FailedDownloadService.cs#L53-L60)
+An explicitly conflicting indexer in a matching queue row also holds
+cleanup. A missing queue indexer can be established by verified grab history.
+After a standalone owner is renamed, recovery can use the stored binding
+when exactly one configured owner matches. A subsequent cleanup for the
+same hash requires a new download addition and verified grabs for every
+affected episode after the previous dispatch time.
 For replacement reporting, Guard combines episode coverage from different-hash
 grabs and same-hash re-grabs verified by a later qBittorrent addition and newer
 matching Sonarr grab IDs after dispatch. Only same-hash re-grab evidence for

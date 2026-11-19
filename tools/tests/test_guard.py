@@ -68,6 +68,12 @@ class FakeApi:
             result = self.routes[route]
         if isinstance(result, Exception):
             raise result
+        if route == "/api/v3/history" and params and "downloadId" in params:
+            rows = [row for row in result["records"] if row.get("downloadId") == params["downloadId"]
+                    and row.get("eventType") in ("grabbed", 1)]
+            page_size = params["pageSize"]
+            start = (params["page"] - 1) * page_size
+            result = {"records": rows[start:start + page_size], "totalRecords": len(rows)}
         if scoped_history:
             # Model the server filter for known IDs but let malformed fixtures
             # reach the validator, which must reject them independently.

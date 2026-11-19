@@ -385,38 +385,145 @@ class ContainerTests(unittest.TestCase):
         path.write_bytes(saved)
         self.assertEqual(self.run_mode(env, "--once")[0], 0)
 
-    def test_initialized_journal_cannot_be_adopted_after_partial_restore_without_marker(self):
+    def test_initialized_and_legacy_substitutes_cannot_take_over_when_the_marker_is_missing(self):
         from contextlib import closing
         from safety import Journal
+
+        import public
+        import routine
 
         self.legacy_hold()
         env = dict(self.env, STGUARD_MODE="live")
         self.assertEqual(self.run_mode(env, "--approve-live-scope")[0], 0)
         path = self.path / worker.JOURNAL_FILE
         marker = self.path / worker.JOURNAL_MARKER
+        binding = self.path / worker.JOURNAL_BINDING
         saved_marker = marker.read_bytes()
+        saved_binding = binding.read_bytes()
         saved_db = path.with_suffix(".saved")
         path.replace(saved_db)
         marker.unlink()
-        with closing(Journal(path)) as other:
-            other.installation_id(create=True)
-        replacement = path.read_bytes()
 
-        for command in ("--check-config", "--once", "--approve-live-scope"):
-            with self.subTest(command=command):
-                result, cycle, errors = self.run_mode(env, command)
-                self.assertEqual(result, 1)
-                self.assertIn("container_journal_marker_missing", errors)
-                cycle.assert_not_called()
-                self.assertFalse(marker.exists())
-                self.assertEqual(path.read_bytes(), replacement)
+        for identified in (False, True):
+            with closing(Journal(path)) as other:
+                if identified:
+                    other.installation_id(create=True)
+            replacement = path.read_bytes()
+            for previous_release in (False, True):
+                if previous_release:
+                    binding.unlink()
+                reason = ("container_journal_marker_missing" if previous_release
+                          else "container_journal_identity_mismatch")
+                for command in ("--check-config", "--once", "--approve-live-scope"):
+                    with self.subTest(identified=identified, previous_release=previous_release, command=command):
+                        result, cycle, errors = self.run_mode(env, command)
+                        self.assertEqual(result, 1)
+                        self.assertIn(reason, errors)
+                        cycle.assert_not_called()
+                        self.assertFalse(marker.exists())
+                        self.assertEqual(path.read_bytes(), replacement)
+                args = ["routine.py", "--live", "--container-mode", "--config", str(self.path / "connections.json"),
+                        "--log-file", str(self.path / "routine.log")]
+                with patch.dict(os.environ, {"STGUARD_MODE": "live"}, clear=True), patch(
+                        "sys.argv", args), patch.object(public, "cycle", return_value={
+                            "assessment": [], "recovery": []}) as direct, contextlib.redirect_stdout(
+                        io.StringIO()) as output:
+                    self.assertEqual(routine.main(), 0)
+                direct.assert_not_called()
+                self.assertEqual(json.loads(output.getvalue())["reason"], "container_journal_marker_missing")
+                if previous_release:
+                    binding.write_bytes(saved_binding)
+                    binding.chmod(0o600)
+            path.unlink()
 
         saved_db.replace(path)
-        marker.write_bytes(saved_marker)
-        marker.chmod(0o600)
         result, cycle, _ = self.run_mode(env, "--once")
         self.assertEqual(result, 0)
         cycle.assert_called_once()
+        self.assertEqual(marker.read_bytes(), saved_marker)
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
+        # A valid legacy marker and journal can migrate without another approval.
+        binding.unlink()
+        self.assertEqual(self.run_mode(env, "--once")[0], 0)
+        self.assertEqual(binding.read_bytes(), saved_binding)
+
+    def test_interrupted_first_marker_write_recovers_only_the_original_bound_journal(self):
+        from contextlib import closing
+        from safety import Journal
+
+        self.legacy_hold()
+        env = dict(self.env, STGUARD_MODE="live")
+        path = self.path / worker.JOURNAL_FILE
+        marker = self.path / worker.JOURNAL_MARKER
+        binding = self.path / worker.JOURNAL_BINDING
+        original = worker.atomic_json
+
+        def fail_marker(destination, data):
+            if destination == marker:
+                raise OSError()
+            return original(destination, data)
+
+        with patch.object(worker, "atomic_json", side_effect=fail_marker):
+            result, cycle, _ = self.run_mode(env, "--approve-live-scope")
+        self.assertEqual(result, 1)
+        cycle.assert_not_called()
+        self.assertFalse(marker.exists())
+        expected = json.loads(binding.read_text())["journal_id"]
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.installation_id(), expected)
+
+        saved = path.with_suffix(".saved")
+        path.replace(saved)
+        with closing(Journal(path)):
+            pass
+        result, cycle, error = self.run_mode(env, "--approve-live-scope")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_identity_mismatch", error)
+        cycle.assert_not_called()
+        self.assertFalse(marker.exists())
+
+        saved.replace(path)
+        result, cycle, _ = self.run_mode(env, "--approve-live-scope")
+        self.assertEqual(result, 0)
+        cycle.assert_not_called()
+        self.assertEqual(json.loads(marker.read_text()), {"journal_id": expected})
+        self.assertEqual(json.loads(binding.read_text()), {"journal_id": expected})
+        self.assertEqual(self.run_mode(env, "--once")[0], 0)
+        with closing(Journal(path, read_only=True)) as journal:
+            self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
+
+    def test_interrupted_first_database_bind_resumes_only_on_the_same_file(self):
+        from contextlib import closing
+        from safety import Journal
+
+        self.legacy_hold()
+        path = self.path / worker.JOURNAL_FILE
+        marker = self.path / worker.JOURNAL_MARKER
+        installation_id = Journal.installation_id
+
+        def fail_write(journal, *, create=False, identifier=None):
+            if create:
+                raise OSError()
+            return installation_id(journal)
+
+        with patch.object(Journal, "installation_id", new=fail_write):
+            self.assertEqual(self.run_mode(self.env, "--once")[0], 1)
+        self.assertFalse(marker.exists())
+        saved = path.with_suffix(".saved")
+        path.replace(saved)
+        path.write_bytes(saved.read_bytes())
+        path.chmod(0o600)
+        result, cycle, errors = self.run_mode(self.env, "--once")
+        self.assertEqual(result, 1)
+        self.assertIn("container_journal_identity_mismatch", errors)
+        cycle.assert_not_called()
+
+        saved.replace(path)
+        result, cycle, _ = self.run_mode(self.env, "--once")
+        self.assertEqual(result, 0)
+        cycle.assert_called_once()
+        self.assertTrue(marker.exists())
         with closing(Journal(path, read_only=True)) as journal:
             self.assertEqual(journal.db.execute("SELECT stage FROM actions").fetchall(), [("manual_review",)])
 

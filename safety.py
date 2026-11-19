@@ -23,13 +23,15 @@ DISPATCH_STOP_REASONS = {"approval_expired_or_target_mismatch", "fresh_assessmen
                          "replacement_queue_identity_invalid", "replacement_blocklisted",
                          "replacement_blocklist_uncertain", "run_time_limit_reached",
                          "container_journal_missing", "container_journal_identity_mismatch",
-                         "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached"}
-CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed", "retry_settings_not_ready",
+                         "container_journal_marker_missing", "sonarr_unscoped_blocklist_limit_reached", "torrent_identity_scan_time_limit_reached",
+                         "sonarr_blocklist_scope_unverified", "retry_settings_not_ready"}
+CANCELLATION_STOP_REASONS = DISPATCH_STOP_REASONS | {"cancellation_validation_failed",
                                                     "candidate_no_longer_eligible", "abandoned_before_dispatch"}
 ARCHIVE_ROW_LIMIT = 10000
 RELATED_RECORD_LIMIT = 1000
 ARCHIVE_MINIMUM_AGE = 30 * 24 * 60 * 60
 CONTAINER_JOURNAL_MARKER = "container-live-journal.json"
+CONTAINER_JOURNAL_BINDING = "container-journal-binding.json"
 ACTION_JOURNAL_FILE = "action-journal.sqlite3"
 ACTION_FIELDS = ("mode", "stage", "evidence", "observation", "confirmed", "current_observation",
                  "observation_available", "context", "dispatched_at", "stop_reason", "search_command_id")
@@ -53,7 +55,8 @@ def clean_observation(observation):
     if not isinstance(observation, dict):
         raise SafetyError("invalid_observation")
     safe = {}
-    for field in (*OBSERVATION_FIELDS, "any_replacement_observed", "replacement_grab_observed"):
+    for field in (*OBSERVATION_FIELDS, "any_replacement_observed", "replacement_grab_observed",
+                  "replacement_grab_ambiguous"):
         val = observation.get(field)
         if val is not None and not isinstance(val, bool):
             raise SafetyError("invalid_observation")
@@ -240,16 +243,18 @@ class Journal:
         if expected is not None and actual != expected:
             raise SafetyError("container_journal_identity_mismatch")
 
-    def installation_id(self, *, create=False):
+    def installation_id(self, *, create=False, identifier=None):
         """Keep a durable journal identity separate from live scope approval."""
         if create:
             if self.read_only:
                 raise SafetyError("container_journal_identity_mismatch")
             with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
                 self.db.execute("CREATE TABLE IF NOT EXISTS installation_identity "
                                 "(singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL)")
                 if self.db.execute("SELECT 1 FROM installation_identity").fetchone() is None:
-                    self.db.execute("INSERT INTO installation_identity VALUES (1,?)", (secrets.token_hex(32),))
+                    self.db.execute("INSERT INTO installation_identity VALUES (1,?)",
+                                    (identifier if identifier is not None else secrets.token_hex(32),))
         exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                  "AND name='installation_identity'").fetchone()
         if exists is None:

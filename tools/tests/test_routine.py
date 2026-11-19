@@ -12,7 +12,7 @@ from authorization import (CONTAINER_SCOPE_FILE, ContainerAuthorization, Routine
 from guard import load_batch_state, run
 import production
 import routine
-from safety import SafetyError
+from safety import CONTAINER_JOURNAL_BINDING, CONTAINER_JOURNAL_MARKER, SafetyError
 from tools.tests import test_production as fixtures
 
 
@@ -37,9 +37,13 @@ class RoutineTests(unittest.TestCase):
         return production.execute_routine_attempt(f.config, f.qb, f.apis, f.journal, f.report, self.authority)
 
     def write_container_scope(self):
-        path = Path(self.f.folder.name) / CONTAINER_SCOPE_FILE
-        path.write_text(json.dumps(container_scope_record(self.f.config)))
-        path.chmod(0o600)
+        directory = Path(self.f.folder.name)
+        record = {"journal_id": self.f.journal.installation_id(create=True)}
+        for name, content in ((CONTAINER_SCOPE_FILE, container_scope_record(self.f.config)),
+                              (CONTAINER_JOURNAL_MARKER, record), (CONTAINER_JOURNAL_BINDING, record)):
+            path = directory / name
+            path.write_text(json.dumps(content))
+            path.chmod(0o600)
         return self.write_connections()
 
     def write_connections(self):

@@ -13,6 +13,7 @@ REASONS = {
     "only_txt_nfo_selected": "only .txt/.nfo files are selected",
     "private_source_protected": "private source protected",
     "unclassified_source_protected": "source has not been classified",
+    "conflicting_queue_source_protected": "the Sonarr queue source disagrees with the verified grab",
     "work_limit_reached": "deferred to a later batch",
     "torrent_identity_scan_time_limit_reached": "could not verify all qBittorrent identities within the cycle budget",
     "sonarr_downloader_binding_mismatch": "Sonarr downloader no longer matches its binding",

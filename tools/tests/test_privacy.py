@@ -18,7 +18,8 @@ class PrivacyFilenameTests(unittest.TestCase):
                  "connections.production.json", "connections-local.json",
                  "nested/connections.production.json", ".connections-validation.json",
                  "nested/.guard-sample", "nested/routine.log.1")
-        newly_ignored = ("nested/.batch-example", "nested/container-status.json")
+        newly_ignored = ("nested/.batch-example", "nested/container-status.json",
+                         "nested/container-journal-binding.json")
         names += newly_ignored
         for name in names:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
